@@ -302,6 +302,22 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 	api.on?.("before_provider_request", async (event, ctx) => {
 		const payload = requestPayload(event);
 		imageResultState.outputDirectory = undefined;
+		if (!isExplicitOpenAIResponsesModel(ctx.model)) {
+			const pending = pendingRemovedState(expectedByTarget);
+			if (pending) {
+				const [key, state] = pending;
+				await failAfterRemoval({
+					api,
+					ctx,
+					reason: "provider request model was not explicitly OpenAI Responses after host-side tool removal",
+					state,
+					incompatibleTargets,
+					key,
+				});
+				expectedByTarget.delete(key);
+			}
+			return undefined;
+		}
 		const { config } = await loadConfig(api, ctx, visibleConfigWarnings);
 		const target = buildRequestTarget({ payload, contextModel: ctx.model, eventModel: requestEventModel(event) });
 		if (!target) {

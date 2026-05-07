@@ -305,6 +305,40 @@ describe("OpenAI provider tools extension", () => {
 		expect(chatPayload.tools).toBeUndefined();
 	});
 
+	it("does not remove host tools or inject when matching model identity lacks explicit Responses api", async () => {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		await writeConfig({ cwd, runtime: "omp", content: webSearchOnlyConfig() });
+		const extension = registerExtension();
+		const ctx = context(cwd, homeDir, {
+			model: { id: targetModel.id, name: targetModel.name, provider: targetModel.provider, baseUrl: targetModel.baseUrl },
+		});
+		const payload: Record<string, unknown> = { model: "gpt-5", input: "hello" };
+
+		await runBeforeAgent(extension, ctx);
+		await runBeforeProvider(extension, payload, ctx);
+
+		expect(extension.activeTools()).toEqual(["read", "web_search", "generate_image"]);
+		expect(payload.tools).toBeUndefined();
+	});
+
+	it("does not inject image_generation when matching model identity lacks explicit Responses api", async () => {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		await writeConfig({ cwd, runtime: "omp", content: imageOnlyConfig() });
+		const extension = registerExtension();
+		const ctx = context(cwd, homeDir, {
+			model: { id: targetModel.id, name: targetModel.name, provider: targetModel.provider, baseUrl: targetModel.baseUrl },
+		});
+		const payload: Record<string, unknown> = { model: "gpt-5", input: "create image" };
+
+		await runBeforeAgent(extension, ctx);
+		await runBeforeProvider(extension, payload, ctx);
+
+		expect(extension.activeTools()).toEqual(["read", "web_search", "generate_image"]);
+		expect(payload.tools).toBeUndefined();
+	});
+
 	it("injects web_search into a matching Responses payload and does not set tool_choice", async () => {
 		const cwd = await makeTempDir();
 		const homeDir = await makeTempDir();
