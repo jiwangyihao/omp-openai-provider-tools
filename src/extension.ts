@@ -382,9 +382,35 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 			}
 			return undefined;
 		}
+		const expected = expectedByTarget.get(key);
+		const enabledProviderTools = getEnabledProviderToolTypes(entry);
+		const hostToolsToRemove = enabledProviderToolsToHostTools(enabledProviderTools);
+		if (!expected && eventModel && hostToolsToRemove.length > 0) {
+			if (!api.getActiveTools) {
+				incompatibleTargets.add(key);
+				await notifyWarning(api, ctx, warningMessage("active tool control API is unavailable"));
+				return undefined;
+			}
+
+			let activeToolNames: string[];
+			try {
+				activeToolNames = normalizeActiveToolNames(await api.getActiveTools());
+			} catch (error) {
+				incompatibleTargets.add(key);
+				await notifyWarning(api, ctx, warningMessage(`active tool inspection failed: ${error instanceof Error ? error.message : String(error)}`));
+				return undefined;
+			}
+
+			const activeHostConflicts = hostToolsToRemove.filter((toolName) => activeToolNames.includes(toolName));
+			if (activeHostConflicts.length > 0) {
+				incompatibleTargets.add(key);
+				await notifyWarning(api, ctx, warningMessage(`active host-side tools remain: ${activeHostConflicts.join(", ")}`));
+				return undefined;
+			}
+		}
+
 		updateImageResultState(imageResultState, entry);
 		const result = injectConfiguredTools(payload, entry);
-		const expected = expectedByTarget.get(key);
 		if (!result.ok) {
 			await failAfterRemoval({ api, ctx, reason: result.reason, state: expected, incompatibleTargets, key });
 			expectedByTarget.delete(key);

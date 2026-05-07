@@ -321,7 +321,7 @@ describe("OpenAI provider tools extension", () => {
 		expect(extension.activeTools()).toEqual(["read", "web_search", "generate_image"]);
 		expect(payload.tools).toBeUndefined();
 	});
-	it("uses request-scoped Responses api metadata when context model api is missing", async () => {
+	it("does not inject request-scoped Responses tools when matching host-side tools remain active", async () => {
 		const cwd = await makeTempDir();
 		const homeDir = await makeTempDir();
 		await writeConfig({ cwd, runtime: "omp", content: webSearchOnlyConfig() });
@@ -334,8 +334,42 @@ describe("OpenAI provider tools extension", () => {
 
 		await runBeforeProvider(extension, payload, ctx, { requestModel });
 
+		expect(payload.tools).toBeUndefined();
+		expect(extension.warnings.join("\n")).toContain("active host-side tools remain");
+		expect(extension.sentMessages.some(({ message }) => String((message as any).content ?? message).includes("active host-side tools remain"))).toBe(true);
+	});
+	it("injects request-scoped Responses tools when matching host-side tools are already inactive", async () => {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		await writeConfig({ cwd, runtime: "omp", content: webSearchOnlyConfig() });
+		const extension = registerExtension({ initialActiveTools: ["read", "generate_image"] });
+		const ctx = context(cwd, homeDir, {
+			model: { id: targetModel.id, name: targetModel.name, provider: targetModel.provider, baseUrl: targetModel.baseUrl },
+		});
+		const requestModel = { ...targetModel };
+		const payload: Record<string, unknown> = { model: "gpt-5", input: "hello" };
+
+		await runBeforeProvider(extension, payload, ctx, { requestModel });
+
 		expect(payload.tools).toEqual([{ type: "web_search" }]);
 		expect(payload).not.toHaveProperty("tool_choice");
+	});
+	it("does not inject request-scoped Responses tools when active tool API is unavailable", async () => {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		await writeConfig({ cwd, runtime: "omp", content: webSearchOnlyConfig() });
+		const extension = registerExtension({ activeToolMethods: false });
+		const ctx = context(cwd, homeDir, {
+			model: { id: targetModel.id, name: targetModel.name, provider: targetModel.provider, baseUrl: targetModel.baseUrl },
+		});
+		const requestModel = { ...targetModel };
+		const payload: Record<string, unknown> = { model: "gpt-5", input: "hello" };
+
+		await runBeforeProvider(extension, payload, ctx, { requestModel });
+
+		expect(payload.tools).toBeUndefined();
+		expect(extension.warnings.join("\n")).toContain("active tool control API is unavailable");
+		expect(extension.sentMessages.some(({ message }) => String((message as any).content ?? message).includes("active tool control API is unavailable"))).toBe(true);
 	});
 
 	it("does not inject image_generation when matching model identity lacks explicit Responses api", async () => {
