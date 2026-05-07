@@ -36,6 +36,6 @@
 	"files": [
 		"src",
 		"README.md",
-		"docs"
+		"docs/runtime-compatibility.md"
 	]
 }

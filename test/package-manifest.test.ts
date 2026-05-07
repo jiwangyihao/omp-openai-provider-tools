@@ -24,10 +24,15 @@ describe("package manifest", () => {
 
 	it("is discoverable as a Pi package and publishes runtime files", () => {
 		expect(packageJson.keywords).toContain("pi-package");
-		expect(packageJson.files).toEqual(expect.arrayContaining(["src", "README.md", "docs"]));
+		expect(packageJson.files).toEqual(["src", "README.md", "docs/runtime-compatibility.md"]);
 		for (const fileEntry of packageJson.files) {
 			expect(existsSync(resolve(repoRoot, fileEntry)), `${fileEntry} should exist before publishing`).toBe(true);
 		}
+	});
+
+	it("excludes internal superpowers docs from published files", () => {
+		expect(packageJson.files).not.toContain("docs");
+		expect(packageJson.files.some((fileEntry) => fileEntry.startsWith("docs/superpowers"))).toBe(false);
 	});
 
 	it("limits runtime dependencies to portable packages", () => {
