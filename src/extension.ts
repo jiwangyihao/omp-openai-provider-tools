@@ -1,15 +1,28 @@
 import * as os from "node:os";
+import * as path from "node:path";
 
 import { enabledProviderToolsToHostTools, normalizeActiveToolNames, removeHostSideTools } from "./active-tools";
 import { detectRuntimeKind, loadAvailableProviderToolsConfig } from "./config";
 import { buildRequestTarget, findMatchingProvider, type RequestTarget } from "./match";
 import { getEnabledProviderToolTypes, injectConfiguredTools } from "./request-injection";
-import type { ExtensionApiLike, ExtensionContextLike, ProviderToolType, RuntimeModelLike } from "./types";
+import {
+	buildImageErrorMessage,
+	buildImageMessage,
+	extractImageGenerationResults,
+	imageResultKey,
+	saveImageResult,
+} from "./image-results";
+import type { ExtensionApiLike, ExtensionContextLike, ProviderToolType, ProviderToolsEntry, RuntimeModelLike } from "./types";
 
 interface ProviderRequestEventLike {
 	payload?: unknown;
 	model?: RuntimeModelLike;
 	requestModel?: RuntimeModelLike;
+}
+
+interface AgentEndEventLike {
+	messages?: unknown;
+	message?: unknown;
 }
 
 interface ExpectedToolsState {
@@ -20,6 +33,10 @@ interface ExpectedToolsState {
 
 interface LoadedRuntimeConfig {
 	config: Awaited<ReturnType<typeof loadAvailableProviderToolsConfig>>["config"];
+}
+
+interface ImageResultState {
+	outputDirectory?: string;
 }
 
 function modelPayloadForBeforeAgent(model: RuntimeModelLike | undefined): Record<string, unknown> | undefined {
@@ -41,6 +58,81 @@ function warningMessage(reason: string): string {
 	return `OpenAI provider tools could not be safely injected: ${reason}`;
 }
 
+
+function imageResultsFromAgentEndEvent(event: unknown) {
+	const candidate = event as AgentEndEventLike | undefined;
+	const messages = Array.isArray(candidate?.messages) ? candidate.messages : [candidate?.message ?? event];
+	return messages.flatMap((message) => extractImageGenerationResults(message));
+}
+
+async function runtimeSessionId(ctx: ExtensionContextLike, api: ExtensionApiLike): Promise<string> {
+	const explicit = await ctx.sessionManager?.getSessionId?.();
+	if (explicit) return explicit;
+	const runtime = detectRuntimeKind(api, ctx);
+	return `fallback:${runtime}:${ctx.homeDir ?? "no-home"}:${ctx.cwd ?? "no-cwd"}`;
+}
+
+async function sessionArtifactDirectory(ctx: ExtensionContextLike): Promise<string | undefined> {
+	return ctx.sessionManager?.getArtifactsDir?.();
+}
+
+function agentImageDirectory(ctx: ExtensionContextLike, api: ExtensionApiLike): string {
+	const runtime = detectRuntimeKind(api, ctx) === "pi" ? "pi" : "omp";
+	return path.join(ctx.homeDir ?? os.homedir(), `.${runtime}`, "agent", "provider-tool-images");
+}
+
+function updateImageResultState(state: ImageResultState, entry: ProviderToolsEntry): void {
+	if (entry.tools.image_generation?.enabled === true) {
+		state.outputDirectory = entry.output?.directory;
+	}
+}
+
+async function sendVisibleImageMessage(api: ExtensionApiLike, message: unknown): Promise<void> {
+	await api.sendMessage?.(message, { deliverAs: "nextTurn" });
+}
+
+async function handleAgentEndImageResults({
+	api,
+	ctx,
+	event,
+	state,
+	seen,
+}: {
+	api: ExtensionApiLike;
+	ctx: ExtensionContextLike;
+	event: unknown;
+	state: ImageResultState;
+	seen: Set<string>;
+}): Promise<void> {
+	let results;
+	try {
+		results = imageResultsFromAgentEndEvent(event);
+	} catch (error) {
+		await notifyWarning(api, ctx, `OpenAI provider image results could not be extracted: ${error instanceof Error ? error.message : String(error)}`);
+		return;
+	}
+	if (results.length === 0) return;
+
+	const sessionId = await runtimeSessionId(ctx, api);
+	const artifactDirectory = await sessionArtifactDirectory(ctx);
+	const locations = {
+		outputDirectory: state.outputDirectory,
+		artifactDirectory,
+		agentImageDirectory: agentImageDirectory(ctx, api),
+	};
+
+	for (const result of results) {
+		const key = imageResultKey(sessionId, result);
+		if (seen.has(key)) continue;
+		seen.add(key);
+		try {
+			const saved = await saveImageResult(result, locations);
+			await sendVisibleImageMessage(api, buildImageMessage(result, saved));
+		} catch (error) {
+			await sendVisibleImageMessage(api, buildImageErrorMessage(result, error));
+		}
+	}
+}
 async function notifyWarning(api: ExtensionApiLike, ctx: ExtensionContextLike, message: string): Promise<void> {
 	api.logger?.warn?.(message);
 	ctx.logger?.warn?.(message);
@@ -111,6 +203,8 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 
 	const expectedByTarget = new Map<string, ExpectedToolsState>();
 	const incompatibleTargets = new Set<string>();
+	const imageResultState: ImageResultState = {};
+	const seenImageResults = new Set<string>();
 
 	api.on?.("session_start", async (_event, ctx) => {
 		await loadConfig(api, ctx);
@@ -185,6 +279,7 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 			}
 			return undefined;
 		}
+		updateImageResultState(imageResultState, entry);
 		const result = injectConfiguredTools(payload, entry);
 		const expected = expectedByTarget.get(key);
 		if (!result.ok) {
@@ -210,5 +305,7 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 		return undefined;
 	});
 
-	api.on?.("agent_end", () => undefined);
+	api.on?.("agent_end", async (event, ctx) => {
+		await handleAgentEndImageResults({ api, ctx, event, state: imageResultState, seen: seenImageResults });
+	});
 }
