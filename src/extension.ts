@@ -39,6 +39,13 @@ interface ImageResultState {
 	outputDirectory?: string;
 }
 
+function isExplicitOpenAIResponsesModel(model: RuntimeModelLike | undefined): boolean {
+	const api = model?.api;
+	if (typeof api !== "string") return false;
+	const normalized = api.trim().toLowerCase();
+	return normalized === "openai-responses" || normalized === "responses" || normalized === "openai_responses" || normalized === "openai.responses";
+}
+
 function modelPayloadForBeforeAgent(model: RuntimeModelLike | undefined): Record<string, unknown> | undefined {
 	const modelId = model?.id ?? model?.name;
 	if (!modelId) return undefined;
@@ -248,6 +255,7 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 
 	api.on?.("before_agent_start", async (_event, ctx) => {
 		const syntheticPayload = modelPayloadForBeforeAgent(ctx.model);
+		if (!isExplicitOpenAIResponsesModel(ctx.model)) return undefined;
 		if (!syntheticPayload) return undefined;
 
 		const { config } = await loadConfig(api, ctx, visibleConfigWarnings);

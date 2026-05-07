@@ -287,6 +287,23 @@ describe("OpenAI provider tools extension", () => {
 		expect(extension.activeTools()).toEqual(["read", "web_search", "generate_image"]);
 		expect(payload).toEqual({ model: "gpt-5", input: "hello" });
 	});
+	it("does not remove host-side tools or inject for chat-completions context even when model identity matches", async () => {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		await writeConfig({ cwd, runtime: "omp", content: webSearchOnlyConfig() });
+		const extension = registerExtension();
+		const ctx = context(cwd, homeDir, {
+			model: { ...targetModel, api: "chat-completions" },
+		});
+		const chatPayload: Record<string, unknown> = { model: "gpt-5", messages: [{ role: "user", content: "hello" }] };
+
+		await runBeforeAgent(extension, ctx);
+		expect(extension.activeTools()).toEqual(["read", "web_search", "generate_image"]);
+		await runBeforeProvider(extension, chatPayload, ctx);
+
+		expect(extension.activeTools()).toEqual(["read", "web_search", "generate_image"]);
+		expect(chatPayload.tools).toBeUndefined();
+	});
 
 	it("injects web_search into a matching Responses payload and does not set tool_choice", async () => {
 		const cwd = await makeTempDir();
