@@ -1,0 +1,41 @@
+{
+	"type": "module",
+	"name": "omp-openai-provider-tools",
+	"version": "0.1.0",
+	"description": "Provider-native OpenAI Responses tools for OMP and Pi-family runtimes.",
+	"license": "MIT",
+	"keywords": [
+		"oh-my-pi",
+		"pi-package",
+		"omp",
+		"pi",
+		"extension",
+		"openai",
+		"responses",
+		"provider-tools"
+	],
+	"scripts": {
+		"test": "bun test",
+		"check": "bun test"
+	},
+	"dependencies": {
+		"yaml": "^2.8.1"
+	},
+	"engines": {
+		"bun": ">=1.3.7"
+	},
+	"publishConfig": {
+		"access": "public"
+	},
+	"omp": {
+		"extensions": ["./src/extension.ts"]
+	},
+	"pi": {
+		"extensions": ["./src/extension.ts"]
+	},
+	"files": [
+		"src",
+		"README.md",
+		"docs"
+	]
+}
