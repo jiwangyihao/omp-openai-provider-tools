@@ -6,6 +6,7 @@ export interface RequestTarget {
 	provider?: string;
 	baseUrl?: string;
 	modelId: string;
+	payloadModel: string;
 	modelName?: string;
 }
 
@@ -64,7 +65,8 @@ export function buildRequestTarget({
 		api: "openai-responses",
 		provider: stringOrUndefined(model.provider),
 		baseUrl: stringOrUndefined(model.baseUrl),
-		modelId: payload.model,
+		modelId: stringOrUndefined(model.id) ?? payload.model,
+		payloadModel: payload.model,
 		modelName: stringOrUndefined(model.name),
 	};
 }
@@ -73,7 +75,7 @@ function entryMatchesTarget(entry: ProviderToolsEntry, target: RequestTarget): b
 	const match = entry.match;
 	if (match.api !== target.api) return false;
 	if (match.provider !== undefined && match.provider.toLowerCase() !== target.provider?.toLowerCase()) return false;
-	if (match.modelId !== undefined && match.modelId !== target.modelId) return false;
+	if (match.modelId !== undefined && match.modelId !== target.modelId && match.modelId !== target.payloadModel) return false;
 	if (match.modelName !== undefined && match.modelName !== target.modelName) return false;
 	if (match.baseUrl !== undefined && !baseUrlMatches(match.baseUrl, target.baseUrl)) return false;
 	return true;
