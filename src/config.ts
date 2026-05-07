@@ -34,6 +34,7 @@ export interface ConfigPaths {
 
 type UnknownRecord = Record<string, unknown>;
 type RuntimeMetadata = { name?: unknown; kind?: unknown; capabilities?: unknown };
+type ValidationState = { warnings: string[]; hasFatal: boolean };
 
 const TOP_LEVEL_FIELDS = new Set(["version", "providers"]);
 const PROVIDER_FIELDS = new Set(["name", "match", "tools", "output"]);
@@ -57,12 +58,16 @@ function isNonEmptyString(value: unknown): value is string {
 	return typeof value === "string" && value.length > 0;
 }
 
-function warnUnknownFields(value: UnknownRecord, allowed: Set<string>, label: string, warnings: string[]): void {
+function warnUnknownFields(value: UnknownRecord, allowed: Set<string>, label: string, state: ValidationState): boolean {
+	let hasUnknown = false;
 	for (const key of Object.keys(value)) {
 		if (!allowed.has(key)) {
-			warnings.push(`unknown ${label} field: ${key}`);
+			state.warnings.push(`unknown ${label} field: ${key}`);
+			state.hasFatal = true;
+			hasUnknown = true;
 		}
 	}
+	return hasUnknown;
 }
 
 export function expandHome(input: string, homeDir: string): string {
@@ -147,50 +152,57 @@ export function detectRuntimeKind(api: ExtensionApiLike | unknown, ctx: Extensio
 	return "unknown";
 }
 
-function validateBaseUrl(value: unknown, warnings: string[]): BaseUrlMatch | undefined {
+function validateBaseUrl(value: unknown, state: ValidationState): BaseUrlMatch | undefined {
 	if (!isRecord(value)) {
-		warnings.push("baseUrl must be an object");
+		state.warnings.push("baseUrl must be an object");
+		state.hasFatal = true;
 		return undefined;
 	}
 	const keys = ["equals", "prefix", "host"].filter((key) => Object.hasOwn(value, key));
 	const unknownKeys = Object.keys(value).filter((key) => !["equals", "prefix", "host"].includes(key));
 	for (const key of unknownKeys) {
-		warnings.push(`unknown baseUrl field: ${key}`);
+		state.warnings.push(`unknown baseUrl field: ${key}`);
+		state.hasFatal = true;
 	}
 	if (keys.length !== 1 || unknownKeys.length > 0) {
-		warnings.push("baseUrl must specify exactly one of equals, prefix, or host");
+		state.warnings.push("baseUrl must specify exactly one of equals, prefix, or host");
+		state.hasFatal = true;
 		return undefined;
 	}
 	const key = keys[0] as "equals" | "prefix" | "host";
 	if (!isNonEmptyString(value[key])) {
-		warnings.push(`baseUrl.${key} must be a non-empty string`);
+		state.warnings.push(`baseUrl.${key} must be a non-empty string`);
+		state.hasFatal = true;
 		return undefined;
 	}
 	return { [key]: value[key] } as BaseUrlMatch;
 }
 
-function validateMatch(value: unknown, warnings: string[]): ProviderToolsEntry["match"] | undefined {
+function validateMatch(value: unknown, state: ValidationState): ProviderToolsEntry["match"] | undefined {
 	if (!isRecord(value)) {
-		warnings.push("provider match must be an object");
+		state.warnings.push("provider match must be an object");
+		state.hasFatal = true;
 		return undefined;
 	}
-	warnUnknownFields(value, MATCH_FIELDS, "match", warnings);
+	warnUnknownFields(value, MATCH_FIELDS, "match", state);
 	if (value.api !== "openai-responses") {
-		warnings.push("match.api must be openai-responses");
+		state.warnings.push("match.api must be openai-responses");
+		state.hasFatal = true;
 		return undefined;
 	}
 	const match: ProviderToolsEntry["match"] = { api: "openai-responses" };
 	for (const key of ["provider", "modelId", "modelName"] as const) {
 		if (value[key] !== undefined) {
 			if (!isNonEmptyString(value[key])) {
-				warnings.push(`match.${key} must be a non-empty string`);
+				state.warnings.push(`match.${key} must be a non-empty string`);
+				state.hasFatal = true;
 				continue;
 			}
 			match[key] = value[key];
 		}
 	}
 	if (value.baseUrl !== undefined) {
-		const baseUrl = validateBaseUrl(value.baseUrl, warnings);
+		const baseUrl = validateBaseUrl(value.baseUrl, state);
 		if (baseUrl) {
 			match.baseUrl = baseUrl;
 		}
@@ -198,40 +210,49 @@ function validateMatch(value: unknown, warnings: string[]): ProviderToolsEntry["
 	return match;
 }
 
-function validateWebSearchTool(value: unknown, warnings: string[]): WebSearchToolConfig | undefined {
+function validateWebSearchTool(value: unknown, state: ValidationState): WebSearchToolConfig | undefined {
 	if (!isRecord(value)) {
-		warnings.push("tools.web_search must be an object");
+		state.warnings.push("tools.web_search must be an object");
 		return undefined;
 	}
-	warnUnknownFields(value, WEB_SEARCH_FIELDS, "tool", warnings);
+	if (warnUnknownFields(value, WEB_SEARCH_FIELDS, "tool", state)) {
+		return undefined;
+	}
+	let isValid = true;
 	const tool: WebSearchToolConfig = {};
 	if (value.enabled !== undefined) {
 		if (typeof value.enabled !== "boolean") {
-			warnings.push("web_search.enabled must be boolean");
+			state.warnings.push("web_search.enabled must be boolean");
+			isValid = false;
 		} else {
 			tool.enabled = value.enabled;
 		}
 	}
 	if (value.search_context_size !== undefined) {
 		if (!WEB_SEARCH_CONTEXT_SIZES.has(String(value.search_context_size))) {
-			warnings.push("web_search.search_context_size must be low, medium, or high");
+			state.warnings.push("web_search.search_context_size must be low, medium, or high");
+			isValid = false;
 		} else {
 			tool.search_context_size = value.search_context_size as WebSearchToolConfig["search_context_size"];
 		}
 	}
-	return tool;
+	return isValid ? tool : undefined;
 }
 
-function validateImageGenerationTool(value: unknown, warnings: string[]): ImageGenerationToolConfig | undefined {
+function validateImageGenerationTool(value: unknown, state: ValidationState): ImageGenerationToolConfig | undefined {
 	if (!isRecord(value)) {
-		warnings.push("tools.image_generation must be an object");
+		state.warnings.push("tools.image_generation must be an object");
 		return undefined;
 	}
-	warnUnknownFields(value, IMAGE_GENERATION_FIELDS, "tool", warnings);
+	if (warnUnknownFields(value, IMAGE_GENERATION_FIELDS, "tool", state)) {
+		return undefined;
+	}
+	let isValid = true;
 	const tool: ImageGenerationToolConfig = {};
 	if (value.enabled !== undefined) {
 		if (typeof value.enabled !== "boolean") {
-			warnings.push("image_generation.enabled must be boolean");
+			state.warnings.push("image_generation.enabled must be boolean");
+			isValid = false;
 		} else {
 			tool.enabled = value.enabled;
 		}
@@ -245,7 +266,8 @@ function validateImageGenerationTool(value: unknown, warnings: string[]): ImageG
 	for (const [field, allowed, description] of enumFields) {
 		if (value[field] !== undefined) {
 			if (!allowed.has(String(value[field]))) {
-				warnings.push(`image_generation.${field} must be ${description}`);
+				state.warnings.push(`image_generation.${field} must be ${description}`);
+				isValid = false;
 			} else {
 				(tool as UnknownRecord)[field] = value[field];
 			}
@@ -253,29 +275,31 @@ function validateImageGenerationTool(value: unknown, warnings: string[]): ImageG
 	}
 	if (value.size !== undefined) {
 		if (!isNonEmptyString(value.size)) {
-			warnings.push("image_generation.size must be a non-empty string");
+			state.warnings.push("image_generation.size must be a non-empty string");
+			isValid = false;
 		} else {
 			tool.size = value.size;
 		}
 	}
-	return tool;
+	return isValid ? tool : undefined;
 }
 
-function validateTools(value: unknown, warnings: string[]): ProviderToolsEntry["tools"] | undefined {
+function validateTools(value: unknown, state: ValidationState): ProviderToolsEntry["tools"] | undefined {
 	if (!isRecord(value)) {
-		warnings.push("provider tools must be an object");
+		state.warnings.push("provider tools must be an object");
+		state.hasFatal = true;
 		return undefined;
 	}
-	warnUnknownFields(value, TOOLS_FIELDS, "tools", warnings);
+	warnUnknownFields(value, TOOLS_FIELDS, "tools", state);
 	const tools: ProviderToolsEntry["tools"] = {};
 	if (value.web_search !== undefined) {
-		const webSearch = validateWebSearchTool(value.web_search, warnings);
+		const webSearch = validateWebSearchTool(value.web_search, state);
 		if (webSearch) {
 			tools.web_search = webSearch;
 		}
 	}
 	if (value.image_generation !== undefined) {
-		const imageGeneration = validateImageGenerationTool(value.image_generation, warnings);
+		const imageGeneration = validateImageGenerationTool(value.image_generation, state);
 		if (imageGeneration) {
 			tools.image_generation = imageGeneration;
 		}
@@ -283,16 +307,18 @@ function validateTools(value: unknown, warnings: string[]): ProviderToolsEntry["
 	return tools;
 }
 
-function validateOutput(value: unknown, warnings: string[]): ProviderToolsEntry["output"] | undefined {
+function validateOutput(value: unknown, state: ValidationState): ProviderToolsEntry["output"] | undefined {
 	if (!isRecord(value)) {
-		warnings.push("provider output must be an object");
+		state.warnings.push("provider output must be an object");
+		state.hasFatal = true;
 		return undefined;
 	}
-	warnUnknownFields(value, OUTPUT_FIELDS, "output", warnings);
+	warnUnknownFields(value, OUTPUT_FIELDS, "output", state);
 	const output: ProviderToolsEntry["output"] = {};
 	if (value.directory !== undefined) {
 		if (!isNonEmptyString(value.directory)) {
-			warnings.push("output.directory must be a non-empty string");
+			state.warnings.push("output.directory must be a non-empty string");
+			state.hasFatal = true;
 		} else {
 			output.directory = value.directory;
 		}
@@ -300,24 +326,26 @@ function validateOutput(value: unknown, warnings: string[]): ProviderToolsEntry[
 	return output;
 }
 
-function validateProvider(value: unknown, index: number, warnings: string[]): ProviderToolsEntry | undefined {
+function validateProvider(value: unknown, index: number, state: ValidationState): ProviderToolsEntry | undefined {
 	if (!isRecord(value)) {
-		warnings.push(`providers[${index}] must be an object`);
+		state.warnings.push(`providers[${index}] must be an object`);
+		state.hasFatal = true;
 		return undefined;
 	}
-	warnUnknownFields(value, PROVIDER_FIELDS, "provider", warnings);
+	warnUnknownFields(value, PROVIDER_FIELDS, "provider", state);
 	if (!isNonEmptyString(value.name)) {
-		warnings.push(`providers[${index}].name must be a non-empty string`);
+		state.warnings.push(`providers[${index}].name must be a non-empty string`);
+		state.hasFatal = true;
 	}
-	const match = validateMatch(value.match, warnings);
-	const tools = validateTools(value.tools, warnings);
+	const match = validateMatch(value.match, state);
+	const tools = validateTools(value.tools, state);
 	const entry: ProviderToolsEntry = {
 		name: isNonEmptyString(value.name) ? value.name : "",
 		match: match ?? { api: "openai-responses" },
 		tools: tools ?? {},
 	};
 	if (value.output !== undefined) {
-		const output = validateOutput(value.output, warnings);
+		const output = validateOutput(value.output, state);
 		if (output) {
 			entry.output = output;
 		}
@@ -326,23 +354,24 @@ function validateProvider(value: unknown, index: number, warnings: string[]): Pr
 }
 
 export function validateProviderToolsConfig(input: unknown): ValidationResult {
-	const warnings: string[] = [];
+	const state: ValidationState = { warnings: [], hasFatal: false };
 	if (!isRecord(input)) {
 		return { ok: false, warnings: ["config must be an object"] };
 	}
-	warnUnknownFields(input, TOP_LEVEL_FIELDS, "top-level", warnings);
+	warnUnknownFields(input, TOP_LEVEL_FIELDS, "top-level", state);
 	if (input.version !== 1) {
-		warnings.push("version must be 1");
+		state.warnings.push("version must be 1");
+		state.hasFatal = true;
 	}
 	if (!Array.isArray(input.providers)) {
-		warnings.push("providers must be an array");
-		return { ok: false, warnings };
+		state.warnings.push("providers must be an array");
+		return { ok: false, warnings: state.warnings };
 	}
-	const providers = input.providers.map((provider, index) => validateProvider(provider, index, warnings)).filter(Boolean) as ProviderToolsEntry[];
-	if (warnings.length > 0) {
-		return { ok: false, warnings };
+	const providers = input.providers.map((provider, index) => validateProvider(provider, index, state)).filter(Boolean) as ProviderToolsEntry[];
+	if (state.hasFatal) {
+		return { ok: false, warnings: state.warnings };
 	}
-	return { ok: true, config: { version: 1, providers }, warnings };
+	return { ok: true, config: { version: 1, providers }, warnings: state.warnings };
 }
 
 function normalizeConfig(config: ProviderToolsConfig, homeDir: string): ProviderToolsConfig {

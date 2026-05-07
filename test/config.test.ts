@@ -131,11 +131,14 @@ describe("provider tools config validation", () => {
 
 	it.each([
 		["web_search", "search_context_size", "maximum"],
+		["web_search", "enabled", "yes"],
 		["image_generation", "output_format", "gif"],
 		["image_generation", "quality", "ultra"],
 		["image_generation", "background", "checkerboard"],
 		["image_generation", "action", "inpaint"],
-	])("rejects invalid %s parameter %s", (toolName, field, value) => {
+		["image_generation", "size", ""],
+		["image_generation", "enabled", "yes"],
+	])("omits invalid %s parameter %s without rejecting the config", (toolName, field, value) => {
 		const base = validConfig();
 		const result = validateProviderToolsConfig({
 			...base,
@@ -147,8 +150,51 @@ describe("provider tools config validation", () => {
 			],
 		});
 
-		expect(result.ok).toBe(false);
+		expect(result.ok).toBe(true);
 		expect(result.warnings.join("\n")).toContain(String(field));
+		expect(result.config?.providers[0].tools).not.toHaveProperty(String(toolName));
+	});
+
+	it("omits invalid image_generation while preserving valid web_search", () => {
+		const base = validConfig();
+		const result = validateProviderToolsConfig({
+			...base,
+			providers: [
+				{
+					...base.providers[0],
+					tools: {
+						web_search: { enabled: true },
+						image_generation: { enabled: true, quality: "ultra" },
+					},
+				},
+			],
+		});
+
+		expect(result.ok).toBe(true);
+		expect(result.warnings.join("\n")).toContain("quality");
+		expect(result.config?.providers[0].tools.web_search?.enabled).toBe(true);
+		expect(result.config?.providers[0].tools).not.toHaveProperty("image_generation");
+	});
+
+	it("omits invalid web_search while preserving valid image_generation", () => {
+		const base = validConfig();
+		const result = validateProviderToolsConfig({
+			...base,
+			providers: [
+				{
+					...base.providers[0],
+					tools: {
+						web_search: { enabled: true, search_context_size: "maximum" },
+						image_generation: { enabled: true, output_format: "webp" },
+					},
+				},
+			],
+		});
+
+		expect(result.ok).toBe(true);
+		expect(result.warnings.join("\n")).toContain("search_context_size");
+		expect(result.config?.providers[0].tools.image_generation?.output_format).toBe("webp");
+		expect(result.config?.providers[0].tools).not.toHaveProperty("web_search");
 	});
 });
 
