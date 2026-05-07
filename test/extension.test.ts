@@ -321,6 +321,22 @@ describe("OpenAI provider tools extension", () => {
 		expect(extension.activeTools()).toEqual(["read", "web_search", "generate_image"]);
 		expect(payload.tools).toBeUndefined();
 	});
+	it("uses request-scoped Responses api metadata when context model api is missing", async () => {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		await writeConfig({ cwd, runtime: "omp", content: webSearchOnlyConfig() });
+		const extension = registerExtension();
+		const ctx = context(cwd, homeDir, {
+			model: { id: targetModel.id, name: targetModel.name, provider: targetModel.provider, baseUrl: targetModel.baseUrl },
+		});
+		const requestModel = { ...targetModel };
+		const payload: Record<string, unknown> = { model: "gpt-5", input: "hello" };
+
+		await runBeforeProvider(extension, payload, ctx, { requestModel });
+
+		expect(payload.tools).toEqual([{ type: "web_search" }]);
+		expect(payload).not.toHaveProperty("tool_choice");
+	});
 
 	it("does not inject image_generation when matching model identity lacks explicit Responses api", async () => {
 		const cwd = await makeTempDir();

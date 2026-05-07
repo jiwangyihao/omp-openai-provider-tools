@@ -301,8 +301,10 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 
 	api.on?.("before_provider_request", async (event, ctx) => {
 		const payload = requestPayload(event);
+		const eventModel = requestEventModel(event);
+		const eligibilityModel = eventModel ?? ctx.model;
 		imageResultState.outputDirectory = undefined;
-		if (!isExplicitOpenAIResponsesModel(ctx.model)) {
+		if (!isExplicitOpenAIResponsesModel(eligibilityModel)) {
 			const pending = pendingRemovedState(expectedByTarget);
 			if (pending) {
 				const [key, state] = pending;
@@ -319,7 +321,7 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 			return undefined;
 		}
 		const { config } = await loadConfig(api, ctx, visibleConfigWarnings);
-		const target = buildRequestTarget({ payload, contextModel: ctx.model, eventModel: requestEventModel(event) });
+		const target = buildRequestTarget({ payload, contextModel: ctx.model, eventModel });
 		if (!target) {
 			const pending = pendingRemovedState(expectedByTarget);
 			if (pending) {
