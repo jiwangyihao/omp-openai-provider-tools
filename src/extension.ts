@@ -54,6 +54,16 @@ function coversExpected(ensured: readonly ProviderToolType[], expected: readonly
 	return expected.every((tool) => ensuredSet.has(tool));
 }
 
+function pendingRemovedState(
+	expectedByTarget: Map<string, ExpectedToolsState>,
+	matches?: (key: string, state: ExpectedToolsState) => boolean,
+): [string, ExpectedToolsState] | undefined {
+	for (const [key, state] of expectedByTarget) {
+		if (state.removed && (!matches || matches(key, state))) return [key, state];
+	}
+	return undefined;
+}
+
 function warningMessage(reason: string): string {
 	return `OpenAI provider tools could not be safely injected: ${reason}`;
 }
@@ -287,7 +297,7 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 		const { config } = await loadConfig(api, ctx, visibleConfigWarnings);
 		const target = buildRequestTarget({ payload, contextModel: ctx.model, eventModel: requestEventModel(event) });
 		if (!target) {
-			const pending = [...expectedByTarget.entries()].find(([, state]) => state.removed);
+			const pending = pendingRemovedState(expectedByTarget);
 			if (pending) {
 				const [key, state] = pending;
 				await failAfterRemoval({ api, ctx, reason: "provider request target could not be verified after host-side tool removal", state, incompatibleTargets, key });
@@ -297,13 +307,41 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 		}
 
 		const key = targetKey(target);
-		if (incompatibleTargets.has(key)) return undefined;
+		const crossTargetPending = pendingRemovedState(expectedByTarget, (pendingKey) => pendingKey !== key);
+		if (crossTargetPending) {
+			const [pendingKey, state] = crossTargetPending;
+			await failAfterRemoval({
+				api,
+				ctx,
+				reason: "provider request target differed after host-side tool removal",
+				state,
+				incompatibleTargets,
+				key: pendingKey,
+			});
+			expectedByTarget.delete(pendingKey);
+			return undefined;
+		}
+
+		if (incompatibleTargets.has(key)) {
+			const pending = pendingRemovedState(expectedByTarget, (pendingKey) => pendingKey === key);
+			if (pending) {
+				const [pendingKey, state] = pending;
+				await failAfterRemoval({
+					api,
+					ctx,
+					reason: "provider request target is incompatible after host-side tool removal",
+					state,
+					incompatibleTargets,
+					key: pendingKey,
+				});
+				expectedByTarget.delete(pendingKey);
+			}
+			return undefined;
+		}
 		const entry = findMatchingProvider(config, target);
 		if (!entry) {
 			const expected = expectedByTarget.get(key);
-			const pending: [string, ExpectedToolsState] | undefined = expected
-				? [key, expected]
-				: [...expectedByTarget.entries()].find(([, state]) => state.removed);
+			const pending: [string, ExpectedToolsState] | undefined = expected ? [key, expected] : pendingRemovedState(expectedByTarget);
 			if (pending) {
 				const [pendingKey, state] = pending;
 				await failAfterRemoval({
@@ -319,21 +357,6 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 			return undefined;
 		}
 		updateImageResultState(imageResultState, entry);
-		const crossTargetPending = [...expectedByTarget.entries()].find(([pendingKey, state]) => pendingKey !== key && state.removed);
-		const enabledProviderTools = getEnabledProviderToolTypes(entry);
-		if (crossTargetPending && !coversExpected(enabledProviderTools, crossTargetPending[1].expected)) {
-			const [pendingKey, state] = crossTargetPending;
-			await failAfterRemoval({
-				api,
-				ctx,
-				reason: "ensured provider tools did not cover tools removed from the host runtime",
-				state,
-				incompatibleTargets,
-				key: pendingKey,
-			});
-			expectedByTarget.delete(pendingKey);
-			return undefined;
-		}
 		const result = injectConfiguredTools(payload, entry);
 		const expected = expectedByTarget.get(key);
 		if (!result.ok) {
@@ -356,7 +379,6 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 		}
 
 		expectedByTarget.delete(key);
-		if (crossTargetPending) expectedByTarget.delete(crossTargetPending[0]);
 		return undefined;
 	});
 

@@ -104,6 +104,32 @@ providers:
 `;
 }
 
+function crossTargetBothToolsConfig(): string {
+	return `version: 1
+providers:
+  - name: context-provider
+    match:
+      api: openai-responses
+      provider: openai
+      modelId: gpt-5
+    tools:
+      web_search:
+        enabled: true
+      image_generation:
+        enabled: true
+  - name: request-provider
+    match:
+      api: openai-responses
+      provider: other
+      modelId: other-model
+    tools:
+      web_search:
+        enabled: true
+      image_generation:
+        enabled: true
+`;
+}
+
 function noEnabledToolsConfig(): string {
 	return providerConfig(`      web_search:
         enabled: false
@@ -464,7 +490,84 @@ describe("OpenAI provider tools extension", () => {
 		expect(extension.activeTools()).toEqual(["read"]);
 		await runBeforeProvider(extension, payload, ctx, { requestModel });
 
-		expect(abortMessage).toContain("ensured provider tools did not cover tools removed from the host runtime");
+		expect(abortMessage).toContain("provider request target differed after host-side tool removal");
+		expect(extension.activeTools()).toEqual(["read", "web_search", "generate_image"]);
+		expect(payload.tools).toBeUndefined();
+	});
+
+	it("restores and aborts when a different request target could inject the same tools as a pending removal", async () => {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		await writeConfig({ cwd, runtime: "omp", content: crossTargetBothToolsConfig() });
+		const extension = registerExtension();
+		let abortMessage = "";
+		const ctx = context(cwd, homeDir, {
+			abort: (message: string) => {
+				abortMessage = message;
+			},
+		});
+		const requestModel = { ...targetModel, id: "other-model", provider: "other" };
+		const payload: Record<string, unknown> = { model: "gpt-5", input: "hello" };
+
+		await runBeforeAgent(extension, ctx);
+		expect(extension.activeTools()).toEqual(["read"]);
+		await runBeforeProvider(extension, payload, ctx, { requestModel });
+
+		expect(abortMessage).toContain("provider request target differed after host-side tool removal");
+		expect(extension.activeTools()).toEqual(["read", "web_search", "generate_image"]);
+		expect(payload.tools).toBeUndefined();
+		expect(extension.warnings.join("\n")).toContain("provider request target differed after host-side tool removal");
+	});
+
+	it("restores and aborts before returning for an incompatible different request target", async () => {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		await writeConfig({ cwd, runtime: "omp", content: crossTargetBothToolsConfig() });
+		const extension = registerExtension();
+		let abortMessage = "";
+		const ctxA = context(cwd, homeDir, {
+			abort: (message: string) => {
+				abortMessage = message;
+			},
+		});
+		const ctxB = context(cwd, homeDir, {
+			model: { ...targetModel, id: "other-model", provider: "other" },
+			abort: (message: string) => {
+				abortMessage = message;
+			},
+		});
+
+		await runBeforeAgent(extension, ctxB);
+		await runBeforeProvider(extension, { model: "other-model", input: "hello", tools: "bad" }, ctxB);
+		expect(extension.activeTools()).toEqual(["read", "web_search", "generate_image"]);
+		abortMessage = "";
+
+		await runBeforeAgent(extension, ctxA);
+		expect(extension.activeTools()).toEqual(["read"]);
+		await runBeforeProvider(extension, { model: "other-model", input: "hello" }, ctxB);
+
+		expect(abortMessage).toContain("provider request target differed after host-side tool removal");
+		expect(extension.activeTools()).toEqual(["read", "web_search", "generate_image"]);
+	});
+
+	it("restores and aborts when payload and context mismatch after host-side removal", async () => {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		await writeConfig({ cwd, runtime: "omp", content: webSearchOnlyConfig() });
+		const extension = registerExtension();
+		let abortMessage = "";
+		const ctx = context(cwd, homeDir, {
+			abort: (message: string) => {
+				abortMessage = message;
+			},
+		});
+		const payload: Record<string, unknown> = { model: "other-model", input: "hello" };
+
+		await runBeforeAgent(extension, ctx);
+		expect(extension.activeTools()).toEqual(["read", "generate_image"]);
+		await runBeforeProvider(extension, payload, ctx);
+
+		expect(abortMessage).toContain("provider request target could not be verified after host-side tool removal");
 		expect(extension.activeTools()).toEqual(["read", "web_search", "generate_image"]);
 		expect(payload.tools).toBeUndefined();
 	});
@@ -486,9 +589,9 @@ describe("OpenAI provider tools extension", () => {
 		expect(extension.activeTools()).toEqual(["read", "generate_image"]);
 		await runBeforeProvider(extension, { model: "gpt-5", input: "hello" }, ctx, { requestModel });
 
-		expect(abortMessage).toContain("provider request no longer matched configured provider tools after host-side tool removal");
+		expect(abortMessage).toContain("provider request target differed after host-side tool removal");
 		expect(extension.activeTools()).toEqual(["read", "web_search", "generate_image"]);
-		expect(extension.warnings.join("\n")).toContain("provider request no longer matched configured provider tools after host-side tool removal");
+		expect(extension.warnings.join("\n")).toContain("provider request target differed after host-side tool removal");
 	});
 
 	it("does not inject when payload and context model mismatch", async () => {
