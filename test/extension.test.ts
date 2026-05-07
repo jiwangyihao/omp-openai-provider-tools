@@ -76,6 +76,20 @@ function noEnabledToolsConfig(): string {
 `);
 }
 
+function noMatchingProviderConfig(): string {
+	return `version: 1
+providers:
+  - name: other-provider
+    match:
+      api: openai-responses
+      provider: other
+      modelId: other-model
+    tools:
+      web_search:
+        enabled: true
+`;
+}
+
 function registerExtension({ runtime = "omp", initialActiveTools = ["read", "web_search", "generate_image"] }: { runtime?: RuntimeKind; initialActiveTools?: any[] } = {}) {
 	const handlers = new Map<string, Handler[]>();
 	const warnings: unknown[][] = [];
@@ -127,8 +141,8 @@ async function runBeforeAgent(extension: ReturnType<typeof registerExtension>, c
 	return getHandler(extension, "before_agent_start")({ type: "before_agent_start" }, ctx);
 }
 
-async function runBeforeProvider(extension: ReturnType<typeof registerExtension>, payload: Record<string, unknown>, ctx: any) {
-	return getHandler(extension, "before_provider_request")({ type: "before_provider_request", payload }, ctx);
+async function runBeforeProvider(extension: ReturnType<typeof registerExtension>, payload: Record<string, unknown>, ctx: any, eventOverrides: Record<string, unknown> = {}) {
+	return getHandler(extension, "before_provider_request")({ type: "before_provider_request", payload, ...eventOverrides }, ctx);
 }
 
 describe("OpenAI provider tools extension", () => {
@@ -254,6 +268,50 @@ describe("OpenAI provider tools extension", () => {
 
 		expect(aborted).toBe(true);
 		expect(extension.activeTools()).toEqual(["read", "web_search", "generate_image"]);
+	});
+
+	it("restores active tools and aborts when provider entry disappears after host-side removal", async () => {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		await writeConfig({ cwd, runtime: "omp", content: webSearchOnlyConfig() });
+		const extension = registerExtension();
+		let abortMessage = "";
+		const ctx = context(cwd, homeDir, {
+			abort: (message: string) => {
+				abortMessage = message;
+			},
+		});
+
+		await runBeforeAgent(extension, ctx);
+		expect(extension.activeTools()).toEqual(["read", "generate_image"]);
+		await writeConfig({ cwd, runtime: "omp", content: noMatchingProviderConfig() });
+		await runBeforeProvider(extension, { model: "gpt-5", input: "hello" }, ctx);
+
+		expect(abortMessage).toContain("provider request no longer matched configured provider tools after host-side tool removal");
+		expect(extension.activeTools()).toEqual(["read", "web_search", "generate_image"]);
+		expect(extension.warnings.join("\n")).toContain("provider request no longer matched configured provider tools after host-side tool removal");
+	});
+
+	it("restores active tools and aborts when request-scoped model changes target after host-side removal", async () => {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		await writeConfig({ cwd, runtime: "omp", content: webSearchOnlyConfig() });
+		const extension = registerExtension();
+		let abortMessage = "";
+		const ctx = context(cwd, homeDir, {
+			abort: (message: string) => {
+				abortMessage = message;
+			},
+		});
+		const requestModel = { ...targetModel, id: "other-model", provider: "other" };
+
+		await runBeforeAgent(extension, ctx);
+		expect(extension.activeTools()).toEqual(["read", "generate_image"]);
+		await runBeforeProvider(extension, { model: "gpt-5", input: "hello" }, ctx, { requestModel });
+
+		expect(abortMessage).toContain("provider request no longer matched configured provider tools after host-side tool removal");
+		expect(extension.activeTools()).toEqual(["read", "web_search", "generate_image"]);
+		expect(extension.warnings.join("\n")).toContain("provider request no longer matched configured provider tools after host-side tool removal");
 	});
 
 	it("does not inject when payload and context model mismatch", async () => {

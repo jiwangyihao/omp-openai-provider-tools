@@ -166,8 +166,25 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 
 		const key = targetKey(target);
 		const entry = findMatchingProvider(config, target);
-		if (!entry) return undefined;
-
+		if (!entry) {
+			const expected = expectedByTarget.get(key);
+			const pending: [string, ExpectedToolsState] | undefined = expected
+				? [key, expected]
+				: [...expectedByTarget.entries()].find(([, state]) => state.removed);
+			if (pending) {
+				const [pendingKey, state] = pending;
+				await failAfterRemoval({
+					api,
+					ctx,
+					reason: "provider request no longer matched configured provider tools after host-side tool removal",
+					state,
+					incompatibleTargets,
+					key: pendingKey,
+				});
+				expectedByTarget.delete(pendingKey);
+			}
+			return undefined;
+		}
 		const result = injectConfiguredTools(payload, entry);
 		const expected = expectedByTarget.get(key);
 		if (!result.ok) {
