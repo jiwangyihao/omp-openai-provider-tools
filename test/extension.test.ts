@@ -160,6 +160,10 @@ async function runAgentEnd(extension: ReturnType<typeof registerExtension>, even
 	return getHandler(extension, "agent_end")(event, ctx);
 }
 
+async function runSessionStart(extension: ReturnType<typeof registerExtension>, ctx: any) {
+	return getHandler(extension, "session_start")({ type: "session_start" }, ctx);
+}
+
 function imageGenerationMessage(id = "img-1", result = ONE_BY_ONE_PNG) {
 	return {
 		providerPayload: {
@@ -429,6 +433,43 @@ describe("OpenAI provider tools extension", () => {
 		expect(message.content).not.toContain(ONE_BY_ONE_PNG);
 	});
 
+	it("reports malformed id-less image results and continues with later valid results", async () => {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		const artifactsDir = path.join(cwd, "artifacts");
+		const invalidResult = "not valid base64!!!";
+		const extension = registerExtension();
+		const ctx = context(cwd, homeDir, {
+			sessionManager: {
+				getSessionId: () => "session-1",
+				getArtifactsDir: () => artifactsDir,
+			},
+		});
+
+		await expect(runAgentEnd(extension, {
+			message: {
+				providerPayload: {
+					type: "openaiResponsesHistory",
+					items: [
+						{ type: "image_generation_call", result: invalidResult, output_format: "png" },
+						{ type: "image_generation_call", id: "img-2", result: ONE_BY_ONE_PNG, output_format: "png" },
+					],
+				},
+			},
+		}, ctx)).resolves.toBeUndefined();
+
+		const files = await directoryEntries(artifactsDir);
+		expect(files).toHaveLength(1);
+		expect(extension.sentMessages).toHaveLength(2);
+		const errorMessage = extension.sentMessages[0]?.message as any;
+		expect(errorMessage.display).toBe(true);
+		expect(errorMessage.content).toMatch(/could not be saved|base64 is invalid/i);
+		expect(errorMessage.content).not.toContain(invalidResult);
+		const savedMessage = extension.sentMessages[1]?.message as any;
+		expect(savedMessage.content).toContain(path.join(artifactsDir, files[0] ?? ""));
+		expect(savedMessage.content).not.toContain(ONE_BY_ONE_PNG);
+	});
+
 	it("deduplicates the same image result within one session", async () => {
 		const cwd = await makeTempDir();
 		const homeDir = await makeTempDir();
@@ -446,6 +487,25 @@ describe("OpenAI provider tools extension", () => {
 
 		expect(await directoryEntries(artifactsDir)).toHaveLength(1);
 		expect(extension.sentMessages).toHaveLength(1);
+	});
+
+	it("resets image result deduplication on session_start", async () => {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		const artifactsDir = path.join(cwd, "artifacts");
+		const extension = registerExtension();
+		const ctx = context(cwd, homeDir, {
+			sessionManager: {
+				getArtifactsDir: () => artifactsDir,
+			},
+		});
+
+		await runAgentEnd(extension, { message: imageGenerationMessage("img-1") }, ctx);
+		await runSessionStart(extension, ctx);
+		await runAgentEnd(extension, { message: imageGenerationMessage("img-1") }, ctx);
+
+		expect(await directoryEntries(artifactsDir)).toHaveLength(1);
+		expect(extension.sentMessages).toHaveLength(2);
 	});
 
 	it("prefers configured output.directory over the session artifact directory", async () => {

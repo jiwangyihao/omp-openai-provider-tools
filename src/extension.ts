@@ -122,10 +122,10 @@ async function handleAgentEndImageResults({
 	};
 
 	for (const result of results) {
-		const key = imageResultKey(sessionId, result);
-		if (seen.has(key)) continue;
-		seen.add(key);
 		try {
+			const key = imageResultKey(sessionId, result);
+			if (seen.has(key)) continue;
+			seen.add(key);
 			const saved = await saveImageResult(result, locations);
 			await sendVisibleImageMessage(api, buildImageMessage(result, saved));
 		} catch (error) {
@@ -207,6 +207,7 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 	const seenImageResults = new Set<string>();
 
 	api.on?.("session_start", async (_event, ctx) => {
+		seenImageResults.clear();
 		await loadConfig(api, ctx);
 	});
 
