@@ -186,6 +186,18 @@ describe("provider tools config paths and loading", () => {
 		expect(loaded.warnings).toEqual([]);
 	});
 
+	it("preserves only explicitly configured tool fields when loading", async () => {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		const paths = getConfigPaths({ cwd, homeDir, runtime: "omp" });
+		await writeConfig(paths.project, `version: 1\nproviders:\n  - name: image-only\n    match:\n      api: openai-responses\n    tools:\n      image_generation:\n        enabled: true\n`);
+
+		const loaded = await loadProviderToolsConfig({ cwd, homeDir, runtime: "omp" });
+
+		expect(Object.hasOwn(loaded.config.providers[0].tools, "web_search")).toBe(false);
+		expect(Object.hasOwn(loaded.config.providers[0].tools, "image_generation")).toBe(true);
+	});
+
 	it("reads Pi config paths for Pi runtime", async () => {
 		const cwd = await makeTempDir();
 		const homeDir = await makeTempDir();
@@ -242,6 +254,11 @@ describe("runtime detection", () => {
 
 	it.each(["oh-my-pi", "omp"])("detects OMP runtime metadata %s", (name) => {
 		expect(detectRuntimeKind({ runtime: { name } }, {})).toBe("omp");
+	});
+
+	it("prefers recognized explicit runtime kind when display name is unrecognized", () => {
+		expect(detectRuntimeKind({ runtime: { name: "Pi CLI", kind: "pi" } }, {})).toBe("pi");
+		expect(detectRuntimeKind({ runtime: { name: "OpenClaw", kind: "omp" } }, {})).toBe("omp");
 	});
 
 	it("detects capability metadata without guessing unknown as OMP", () => {

@@ -129,9 +129,13 @@ function metadataCandidates(api: unknown, ctx: unknown): RuntimeMetadata[] {
 
 export function detectRuntimeKind(api: ExtensionApiLike | unknown, ctx: ExtensionContextLike | unknown): RuntimeKind {
 	for (const candidate of metadataCandidates(api, ctx)) {
-		const byName = normalizeRuntimeName(candidate.name ?? candidate.kind);
+		const byName = normalizeRuntimeName(candidate.name);
 		if (byName !== "unknown") {
 			return byName;
+		}
+		const byKind = normalizeRuntimeName(candidate.kind);
+		if (byKind !== "unknown") {
+			return byKind;
 		}
 	}
 	for (const candidate of metadataCandidates(api, ctx)) {
@@ -342,18 +346,24 @@ export function validateProviderToolsConfig(input: unknown): ValidationResult {
 }
 
 function normalizeConfig(config: ProviderToolsConfig, homeDir: string): ProviderToolsConfig {
-	return {
-		version: 1,
-		providers: config.providers.map((provider) => ({
+	const providers = config.providers.map((provider) => {
+		const tools: ProviderToolsEntry["tools"] = {};
+		if (provider.tools.web_search) {
+			tools.web_search = { ...provider.tools.web_search };
+		}
+		if (provider.tools.image_generation) {
+			tools.image_generation = { ...provider.tools.image_generation };
+		}
+
+		return {
 			...provider,
 			match: { ...provider.match },
-			tools: {
-				web_search: provider.tools.web_search ? { ...provider.tools.web_search } : undefined,
-				image_generation: provider.tools.image_generation ? { ...provider.tools.image_generation } : undefined,
-			},
+			tools,
 			output: provider.output?.directory ? { directory: expandHome(provider.output.directory, homeDir) } : provider.output ? { ...provider.output } : undefined,
-		})),
-	};
+		};
+	});
+
+	return { version: 1, providers };
 }
 
 async function readConfigFile(filePath: string, homeDir: string): Promise<{ config?: ProviderToolsConfig; warning?: string; exists: boolean }> {
