@@ -87,6 +87,12 @@ function updateImageResultState(state: ImageResultState, entry: ProviderToolsEnt
 	}
 }
 
+function logImageSaveFailure(api: ExtensionApiLike, ctx: ExtensionContextLike, error: unknown): void {
+	const message = `OpenAI provider image result could not be saved: ${error instanceof Error ? error.message : String(error)}`;
+	api.logger?.warn?.(message, error);
+	ctx.logger?.warn?.(message, error);
+}
+
 async function sendVisibleImageMessage(api: ExtensionApiLike, message: unknown): Promise<void> {
 	await api.sendMessage?.(message, { deliverAs: "nextTurn" });
 }
@@ -129,6 +135,7 @@ async function handleAgentEndImageResults({
 			const saved = await saveImageResult(result, locations);
 			await sendVisibleImageMessage(api, buildImageMessage(result, saved));
 		} catch (error) {
+			logImageSaveFailure(api, ctx, error);
 			await sendVisibleImageMessage(api, buildImageErrorMessage(result, error));
 		}
 	}
@@ -208,6 +215,7 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 
 	api.on?.("session_start", async (_event, ctx) => {
 		seenImageResults.clear();
+		imageResultState.outputDirectory = undefined;
 		await loadConfig(api, ctx);
 	});
 
@@ -247,6 +255,7 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 
 	api.on?.("before_provider_request", async (event, ctx) => {
 		const payload = requestPayload(event);
+		imageResultState.outputDirectory = undefined;
 		const { config } = await loadConfig(api, ctx);
 		const target = buildRequestTarget({ payload, contextModel: ctx.model, eventModel: requestEventModel(event) });
 		if (!target) {

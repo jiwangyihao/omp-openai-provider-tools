@@ -101,7 +101,7 @@ providers:
 `;
 }
 
-function registerExtension({ runtime = "omp", initialActiveTools = ["read", "web_search", "generate_image"] }: { runtime?: RuntimeKind; initialActiveTools?: any[] } = {}) {
+function registerExtension({ runtime = "omp", initialActiveTools = ["read", "web_search", "generate_image"], sendMessage = true }: { runtime?: RuntimeKind; initialActiveTools?: any[]; sendMessage?: boolean } = {}) {
 	const handlers = new Map<string, Handler[]>();
 	const warnings: unknown[][] = [];
 	const sentMessages: Array<{ message: unknown; options: unknown }> = [];
@@ -130,9 +130,13 @@ function registerExtension({ runtime = "omp", initialActiveTools = ["read", "web
 		setActiveTools(next: any[]) {
 			activeTools = next;
 		},
-		sendMessage(message: unknown, options?: unknown) {
-			sentMessages.push({ message, options });
-		},
+		...(sendMessage
+			? {
+				sendMessage(message: unknown, options?: unknown) {
+					sentMessages.push({ message, options });
+				},
+			}
+			: {}),
 	};
 	providerToolsExtension(api);
 	return { activeTools: () => activeTools, handlers, label: () => label, sentMessages, warnings };
@@ -531,6 +535,59 @@ describe("OpenAI provider tools extension", () => {
 		expect(message.content).toContain(outputDir);
 	});
 
+	it("clears configured image output directory on session_start", async () => {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		const outputDir = path.join(cwd, "configured-output");
+		const artifactsDir = path.join(cwd, "artifacts");
+		await writeConfig({ cwd, runtime: "omp", content: imageConfigWithOutput(outputDir) });
+		const extension = registerExtension();
+		const ctx = context(cwd, homeDir, {
+			sessionManager: {
+				getSessionId: () => "session-1",
+				getArtifactsDir: () => artifactsDir,
+			},
+		});
+
+		await runBeforeProvider(extension, { model: "gpt-5", input: "hello" }, ctx);
+		await runAgentEnd(extension, { message: imageGenerationMessage("img-1") }, ctx);
+		await runSessionStart(extension, ctx);
+		await runAgentEnd(extension, { message: imageGenerationMessage("img-2") }, ctx);
+
+		expect(await directoryEntries(outputDir)).toHaveLength(1);
+		expect(await directoryEntries(artifactsDir)).toHaveLength(1);
+		const secondMessage = extension.sentMessages[1]?.message as any;
+		expect(secondMessage.content).toContain(artifactsDir);
+		expect(secondMessage.content).not.toContain(outputDir);
+	});
+
+	it("clears previous image output directory for requests without image generation enabled", async () => {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		const outputDir = path.join(cwd, "configured-output");
+		const artifactsDir = path.join(cwd, "artifacts");
+		await writeConfig({ cwd, runtime: "omp", content: imageConfigWithOutput(outputDir) });
+		const extension = registerExtension();
+		const ctx = context(cwd, homeDir, {
+			sessionManager: {
+				getSessionId: () => "session-1",
+				getArtifactsDir: () => artifactsDir,
+			},
+		});
+
+		await runBeforeProvider(extension, { model: "gpt-5", input: "hello" }, ctx);
+		await runAgentEnd(extension, { message: imageGenerationMessage("img-1") }, ctx);
+		await writeConfig({ cwd, runtime: "omp", content: webSearchOnlyConfig() });
+		await runBeforeProvider(extension, { model: "gpt-5", input: "hello" }, ctx);
+		await runAgentEnd(extension, { message: imageGenerationMessage("img-2") }, ctx);
+
+		expect(await directoryEntries(outputDir)).toHaveLength(1);
+		expect(await directoryEntries(artifactsDir)).toHaveLength(1);
+		const secondMessage = extension.sentMessages[1]?.message as any;
+		expect(secondMessage.content).toContain(artifactsDir);
+		expect(secondMessage.content).not.toContain(outputDir);
+	});
+
 	it("uses the agent default image directory when no artifact directory is available", async () => {
 		const cwd = await makeTempDir();
 		const homeDir = await makeTempDir();
@@ -572,5 +629,27 @@ describe("OpenAI provider tools extension", () => {
 		expect(message.display).toBe(true);
 		expect(message.content).toContain("could not be saved");
 		expect(message.content).not.toContain(ONE_BY_ONE_PNG);
+	});
+
+	it("logs image save failures when visible messaging is unavailable", async () => {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		const outputParentFile = path.join(cwd, "not-a-directory");
+		const badOutputDir = path.join(outputParentFile, "images");
+		await fs.writeFile(outputParentFile, "file blocks directory creation");
+		await writeConfig({ cwd, runtime: "omp", content: imageConfigWithOutput(badOutputDir) });
+		const extension = registerExtension({ sendMessage: false });
+		const ctx = context(cwd, homeDir, {
+			sessionManager: {
+				getSessionId: () => "session-1",
+				getArtifactsDir: () => path.join(cwd, "artifacts"),
+			},
+		});
+		await runBeforeProvider(extension, { model: "gpt-5", input: "hello" }, ctx);
+
+		await expect(runAgentEnd(extension, { message: imageGenerationMessage() }, ctx)).resolves.toBeUndefined();
+
+		expect(extension.sentMessages).toHaveLength(0);
+		expect(extension.warnings.join("\n")).toContain("OpenAI provider image result could not be saved");
 	});
 });
