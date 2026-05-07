@@ -199,7 +199,7 @@ When an image is saved, the plugin sends a visible custom message with the saved
 
 ## Manual validation matrix
 
-Before publishing or enabling the plugin in a runtime, validate the relevant rows for your target environment.
+Before publishing or enabling the plugin in a runtime, validate the relevant rows for your target environment. Rows marked **live e2e** send requests to the configured provider and may consume provider quota; run them only with an intentionally configured test account/model.
 
 | Area | Validation |
 | --- | --- |
@@ -209,8 +209,8 @@ Before publishing or enabling the plugin in a runtime, validate the relevant row
 | Pi explicit package flag | Run `pi -e npm:omp-openai-provider-tools`. |
 | Official OpenAI dry run | Use a non-secret runtime provider configuration named `openai`; confirm the matching entry injects only enabled provider-native tools. |
 | Compatible provider dry run | Use a test runtime provider named `compatible-example` with `https://gateway.example.invalid/v1`; confirm matching uses the compatible entry. |
-| Provider-native `web_search` | Send a request that allows provider-native search and confirm the Responses request carries `web_search`. |
-| Provider-native `image_generation` | Send a request that allows provider-native image generation and confirm the Responses request carries `image_generation`. |
-| Image file saved | Confirm the visible custom message reports the saved image path and the file exists in the configured output, session artifact, or agent default image directory. |
+| Provider-native `web_search` live e2e | Send a real request that allows provider-native search; confirm the Responses request carries `web_search` and the provider returns native search call history or a provider-side error transparently. |
+| Provider-native `image_generation` live e2e | Send a real request that allows provider-native image generation; confirm the Responses request carries `image_generation` and the provider returns native image generation call history or a provider-side error transparently. |
+| Image file saved live e2e | After a provider-native image generation response, confirm the visible custom message reports the saved image path and the file exists in the configured output, session artifact, or agent default image directory. |
 | Targeted tests | Run `bun test test/package-manifest.test.ts`. |
 | Package dry run | Run `bun pm pack --dry-run`. |
