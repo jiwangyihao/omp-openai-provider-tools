@@ -16,6 +16,14 @@ export const OMP_14_7_3_CAPABILITIES = [
 		evidence: "OMP 14.7.3 extension runtime source; docs/superpowers/specs/2026-05-07-openai-provider-tools-design.md#runtime-support-boundary",
 		pluginBehavior: "Register the provider request hook through the runtime extension entry and inspect only OpenAI Responses payloads.",
 	},
+
+	{
+		runtime: "omp@14.7.3",
+		capability: "extension factory shape",
+		status: "observed",
+		evidence: "OMP 14.7.3 extension runtime and manifest docs define the extension factory/entry shape; docs/superpowers/specs/2026-05-07-openai-provider-tools-design.md#runtime-support-boundary",
+		pluginBehavior: "Export the shared extension entry in the documented shape and attach hooks through runtime registration only.",
+	},
 	{
 		runtime: "omp@14.7.3",
 		capability: "before_provider_request payload mutation is synchronous and in-place",
@@ -43,6 +51,38 @@ export const OMP_14_7_3_CAPABILITIES = [
 		status: "observed",
 		evidence: "OMP 14.7.3 extension/custom tool context shapes",
 		pluginBehavior: "Use request-scoped model metadata when available and fall back to context model only after consistency checks.",
+	},
+
+	{
+		runtime: "omp@14.7.3",
+		capability: "request-scoped model and context model metadata",
+		status: "observed",
+		evidence: "OMP 14.7.3 extension/custom tool context shapes expose model metadata; provider request handling requires OpenAI Responses payload model consistency",
+		pluginBehavior: "Prefer request/event model metadata when present; use context model metadata only after consistency checks confirm it describes the current provider request.",
+	},
+
+	{
+		runtime: "omp@14.7.3",
+		capability: "active tools conflict-control API is capability-gated",
+		status: "required",
+		evidence: "No exact OMP 14.7.3 active-tools get/set API is recorded in this fixture; safe removal requires an observed read/write or equivalent block/restore mechanism",
+		pluginBehavior: "Remove conflicting host-side tools only when safe conflict control exists and provider-native injection is ensured; otherwise warn and avoid unsafe removal.",
+	},
+
+	{
+		runtime: "omp@14.7.3",
+		capability: "system prompt and before-agent behavior is not required for correctness",
+		status: "guarded",
+		evidence: "Exact system prompt mutation or before-agent return semantics are not recorded as an observed dependency for provider-native tool injection",
+		pluginBehavior: "Keep correctness independent from system prompt mutation; rely on provider request hooks plus visible warnings.",
+	},
+
+	{
+		runtime: "omp@14.7.3",
+		capability: "agent_end assistant message shape includes providerPayload for native history",
+		status: "observed",
+		evidence: "Extension events can access AgentMessage; observed assistant messages preserve providerPayload.type === 'openaiResponsesHistory' with providerPayload.items[]",
+		pluginBehavior: "Parse only observed assistant/provider payloads for image results and warn visibly when native history is absent.",
 	},
 	{
 		runtime: "omp@14.7.3",
@@ -75,6 +115,22 @@ export const PI_FAMILY_REQUIRED_CAPABILITIES = [
 		evidence: "Runtime must expose current tool names and a safe way to remove conflicting host-side tools for the turn",
 		pluginBehavior: "Remove conflicting host-side tools only after provider-native injection is ensured or can be safely blocked/restored on failure.",
 	},
+
+	{
+		runtime: "pi-family",
+		capability: "request-scoped model metadata",
+		status: "required",
+		evidence: "Runtime events or provider request context must expose request-scoped model metadata, or context model metadata that can be checked against the request",
+		pluginBehavior: "Resolve provider-native tool eligibility from the current request model and use fallback context metadata only after consistency checks.",
+	},
+
+	{
+		runtime: "pi-family",
+		capability: "before-agent and system prompt independence",
+		status: "guarded",
+		evidence: "Pi-family support must not require undocumented system prompt mutation or before-agent return semantics",
+		pluginBehavior: "Keep provider-native injection correctness on provider request mutation; use visible warnings for degraded behavior instead of depending on prompt mutation.",
+	},
 	{
 		runtime: "pi-family",
 		capability: "session artifact directory or visible warning path",
@@ -95,6 +151,14 @@ export const PI_FAMILY_REQUIRED_CAPABILITIES = [
 		status: "guarded",
 		evidence: "Required message shape: providerPayload.type === 'openaiResponsesHistory' with providerPayload.items[]",
 		pluginBehavior: "Enable automatic image result saving only when native history is present; otherwise inject provider-native tools but warn and skip automatic image file saving.",
+	},
+
+	{
+		runtime: "pi-family",
+		capability: "agent_end native history preservation",
+		status: "guarded",
+		evidence: "Automatic image extraction requires agent_end/assistant messages with providerPayload.type === 'openaiResponsesHistory' and providerPayload.items[]",
+		pluginBehavior: "Parse only preserved native assistant/provider payloads; warn visibly and skip automatic saving when the shape is absent.",
 	},
 ] as const satisfies readonly RuntimeCapabilityRecord[];
 
