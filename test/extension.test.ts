@@ -80,6 +80,30 @@ function bothToolsConfig(): string {
 `);
 }
 
+function mismatchedRequestScopedProviderConfig(): string {
+	return `version: 1
+providers:
+  - name: context-provider
+    match:
+      api: openai-responses
+      provider: openai
+      modelId: gpt-5
+    tools:
+      web_search:
+        enabled: true
+      image_generation:
+        enabled: true
+  - name: request-provider
+    match:
+      api: openai-responses
+      provider: other
+      modelId: other-model
+    tools:
+      web_search:
+        enabled: true
+`;
+}
+
 function noEnabledToolsConfig(): string {
 	return providerConfig(`      web_search:
         enabled: false
@@ -101,7 +125,19 @@ providers:
 `;
 }
 
-function registerExtension({ runtime = "omp", initialActiveTools = ["read", "web_search", "generate_image"], sendMessage = true }: { runtime?: RuntimeKind; initialActiveTools?: any[]; sendMessage?: boolean } = {}) {
+function registerExtension({
+	runtime = "omp",
+	initialActiveTools = ["read", "web_search", "generate_image"],
+	sendMessage = true,
+	activeToolMethods = true,
+	setActiveTools,
+}: {
+	runtime?: RuntimeKind;
+	initialActiveTools?: any[];
+	sendMessage?: boolean;
+	activeToolMethods?: boolean;
+	setActiveTools?: (next: any[]) => unknown | Promise<unknown>;
+} = {}) {
 	const handlers = new Map<string, Handler[]>();
 	const warnings: unknown[][] = [];
 	const sentMessages: Array<{ message: unknown; options: unknown }> = [];
@@ -124,12 +160,20 @@ function registerExtension({ runtime = "omp", initialActiveTools = ["read", "web
 		setLabel(value: string) {
 			label = value;
 		},
-		getActiveTools() {
-			return activeTools;
-		},
-		setActiveTools(next: any[]) {
-			activeTools = next;
-		},
+		...(activeToolMethods
+			? {
+				getActiveTools() {
+					return activeTools;
+				},
+				async setActiveTools(next: any[]) {
+					if (setActiveTools) {
+						await setActiveTools(next);
+					} else {
+						activeTools = next;
+					}
+				},
+			}
+			: {}),
 		...(sendMessage
 			? {
 				sendMessage(message: unknown, options?: unknown) {
@@ -336,6 +380,95 @@ describe("OpenAI provider tools extension", () => {
 		expect(extension.warnings.join("\n")).toContain("provider request no longer matched configured provider tools after host-side tool removal");
 	});
 
+	it("clears incompatible targets on session_start so a later before-agent can remove host tools", async () => {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		await writeConfig({ cwd, runtime: "omp", content: webSearchOnlyConfig() });
+		const extension = registerExtension();
+		const ctx = context(cwd, homeDir, { abort: () => {} });
+
+		await runBeforeAgent(extension, ctx);
+		await runBeforeProvider(extension, { model: "gpt-5", input: "hello", tools: "bad" }, ctx);
+		expect(extension.activeTools()).toEqual(["read", "web_search", "generate_image"]);
+
+		await runSessionStart(extension, ctx);
+		await runBeforeAgent(extension, ctx);
+
+		expect(extension.activeTools()).toEqual(["read", "generate_image"]);
+	});
+
+	it("restores and warns on agent_end when no provider request follows host-side removal", async () => {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		await writeConfig({ cwd, runtime: "omp", content: webSearchOnlyConfig() });
+		const extension = registerExtension();
+		const ctx = context(cwd, homeDir);
+
+		await runBeforeAgent(extension, ctx);
+		expect(extension.activeTools()).toEqual(["read", "generate_image"]);
+		await runAgentEnd(extension, { message: { content: "done" } }, ctx);
+
+		expect(extension.activeTools()).toEqual(["read", "web_search", "generate_image"]);
+		expect(extension.warnings.join("\n")).toContain("provider request was not observed after host-side tool removal");
+		expect(extension.sentMessages.some(({ message }) => String((message as any).content ?? message).includes("provider request was not observed after host-side tool removal"))).toBe(true);
+	});
+
+	it("warns and marks target incompatible when active tool APIs are unavailable", async () => {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		await writeConfig({ cwd, runtime: "omp", content: webSearchOnlyConfig() });
+		const extension = registerExtension({ activeToolMethods: false });
+		const ctx = context(cwd, homeDir);
+		const payload: Record<string, unknown> = { model: "gpt-5", input: "hello" };
+
+		await runBeforeAgent(extension, ctx);
+		await runBeforeProvider(extension, payload, ctx);
+
+		expect(payload.tools).toBeUndefined();
+		expect(extension.warnings.join("\n")).toContain("active tool control API is unavailable");
+		expect(extension.sentMessages.some(({ message }) => String((message as any).content ?? message).includes("active tool control API is unavailable"))).toBe(true);
+	});
+
+	it("warns and marks target incompatible when active tool removal fails", async () => {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		await writeConfig({ cwd, runtime: "omp", content: webSearchOnlyConfig() });
+		const extension = registerExtension({ setActiveTools: () => { throw new Error("boom"); } });
+		const ctx = context(cwd, homeDir);
+		const payload: Record<string, unknown> = { model: "gpt-5", input: "hello" };
+
+		await runBeforeAgent(extension, ctx);
+		await runBeforeProvider(extension, payload, ctx);
+
+		expect(extension.activeTools()).toEqual(["read", "web_search", "generate_image"]);
+		expect(payload.tools).toBeUndefined();
+		expect(extension.warnings.join("\n")).toContain("active tool removal failed");
+		expect(extension.sentMessages.some(({ message }) => String((message as any).content ?? message).includes("active tool removal failed"))).toBe(true);
+	});
+
+	it("restores and aborts when request-scoped target injects fewer provider tools than a pending removal expected", async () => {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		await writeConfig({ cwd, runtime: "omp", content: mismatchedRequestScopedProviderConfig() });
+		const extension = registerExtension();
+		let abortMessage = "";
+		const ctx = context(cwd, homeDir, {
+			abort: (message: string) => {
+				abortMessage = message;
+			},
+		});
+		const requestModel = { ...targetModel, id: "other-model", provider: "other" };
+		const payload: Record<string, unknown> = { model: "gpt-5", input: "hello" };
+
+		await runBeforeAgent(extension, ctx);
+		expect(extension.activeTools()).toEqual(["read"]);
+		await runBeforeProvider(extension, payload, ctx, { requestModel });
+
+		expect(abortMessage).toContain("ensured provider tools did not cover tools removed from the host runtime");
+		expect(extension.activeTools()).toEqual(["read", "web_search", "generate_image"]);
+		expect(payload.tools).toBeUndefined();
+	});
+
 	it("restores active tools and aborts when request-scoped model changes target after host-side removal", async () => {
 		const cwd = await makeTempDir();
 		const homeDir = await makeTempDir();
@@ -382,7 +515,7 @@ describe("OpenAI provider tools extension", () => {
 		expect(payload.tools).toEqual([{ type: "web_search" }]);
 	});
 
-	it("loads Pi config, warns for unknown runtime identity, and injects when provider match succeeds", async () => {
+	it("loads Pi config, visibly warns for unknown runtime identity, and injects when provider match succeeds", async () => {
 		const cwd = await makeTempDir();
 		const homeDir = await makeTempDir();
 		await writeConfig({ cwd, runtime: "pi", content: webSearchOnlyConfig() });
@@ -390,9 +523,11 @@ describe("OpenAI provider tools extension", () => {
 		const payload: Record<string, unknown> = { model: "gpt-5", input: "hello" };
 
 		await runBeforeProvider(extension, payload, context(cwd, homeDir));
+		await runBeforeProvider(extension, { model: "gpt-5", input: "hello" }, context(cwd, homeDir));
 
 		expect(payload.tools).toEqual([{ type: "web_search" }]);
 		expect(extension.warnings.join("\n")).toContain("runtime identity is unknown");
+		expect(extension.sentMessages.filter(({ message }) => String((message as any).content ?? message).includes("runtime identity is unknown"))).toHaveLength(1);
 	});
 
 	it("does not remove host-side tools on the next before-agent for a target marked incompatible", async () => {

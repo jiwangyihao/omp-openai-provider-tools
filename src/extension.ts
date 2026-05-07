@@ -152,6 +152,17 @@ async function notifyWarning(api: ExtensionApiLike, ctx: ExtensionContextLike, m
 	}
 }
 
+async function restoreActiveTools(api: ExtensionApiLike, state: ExpectedToolsState | undefined): Promise<boolean> {
+	if (!state?.removed) return true;
+	if (!api.setActiveTools) return false;
+	try {
+		await api.setActiveTools([...state.snapshot]);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 async function failAfterRemoval({
 	api,
 	ctx,
@@ -167,9 +178,7 @@ async function failAfterRemoval({
 	incompatibleTargets: Set<string>;
 	key?: string;
 }): Promise<void> {
-	if (state?.removed && api.setActiveTools) {
-		await api.setActiveTools([...state.snapshot]);
-	}
+	await restoreActiveTools(api, state);
 	if (key) incompatibleTargets.add(key);
 
 	const message = warningMessage(reason);
@@ -182,7 +191,7 @@ async function failAfterRemoval({
 	await notifyWarning(api, ctx, message);
 }
 
-async function loadConfig(api: ExtensionApiLike, ctx: ExtensionContextLike): Promise<LoadedRuntimeConfig> {
+async function loadConfig(api: ExtensionApiLike, ctx: ExtensionContextLike, visibleWarnings?: Set<string>): Promise<LoadedRuntimeConfig> {
 	const runtime = detectRuntimeKind(api, ctx);
 	const loaded = await loadAvailableProviderToolsConfig({
 		cwd: ctx.cwd ?? process.cwd(),
@@ -190,8 +199,13 @@ async function loadConfig(api: ExtensionApiLike, ctx: ExtensionContextLike): Pro
 		runtime,
 	});
 	for (const warning of loaded.warnings) {
-		api.logger?.warn?.(warning);
-		ctx.logger?.warn?.(warning);
+		if (visibleWarnings && !visibleWarnings.has(warning)) {
+			visibleWarnings.add(warning);
+			await notifyWarning(api, ctx, warning);
+		} else {
+			api.logger?.warn?.(warning);
+			ctx.logger?.warn?.(warning);
+		}
 	}
 	return { config: loaded.config };
 }
@@ -212,18 +226,21 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 	const incompatibleTargets = new Set<string>();
 	const imageResultState: ImageResultState = {};
 	const seenImageResults = new Set<string>();
+	const visibleConfigWarnings = new Set<string>();
 
 	api.on?.("session_start", async (_event, ctx) => {
+		expectedByTarget.clear();
+		incompatibleTargets.clear();
 		seenImageResults.clear();
 		imageResultState.outputDirectory = undefined;
-		await loadConfig(api, ctx);
+		await loadConfig(api, ctx, visibleConfigWarnings);
 	});
 
 	api.on?.("before_agent_start", async (_event, ctx) => {
 		const syntheticPayload = modelPayloadForBeforeAgent(ctx.model);
 		if (!syntheticPayload) return undefined;
 
-		const { config } = await loadConfig(api, ctx);
+		const { config } = await loadConfig(api, ctx, visibleConfigWarnings);
 		const target = buildRequestTarget({ payload: syntheticPayload, contextModel: ctx.model });
 		if (!target) return undefined;
 		const key = targetKey(target);
@@ -235,8 +252,13 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 		const enabledProviderTools = getEnabledProviderToolTypes(entry);
 		if (enabledProviderTools.length === 0) return undefined;
 
-		const snapshot = normalizeActiveToolNames(await api.getActiveTools?.());
-		if (!api.getActiveTools || !api.setActiveTools || snapshot.length === 0) {
+		if (!api.getActiveTools || !api.setActiveTools) {
+			incompatibleTargets.add(key);
+			await notifyWarning(api, ctx, warningMessage("active tool control API is unavailable"));
+			return undefined;
+		}
+		const snapshot = normalizeActiveToolNames(await api.getActiveTools());
+		if (snapshot.length === 0) {
 			expectedByTarget.set(key, { expected: enabledProviderTools, snapshot, removed: false });
 			return undefined;
 		}
@@ -248,7 +270,13 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 			return undefined;
 		}
 
-		await api.setActiveTools(removal.toolNames);
+		try {
+			await api.setActiveTools(removal.toolNames);
+		} catch (error) {
+			incompatibleTargets.add(key);
+			await notifyWarning(api, ctx, warningMessage(`active tool removal failed: ${error instanceof Error ? error.message : String(error)}`));
+			return undefined;
+		}
 		expectedByTarget.set(key, { expected: enabledProviderTools, snapshot, removed: true });
 		return undefined;
 	});
@@ -256,7 +284,7 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 	api.on?.("before_provider_request", async (event, ctx) => {
 		const payload = requestPayload(event);
 		imageResultState.outputDirectory = undefined;
-		const { config } = await loadConfig(api, ctx);
+		const { config } = await loadConfig(api, ctx, visibleConfigWarnings);
 		const target = buildRequestTarget({ payload, contextModel: ctx.model, eventModel: requestEventModel(event) });
 		if (!target) {
 			const pending = [...expectedByTarget.entries()].find(([, state]) => state.removed);
@@ -269,6 +297,7 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 		}
 
 		const key = targetKey(target);
+		if (incompatibleTargets.has(key)) return undefined;
 		const entry = findMatchingProvider(config, target);
 		if (!entry) {
 			const expected = expectedByTarget.get(key);
@@ -290,6 +319,21 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 			return undefined;
 		}
 		updateImageResultState(imageResultState, entry);
+		const crossTargetPending = [...expectedByTarget.entries()].find(([pendingKey, state]) => pendingKey !== key && state.removed);
+		const enabledProviderTools = getEnabledProviderToolTypes(entry);
+		if (crossTargetPending && !coversExpected(enabledProviderTools, crossTargetPending[1].expected)) {
+			const [pendingKey, state] = crossTargetPending;
+			await failAfterRemoval({
+				api,
+				ctx,
+				reason: "ensured provider tools did not cover tools removed from the host runtime",
+				state,
+				incompatibleTargets,
+				key: pendingKey,
+			});
+			expectedByTarget.delete(pendingKey);
+			return undefined;
+		}
 		const result = injectConfiguredTools(payload, entry);
 		const expected = expectedByTarget.get(key);
 		if (!result.ok) {
@@ -312,10 +356,23 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 		}
 
 		expectedByTarget.delete(key);
+		if (crossTargetPending) expectedByTarget.delete(crossTargetPending[0]);
 		return undefined;
 	});
 
 	api.on?.("agent_end", async (event, ctx) => {
+		const pending = [...expectedByTarget.entries()].filter(([, state]) => state.removed);
+		for (const [key, state] of pending) {
+			await failAfterRemoval({
+				api,
+				ctx,
+				reason: "provider request was not observed after host-side tool removal",
+				state,
+				incompatibleTargets,
+				key,
+			});
+			expectedByTarget.delete(key);
+		}
 		await handleAgentEndImageResults({ api, ctx, event, state: imageResultState, seen: seenImageResults });
 	});
 }
