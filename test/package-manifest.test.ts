@@ -1,4 +1,6 @@
 import { describe, expect, it } from "bun:test";
+import { existsSync } from "node:fs";
+import { resolve } from "node:path";
 import packageJson from "../package.json";
 
 const runtimeCorePackages = [
@@ -10,6 +12,10 @@ const runtimeCorePackages = [
 	"@mariozechner/pi-agent-core",
 ];
 
+const allowedRuntimeDependencies = ["yaml"];
+const forbiddenRuntimePackageScopes = ["@oh-my-pi/", "@mariozechner/"];
+const repoRoot = resolve(import.meta.dir, "..");
+
 describe("package manifest", () => {
 	it("declares both OMP and Pi extension entry points", () => {
 		expect(packageJson.omp).toEqual({ extensions: ["./src/extension.ts"] });
@@ -19,12 +25,22 @@ describe("package manifest", () => {
 	it("is discoverable as a Pi package and publishes runtime files", () => {
 		expect(packageJson.keywords).toContain("pi-package");
 		expect(packageJson.files).toEqual(expect.arrayContaining(["src", "README.md", "docs"]));
+		for (const fileEntry of packageJson.files) {
+			expect(existsSync(resolve(repoRoot, fileEntry)), `${fileEntry} should exist before publishing`).toBe(true);
+		}
 	});
 
-	it("does not depend on OMP or Pi runtime packages", () => {
+	it("limits runtime dependencies to portable packages", () => {
+		expect(Object.keys(packageJson.dependencies ?? {}).sort()).toEqual(allowedRuntimeDependencies);
+		expect(Object.keys(packageJson.peerDependencies ?? {})).toEqual([]);
+
 		for (const deps of [packageJson.dependencies ?? {}, packageJson.peerDependencies ?? {}]) {
 			for (const packageName of runtimeCorePackages) {
 				expect(deps).not.toHaveProperty(packageName);
+			}
+
+			for (const packageName of Object.keys(deps)) {
+				expect(forbiddenRuntimePackageScopes.some((scope) => packageName.startsWith(scope))).toBe(false);
 			}
 		}
 	});
