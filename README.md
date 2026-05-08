@@ -45,21 +45,6 @@ Runtime behavior is gated by the capabilities exposed by the host runtime. Requi
 
 See [runtime compatibility notes](./docs/runtime-compatibility.md) for observed OMP behavior, Pi-family capability gates, and guarded behavior when a runtime does not expose a required capability.
 
-## Legacy configuration files
-
-The plugin still reads legacy `openai-provider-tools.yml` files for existing installations, but new setups should prefer `models.yml` `compat.openaiProviderTools` metadata described below.
-
-OMP legacy paths:
-
-- User config: `~/.omp/agent/openai-provider-tools.yml`
-- Project config: `.omp/openai-provider-tools.yml`
-
-Pi legacy paths:
-
-- User config: `~/.pi/agent/openai-provider-tools.yml`
-- Project config: `.pi/openai-provider-tools.yml`
-
-Project legacy config takes precedence over user legacy config. Within the loaded configuration set, the first matching `providers[]` entry wins. When the runtime identity is unknown, the plugin loads existing `.pi` and `.omp` configs in deterministic project-before-user order and emits a visible warning instead of silently ignoring one runtime family.
 
 ## Configuration
 
@@ -115,7 +100,7 @@ When provider-level and model-level `compat` are both present, OMP merges them i
 
 ### Optional image output directory
 
-If the runtime exposes `compat.openaiProviderTools.outputDirectory` or `output_directory`, the plugin uses it as the preferred saved-image directory. Otherwise it falls back to the runtime session artifact directory and then the agent default image directory.
+If the runtime exposes `compat.openaiProviderTools.outputDirectory`, the plugin uses it as the preferred saved-image directory. Otherwise it falls back to the runtime session artifact directory and then the agent default image directory.
 
 ```yaml
 compat:
@@ -124,36 +109,12 @@ compat:
     outputDirectory: ./provider-tool-images
 ```
 
-### Legacy plugin YAML
-
-`openai-provider-tools.yml` remains supported as a legacy fallback for existing projects. New configuration should prefer `models.yml` provider/model metadata.
-
-Legacy YAML shape:
-
-```yaml
-version: 1
-providers:
-  - name: compatible-example
-    match:
-      api: openai-responses
-      provider: compatible-example
-    tools:
-      web_search:
-        enabled: true
-      image_generation:
-        enabled: true
-        output_format: png
-    output:
-      directory: ./provider-tool-images
-```
-
-Legacy `compat.extraBody.openai_provider_tools.*` markers are still recognized for compatibility, but are no longer recommended because `extraBody` is request-body metadata in some provider paths.
 
 ## Credential policy
 
 The plugin does not read, store, or request API keys. It does not use environment variables for plugin credentials. Provider authentication remains in the runtime/model provider configuration that already owns provider credentials.
 
-Do not put keys or private endpoints in `openai-provider-tools.yml` or plugin settings. Provider credentials stay in the runtime model/provider registry (`models.yml` or the host runtime's equivalent credential store).
+Do not put keys or private endpoints in plugin settings or extension-specific files. Provider credentials stay in the runtime model/provider registry (`models.yml` or the host runtime's equivalent credential store).
 
 ## Behavior
 
@@ -169,7 +130,7 @@ Image files are extracted from OpenAI Responses native history, specifically pre
 
 Saved image directory order:
 
-1. `compat.openaiProviderTools.outputDirectory` / `output_directory`, or legacy `providers[].output.directory`, when configured.
+1. `compat.openaiProviderTools.outputDirectory`, when configured.
 2. Runtime session artifact directory, when available.
 3. Agent default image directory.
 
@@ -186,7 +147,6 @@ Currently, `web_search_call` history is summarized with the provider action, que
 | Symptom | What to check |
 | --- | --- |
 | No provider-native tools appear | For official OpenAI, confirm the selected model is an OpenAI Responses model on provider `openai` or host `api.openai.com`. For custom providers, confirm runtime model metadata contains `compat.openaiProviderTools.enabled: true`. For image generation, also confirm the selected model has `compat.openaiProviderTools.imageGeneration: true`. |
-| Legacy config warning | Validate legacy `openai-provider-tools.yml` YAML syntax and supported schema fields. Unknown or malformed fields can prevent safe matching when the legacy file is present. |
 | Runtime capability warning | Check [runtime compatibility notes](./docs/runtime-compatibility.md). The runtime must expose the capability gate needed for the requested behavior. |
 | Provider request fails | Treat the error as a provider/runtime response first. The plugin keeps provider-native execution in the main request path and reports plugin-side warnings separately. |
 | No image file is saved | Confirm the provider returned native Responses image history and the runtime preserved that history or exposed an artifact-capable session. Also confirm the configured output directory is writable when one is set. |
@@ -201,7 +161,7 @@ Before publishing or enabling the plugin in a runtime, validate the relevant row
 | OMP local link | Run `omp plugin link <path>`. |
 | Pi install | Run `pi install npm:omp-openai-provider-tools`. |
 | Pi explicit package flag | Run `pi -e npm:omp-openai-provider-tools`. |
-| Official OpenAI dry run | Use an official OpenAI Responses runtime provider; confirm provider-native `web_search` is injected without a legacy plugin YAML file and `tool_choice` is absent. |
+| Official OpenAI dry run | Use an official OpenAI Responses runtime provider; confirm provider-native `web_search` is injected from model/provider metadata and `tool_choice` is absent. |
 | Compatible provider dry run | Use a test runtime provider with `compat.openaiProviderTools.enabled: true`; confirm provider-native `web_search` is injected only when the metadata is present. |
 | Provider-native `web_search` live e2e | Send a real request that allows provider-native search; confirm the Responses request carries `web_search` and the provider returns native search call history or a provider-side error transparently. |
 | Provider-native `image_generation` live e2e | Send a real request that allows provider-native image generation; confirm the Responses request carries `image_generation` and the provider returns native image generation call history or a provider-side error transparently. |

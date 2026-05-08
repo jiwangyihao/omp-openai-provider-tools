@@ -8,11 +8,7 @@ import {
 import type { ProviderToolsEntry } from "../src/types";
 
 function providerEntry(tools: ProviderToolsEntry["tools"]): ProviderToolsEntry {
-	return {
-		name: "configured-provider",
-		match: { api: "openai-responses" },
-		tools,
-	};
+	return { tools };
 }
 
 describe("OpenAI Responses payload detection", () => {

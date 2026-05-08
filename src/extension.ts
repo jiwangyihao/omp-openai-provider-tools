@@ -2,8 +2,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import { enabledProviderToolsToHostTools, normalizeActiveToolNames, removeHostSideTools } from "./active-tools";
-import { detectRuntimeKind, loadAvailableProviderToolsConfig } from "./config";
-import { buildRequestTarget, findMatchingProvider, type RequestTarget } from "./match";
+import { buildRequestTarget, type RequestTarget } from "./match";
 import { getEnabledProviderToolTypes, injectConfiguredTools } from "./request-injection";
 import {
 	buildImageErrorMessage,
@@ -40,9 +39,6 @@ interface ExpectedToolsState {
 	removed: boolean;
 }
 
-interface LoadedRuntimeConfig {
-	config: Awaited<ReturnType<typeof loadAvailableProviderToolsConfig>>["config"];
-}
 
 interface ImageResultState {
 	outputDirectory?: string;
@@ -74,6 +70,38 @@ function isOfficialOpenAIResponsesProvider(model: RuntimeModelLike | undefined):
 	return provider === "openai";
 }
 
+type RuntimeKind = "omp" | "pi" | "unknown";
+type RuntimeMetadata = { name?: unknown; kind?: unknown };
+
+function normalizeRuntimeName(value: unknown): RuntimeKind {
+	if (typeof value !== "string") return "unknown";
+	const normalized = value.trim().toLowerCase();
+	if (normalized === "pi" || normalized === "pi-family" || normalized === "mariozechner-pi") return "pi";
+	if (normalized === "omp" || normalized === "oh-my-pi" || normalized === "oh my pi") return "omp";
+	return "unknown";
+}
+
+function runtimeMetadataCandidates(api: unknown, ctx: unknown): RuntimeMetadata[] {
+	const candidates: RuntimeMetadata[] = [];
+	for (const value of [api, ctx]) {
+		if (!isRecord(value)) continue;
+		if (isRecord(value.runtime)) candidates.push(value.runtime);
+		if (isRecord(value.model) && isRecord(value.model.runtime)) candidates.push(value.model.runtime);
+		candidates.push(value as RuntimeMetadata);
+	}
+	return candidates;
+}
+
+function detectRuntimeKind(api: ExtensionApiLike, ctx?: ExtensionContextLike): RuntimeKind {
+	for (const candidate of runtimeMetadataCandidates(api, ctx)) {
+		const byName = normalizeRuntimeName(candidate.name);
+		if (byName !== "unknown") return byName;
+		const byKind = normalizeRuntimeName(candidate.kind);
+		if (byKind !== "unknown") return byKind;
+	}
+	return "unknown";
+}
+
 function modelPayloadForBeforeAgent(model: RuntimeModelLike | undefined): Record<string, unknown> | undefined {
 	const modelId = model?.id ?? model?.name;
 	if (!modelId) return undefined;
@@ -97,39 +125,10 @@ function isEnabledFlag(value: unknown): boolean {
 	return normalized === "true" || normalized === "1" || normalized === "yes" || normalized === "enabled";
 }
 
-function nestedValue(value: unknown, path: readonly string[]): unknown {
-	let current = value;
-	for (const key of path) {
-		if (!isRecord(current)) return undefined;
-		current = current[key];
-	}
-	return current;
-}
 
 function modelAllowsProviderImageGeneration(model: RuntimeModelLike | undefined): boolean {
-	if (!model) return false;
 	const metadata = openAIProviderToolsMetadata(model);
-	if (isEnabledFlag(metadata?.imageGeneration)) return true;
-	if (isEnabledFlag(metadata?.image_generation)) return true;
-
-	const capabilityPaths = [
-		["openaiProviderTools", "imageGeneration"],
-		["openaiProviderTools", "image_generation"],
-		["openai_provider_tools", "image_generation"],
-	] as const;
-	for (const path of capabilityPaths) {
-		if (isEnabledFlag(nestedValue(model.capabilities, path))) return true;
-		if (isEnabledFlag(nestedValue(model.runtime?.capabilities, path))) return true;
-	}
-
-	const extraBody = model.compat?.extraBody;
-	if (isEnabledFlag(nestedValue(extraBody, ["openai_provider_tools", "image_generation"]))) return true;
-	if (isEnabledFlag(nestedValue(extraBody, ["openaiProviderTools", "imageGeneration"]))) return true;
-	if (isEnabledFlag(nestedValue(extraBody, ["openaiProviderTools", "image_generation"]))) return true;
-	if (isEnabledFlag(extraBody?.openai_provider_tools_image_generation)) return true;
-
-	const headers = model.headers ?? {};
-	return isEnabledFlag(headers["x-openai-provider-tools-image-generation"] ?? headers["X-OpenAI-Provider-Tools-Image-Generation"]);
+	return isEnabledFlag(metadata?.imageGeneration);
 }
 
 function providerEntryFromModel(model: RuntimeModelLike | undefined): ProviderToolsEntry | undefined {
@@ -138,17 +137,15 @@ function providerEntryFromModel(model: RuntimeModelLike | undefined): ProviderTo
 	if (!isOfficialOpenAIResponsesProvider(model) && !isEnabledFlag(metadata?.enabled)) return undefined;
 
 	const tools: ProviderToolsEntry["tools"] = {};
-	if (metadata?.webSearch !== false && metadata?.web_search !== false) {
+	if (metadata?.webSearch !== false) {
 		tools.web_search = { enabled: true };
 	}
 	if (modelAllowsProviderImageGeneration(model)) {
 		tools.image_generation = { enabled: true };
 	}
 
-	const outputDirectory = metadata?.outputDirectory ?? metadata?.output_directory;
+	const outputDirectory = metadata?.outputDirectory;
 	return {
-		name: "runtime-model-openai-provider-tools",
-		match: { api: "openai-responses" },
 		tools,
 		...(typeof outputDirectory === "string" ? { output: { directory: outputDirectory } } : {}),
 	};
@@ -509,24 +506,6 @@ async function failAfterRemoval({
 	await notifyWarning(api, ctx, message);
 }
 
-async function loadConfig(api: ExtensionApiLike, ctx: ExtensionContextLike, visibleWarnings?: Set<string>): Promise<LoadedRuntimeConfig> {
-	const runtime = detectRuntimeKind(api, ctx);
-	const loaded = await loadAvailableProviderToolsConfig({
-		cwd: ctx.cwd ?? process.cwd(),
-		homeDir: ctx.homeDir ?? os.homedir(),
-		runtime,
-	});
-	for (const warning of loaded.warnings) {
-		if (visibleWarnings && !visibleWarnings.has(warning)) {
-			visibleWarnings.add(warning);
-			await notifyWarning(api, ctx, warning);
-		} else {
-			api.logger?.warn?.(warning);
-			ctx.logger?.warn?.(warning);
-		}
-	}
-	return { config: loaded.config };
-}
 
 function requestEventModel(event: unknown): RuntimeModelLike | undefined {
 	const candidate = event as ProviderRequestEventLike;
@@ -545,8 +524,6 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 	const imageResultState: ImageResultState = {};
 	const seenImageResults = new Set<string>();
 	const seenProviderToolResults = new Set<string>();
-	const visibleConfigWarnings = new Set<string>();
-	let loadedRuntimeConfig: LoadedRuntimeConfig | undefined;
 
 	api.on?.("session_start", async (_event, ctx) => {
 		expectedByTarget.clear();
@@ -557,8 +534,6 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 		imageResultState.sessionId = undefined;
 		imageResultState.artifactDirectory = undefined;
 		await preloadImageRuntimeState(imageResultState, ctx);
-		loadedRuntimeConfig = undefined;
-		loadedRuntimeConfig = await loadConfig(api, ctx, visibleConfigWarnings);
 	});
 
 	api.on?.("before_agent_start", async (_event, ctx) => {
@@ -566,15 +541,12 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 		if (!isExplicitOpenAIResponsesModel(ctx.model)) return undefined;
 		if (!syntheticPayload) return undefined;
 
-		loadedRuntimeConfig = undefined;
-		loadedRuntimeConfig = await loadConfig(api, ctx, visibleConfigWarnings);
-		const { config } = loadedRuntimeConfig;
 		const target = buildRequestTarget({ payload: syntheticPayload, contextModel: ctx.model });
 		if (!target) return undefined;
 		const key = targetKey(target);
 		if (incompatibleTargets.has(key)) return undefined;
 
-		const entry = findMatchingProvider(config, target) ?? providerEntryFromModel(ctx.model);
+		const entry = providerEntryFromModel(ctx.model);
 		if (!entry) return undefined;
 
 		const enabledProviderTools = getEnabledProviderToolTypesForModel(entry, ctx.model);
@@ -630,12 +602,6 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 			}
 			return undefined;
 		}
-		const cached = loadedRuntimeConfig;
-		if (!cached) {
-			notifyWarningLater(api, ctx, warningMessage("configuration was not preloaded before provider request"));
-			return undefined;
-		}
-		const { config } = cached;
 		const target = buildRequestTarget({ payload, contextModel: ctx.model, eventModel });
 		if (!target) {
 			const pending = pendingRemovedState(expectedByTarget);
@@ -679,7 +645,7 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 			}
 			return undefined;
 		}
-		const entry = findMatchingProvider(config, target) ?? providerEntryFromModel(eligibilityModel);
+		const entry = providerEntryFromModel(eligibilityModel);
 		if (!entry) {
 			const expected = expectedByTarget.get(key);
 			const pending: [string, ExpectedToolsState] | undefined = expected ? [key, expected] : pendingRemovedState(expectedByTarget);
