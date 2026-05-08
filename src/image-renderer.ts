@@ -10,8 +10,18 @@ interface ComponentLike {
 	invalidate(): void;
 }
 
+interface ContainerLike extends ComponentLike {
+	addChild(component: ComponentLike): void;
+}
+
+interface BoxLike extends ContainerLike {
+	clear?: () => void;
+}
+
 interface TuiLike {
-	Container: new () => { addChild(component: ComponentLike): void } & ComponentLike;
+	Container: new () => ContainerLike;
+	Box: new (paddingX?: number, paddingY?: number, bgFn?: (text: string) => string) => BoxLike;
+	Spacer: new (height?: number) => ComponentLike;
 	Text: new (text?: string, paddingX?: number, paddingY?: number, customBgFn?: (text: string) => string) => ComponentLike;
 	Image?: new (
 		base64Data: string,
@@ -24,29 +34,44 @@ interface TuiLike {
 interface RendererApiLike {
 	registerMessageRenderer?: (customType: string, renderer: (message: unknown, options: { expanded: boolean }, theme: unknown) => ComponentLike | undefined) => void;
 	logger?: { warn?: (...args: unknown[]) => void };
+	pi?: { VERSION?: string };
+}
+
+interface ProviderImageDetail {
+	id?: string;
+	path: string;
+	bytes?: number;
+	mimeType?: string;
+	outputFormat?: string;
+	size?: string;
+	quality?: string;
+	revisedPrompt?: string;
+	sha256?: string;
+	reusedExisting?: boolean;
 }
 
 let tuiModule: TuiLike | undefined;
 let tuiLoadStarted = false;
 
-export function registerProviderImageRenderer(api: RendererApiLike): void {
+export function registerProviderImageRenderer(api: RendererApiLike, tuiOverride?: TuiLike): void {
 	if (!api.registerMessageRenderer) return;
-	void ensureTuiLoaded(api);
-	api.registerMessageRenderer(PROVIDER_IMAGE_MESSAGE_TYPE, (message, options, theme) => renderProviderImageMessage(message, options, theme));
+	if (!tuiOverride) void ensureTuiLoaded(api);
+	api.registerMessageRenderer(PROVIDER_IMAGE_MESSAGE_TYPE, (message, options, theme) =>
+		renderProviderImageMessage(message, options, theme, tuiOverride ?? tuiModule));
 }
 
 async function ensureTuiLoaded(api: RendererApiLike): Promise<void> {
 	if (tuiLoadStarted) return;
 	tuiLoadStarted = true;
 	try {
-		tuiModule = await loadTuiModule();
+		tuiModule = await loadTuiModule(api.pi?.VERSION);
 	} catch (error) {
 		api.logger?.warn?.("OpenAI provider image preview renderer is unavailable", error);
 	}
 }
 
-async function loadTuiModule(): Promise<TuiLike> {
-	for (const specifier of runtimeTuiSpecifiers()) {
+async function loadTuiModule(runtimeVersion?: string): Promise<TuiLike> {
+	for (const specifier of runtimeTuiSpecifiers(runtimeVersion)) {
 		try {
 			return await import(specifier) as TuiLike;
 		} catch {
@@ -56,62 +81,169 @@ async function loadTuiModule(): Promise<TuiLike> {
 	throw new Error("No compatible pi-tui runtime package was found.");
 }
 
-function runtimeTuiSpecifiers(): string[] {
+export function runtimeTuiSpecifiers(runtimeVersion?: string, cacheRoot = path.join(os.homedir(), ".bun", "install", "cache")): string[] {
 	const specifiers = ["@oh-my-pi/pi-tui", "@mariozechner/pi-tui"];
-	const cacheRoot = path.join(os.homedir(), ".bun", "install", "cache");
+	const cacheSpecifiers: Array<{ specifier: string; version?: string }> = [];
+	const normalizedRuntimeVersion = normalizeRuntimeVersion(runtimeVersion);
 	for (const scope of ["@oh-my-pi", "@mariozechner"]) {
 		const scopeDir = path.join(cacheRoot, scope);
 		try {
 			for (const entry of fs.readdirSync(scopeDir)) {
 				if (!entry.startsWith("pi-tui@")) continue;
 				const indexPath = path.join(scopeDir, entry, "src", "index.ts");
-				if (fs.existsSync(indexPath)) specifiers.push(pathToFileURL(indexPath).href);
+				if (fs.existsSync(indexPath)) {
+					cacheSpecifiers.push({ specifier: pathToFileURL(indexPath).href, version: cachedTuiVersion(entry) });
+				}
 			}
 		} catch {
 			// Cache layout is best-effort only.
 		}
 	}
+	cacheSpecifiers.sort((left, right) => compareCachedTuiSpecifiers(left, right, normalizedRuntimeVersion));
+	specifiers.push(...cacheSpecifiers.map(candidate => candidate.specifier));
 	return specifiers;
 }
 
-function renderProviderImageMessage(message: unknown, options: { expanded: boolean }, theme: unknown): ComponentLike | undefined {
-	const text = messageContent(message);
-	const images = imageDetails(message);
-	const primary = images[0];
-	const Tui = tuiModule;
-	if (!Tui) {
-		return textComponent(text || primary?.path || "OpenAI provider image_generation result", theme);
-	}
-
-	const container = new Tui.Container();
-	container.addChild(new Tui.Text(text || "OpenAI provider image_generation result", 1, 1));
-	if (!options.expanded) {
-		if (primary?.path) container.addChild(new Tui.Text(`Ctrl+O 展开图片预览：${primary.path}`, 1, 0));
-		return container;
-	}
-	if (!primary?.path || !Tui.Image) return container;
-	try {
-		const base64 = fs.readFileSync(primary.path).toString("base64");
-		container.addChild(new Tui.Image(base64, primary.mimeType ?? "image/png", {
-			fallbackColor: (value: string) => color(theme, "toolOutput", value),
-		}, {
-			maxWidthCells: 96,
-			maxHeightCells: 32,
-			filename: path.basename(primary.path),
-		}));
-	} catch {
-		container.addChild(new Tui.Text(`图片预览不可用：${primary.path}`, 1, 0));
-	}
-	return container;
+function cachedTuiVersion(entry: string): string | undefined {
+	const match = /^pi-tui@(\d+\.\d+\.\d+)(?:@@@\d+)?$/u.exec(entry);
+	return match?.[1];
 }
 
-function textComponent(text: string, theme: unknown): ComponentLike {
-	return {
-		render() {
-			return [color(theme, "customMessageText", text)];
-		},
-		invalidate() {},
-	};
+function normalizeRuntimeVersion(version: string | undefined): string | undefined {
+	if (!version) return undefined;
+	const match = /(\d+\.\d+\.\d+)/u.exec(version);
+	return match?.[1];
+}
+
+function compareCachedTuiSpecifiers(
+	left: { specifier: string; version?: string },
+	right: { specifier: string; version?: string },
+	runtimeVersion?: string,
+): number {
+	if (runtimeVersion) {
+		const leftMatches = left.version === runtimeVersion;
+		const rightMatches = right.version === runtimeVersion;
+		if (leftMatches !== rightMatches) return leftMatches ? -1 : 1;
+	}
+	const versionOrder = compareVersionsDescending(left.version, right.version);
+	if (versionOrder !== 0) return versionOrder;
+	return left.specifier.localeCompare(right.specifier);
+}
+
+function compareVersionsDescending(left?: string, right?: string): number {
+	const leftParts = versionParts(left);
+	const rightParts = versionParts(right);
+	for (let index = 0; index < 3; index++) {
+		const diff = (rightParts[index] ?? 0) - (leftParts[index] ?? 0);
+		if (diff !== 0) return diff;
+	}
+	return 0;
+}
+
+function versionParts(version?: string): number[] {
+	return version?.split(".").map(part => Number.parseInt(part, 10)).map(part => Number.isFinite(part) ? part : 0) ?? [];
+}
+
+function renderProviderImageMessage(
+	message: unknown,
+	options: { expanded: boolean },
+	theme: unknown,
+	Tui: TuiLike | undefined,
+): ComponentLike | undefined {
+	const text = messageContent(message);
+	const images = imageDetails(message);
+	if (!Tui) return undefined;
+
+	const box = new Tui.Box(1, 1, value => background(theme, "customMessageBg", value));
+	const label = color(theme, "customMessageLabel", bold(theme, `[${messageCustomType(message)}]`));
+	box.addChild(new Tui.Text(label, 0, 0));
+	box.addChild(new Tui.Spacer(1));
+	box.addChild(new Tui.Text(color(theme, "customMessageText", text || "OpenAI provider image_generation result"), 0, 0));
+
+	if (images.length > 0) {
+		box.addChild(new Tui.Spacer(1));
+		for (const image of images) addImagePreview(box, Tui, image, theme, options.expanded);
+	}
+
+	if (options.expanded) {
+		const detailLines = expandedImageDetailLines(images);
+		if (detailLines.length > 0) {
+			box.addChild(new Tui.Spacer(1));
+			box.addChild(new Tui.Text(color(theme, "customMessageText", detailLines.join("\n")), 0, 0));
+		}
+	}
+
+	return box;
+}
+
+function addImagePreview(box: BoxLike, Tui: TuiLike, image: ProviderImageDetail, theme: unknown, expanded: boolean): void {
+	if (!image.path) return;
+	if (!Tui.Image) {
+		box.addChild(new Tui.Text(color(theme, "toolOutput", `图片预览不可用：${image.path}`), 0, 0));
+		return;
+	}
+	try {
+		const base64 = fs.readFileSync(image.path).toString("base64");
+		box.addChild(new Tui.Image(base64, image.mimeType ?? "image/png", {
+			fallbackColor: (value: string) => color(theme, "toolOutput", value),
+		}, {
+			maxWidthCells: expanded ? 96 : 72,
+			maxHeightCells: expanded ? 32 : 20,
+			filename: path.basename(image.path),
+		}));
+	} catch {
+		box.addChild(new Tui.Text(color(theme, "toolOutput", `图片预览不可用：${image.path}`), 0, 0));
+	}
+}
+
+function expandedImageDetailLines(images: ProviderImageDetail[]): string[] {
+	if (images.length === 0) return [];
+	const lines: string[] = [];
+	for (let index = 0; index < images.length; index++) {
+		const image = images[index];
+		if (!image) continue;
+		if (images.length > 1) lines.push(`Image ${index + 1}:`);
+		lines.push(`Path: ${image.path}`);
+		if (image.mimeType) lines.push(`MIME: ${image.mimeType}`);
+		if (typeof image.bytes === "number") lines.push(`Bytes: ${image.bytes}`);
+		if (image.sha256) lines.push(`SHA-256: ${image.sha256}`);
+		if (image.outputFormat) lines.push(`Output format: ${image.outputFormat}`);
+		if (image.size) lines.push(`Size: ${image.size}`);
+		if (image.quality) lines.push(`Quality: ${image.quality}`);
+		if (image.id) lines.push(`ID: ${image.id}`);
+		if (typeof image.reusedExisting === "boolean") lines.push(`Reused existing file: ${image.reusedExisting ? "yes" : "no"}`);
+		if (image.revisedPrompt) lines.push(`Revised prompt: ${image.revisedPrompt}`);
+		if (index < images.length - 1) lines.push("");
+	}
+	return lines;
+}
+function background(theme: unknown, key: string, value: string): string {
+	if (theme && typeof theme === "object" && "bg" in theme && typeof (theme as { bg?: unknown }).bg === "function") {
+		try {
+			return ((theme as { bg: (key: string, value: string) => string }).bg)(key, value);
+		} catch {
+			return value;
+		}
+	}
+	return value;
+}
+
+function bold(theme: unknown, value: string): string {
+	if (theme && typeof theme === "object" && "bold" in theme && typeof (theme as { bold?: unknown }).bold === "function") {
+		try {
+			return ((theme as { bold: (value: string) => string }).bold)(value);
+		} catch {
+			return value;
+		}
+	}
+	return value;
+}
+
+function messageCustomType(message: unknown): string {
+	if (message && typeof message === "object" && typeof (message as { customType?: unknown }).customType === "string") {
+		return (message as { customType: string }).customType;
+	}
+	return PROVIDER_IMAGE_MESSAGE_TYPE;
 }
 
 function color(theme: unknown, key: string, value: string): string {
@@ -135,20 +267,44 @@ function messageContent(message: unknown): string {
 		.join("\n");
 }
 
-function imageDetails(message: unknown): Array<{ path: string; mimeType?: string }> {
-	if (!message || typeof message !== "object") return [];
-	const details = (message as { details?: unknown }).details;
-	if (!details || typeof details !== "object") return [];
-	const images = (details as { images?: unknown }).images;
+function imageDetails(message: unknown): ProviderImageDetail[] {
+	if (!isRecord(message)) return [];
+	const details = message.details;
+	if (!isRecord(details)) return [];
+	const images = details.images;
 	if (Array.isArray(images)) {
-		return images.flatMap(image => image && typeof image === "object" && typeof (image as { path?: unknown }).path === "string"
-			? [{ path: (image as { path: string }).path, mimeType: typeof (image as { mimeType?: unknown }).mimeType === "string" ? (image as { mimeType: string }).mimeType : undefined }]
-			: []);
+		return images.flatMap(image => isRecord(image) && typeof image.path === "string" ? [imageDetailFromRecord(image)] : []);
 	}
-	const singlePath = (details as { path?: unknown }).path;
-	if (typeof singlePath === "string") {
-		const mimeType = (details as { mimeType?: unknown }).mimeType;
-		return [{ path: singlePath, mimeType: typeof mimeType === "string" ? mimeType : undefined }];
-	}
-	return [];
+	return typeof details.path === "string" ? [imageDetailFromRecord(details)] : [];
+}
+
+function imageDetailFromRecord(record: Record<string, unknown>): ProviderImageDetail {
+	return {
+		path: String(record.path),
+		id: stringField(record, "id"),
+		bytes: numberField(record, "bytes"),
+		mimeType: stringField(record, "mimeType"),
+		outputFormat: stringField(record, "outputFormat"),
+		size: stringField(record, "size"),
+		quality: stringField(record, "quality"),
+		revisedPrompt: stringField(record, "revisedPrompt"),
+		sha256: stringField(record, "sha256"),
+		reusedExisting: booleanField(record, "reusedExisting"),
+	};
+}
+
+function stringField(record: Record<string, unknown>, key: string): string | undefined {
+	return typeof record[key] === "string" ? record[key] : undefined;
+}
+
+function numberField(record: Record<string, unknown>, key: string): number | undefined {
+	return typeof record[key] === "number" ? record[key] : undefined;
+}
+
+function booleanField(record: Record<string, unknown>, key: string): boolean | undefined {
+	return typeof record[key] === "boolean" ? record[key] : undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return value !== null && typeof value === "object" && !Array.isArray(value);
 }
