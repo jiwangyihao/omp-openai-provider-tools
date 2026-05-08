@@ -45,79 +45,58 @@ Runtime behavior is gated by the capabilities exposed by the host runtime. Requi
 
 See [runtime compatibility notes](./docs/runtime-compatibility.md) for observed OMP behavior, Pi-family capability gates, and guarded behavior when a runtime does not expose a required capability.
 
-## Configuration files
+## Legacy configuration files
 
-OMP paths:
+The plugin still reads legacy `openai-provider-tools.yml` files for existing installations, but new setups should prefer `models.yml` `compat.openaiProviderTools` metadata described below.
+
+OMP legacy paths:
 
 - User config: `~/.omp/agent/openai-provider-tools.yml`
 - Project config: `.omp/openai-provider-tools.yml`
 
-Pi paths:
+Pi legacy paths:
 
 - User config: `~/.pi/agent/openai-provider-tools.yml`
 - Project config: `.pi/openai-provider-tools.yml`
 
-Project config takes precedence over user config. Within the loaded configuration set, the first matching `providers[]` entry wins. When the runtime identity is unknown, the plugin loads existing `.pi` and `.omp` configs in deterministic project-before-user order and emits a visible warning instead of silently ignoring one runtime family.
+Project legacy config takes precedence over user legacy config. Within the loaded configuration set, the first matching `providers[]` entry wins. When the runtime identity is unknown, the plugin loads existing `.pi` and `.omp` configs in deterministic project-before-user order and emits a visible warning instead of silently ignoring one runtime family.
 
-## Configuration schema
+## Configuration
 
-Configuration uses YAML with `version: 1` and a `providers` array.
+The recommended configuration surface is the OMP/Pi model registry (`models.yml`). Provider-native tools are capabilities of the selected provider/model, so keeping the markers beside provider and model definitions avoids a second plugin-specific file that can drift out of sync.
+
+### Official OpenAI Responses provider
+
+For the official OpenAI Responses provider, provider-native `web_search` is enabled by default when the selected runtime model is explicitly an OpenAI Responses model and the provider/base URL identifies official OpenAI:
 
 ```yaml
-version: 1
 providers:
-  - name: openai
-    match:
-      api: openai-responses
-      provider: openai
-      baseUrl:
-        equals: https://api.openai.com/v1
-      modelId: gpt-4.1
-      modelName: GPT 4.1
-    tools:
-      web_search:
-        enabled: true
-        search_context_size: medium
-      image_generation:
-        enabled: true
-        output_format: png
-        quality: high
-        size: 1024x1024
-        background: auto
-        action: generate
-    output:
-      directory: ./provider-tool-images
+  openai:
+    api: openai-responses
+    baseUrl: https://api.openai.com/v1
 ```
 
-Supported fields:
+`image_generation` is never enabled by provider defaults. It still requires model-level opt-in because image generation depends on the specific model/backend account.
 
-| Field | Required | Description |
-| --- | --- | --- |
-| `version` | Yes | Must be `1`. |
-| `providers[]` | Yes | Ordered list of provider entries. The first matching entry is used. |
-| `providers[].name` | Yes | Human-readable entry name used in diagnostics. |
-| `providers[].match.api` | Yes | API family to match. Use `openai-responses`. |
-| `providers[].match.provider` | No | Runtime/provider identifier, for example `openai`. |
-| `providers[].match.baseUrl.equals` | No | Exact provider base URL match. |
-| `providers[].match.baseUrl.prefix` | No | Prefix match for OpenAI-compatible provider base URLs. |
-| `providers[].match.baseUrl.host` | No | Hostname match for provider base URLs. |
-| `providers[].match.modelId` | No | Exact model ID match. |
-| `providers[].match.modelName` | No | Exact model display-name match. |
-| `providers[].tools.web_search.enabled` | Yes to enable | Defaults to disabled unless set to `true`. |
-| `providers[].tools.web_search.search_context_size` | No | Provider-native search context size, such as `low`, `medium`, or `high`. |
-| `providers[].tools.image_generation.enabled` | Yes to enable | Defaults to disabled unless set to `true`; also requires the selected runtime model to opt in to provider-native image generation. |
-| `providers[].tools.image_generation.output_format` | No | Provider-native image output format, such as `png`, `jpeg`, or `webp`. |
-| `providers[].tools.image_generation.quality` | No | Provider-native image quality option. |
-| `providers[].tools.image_generation.size` | No | Provider-native image size option. |
-| `providers[].tools.image_generation.background` | No | Provider-native background option. |
-| `providers[].tools.image_generation.action` | No | Provider-native action option. |
-| `providers[].output.directory` | No | Directory for saved image files from native response history. |
+### OpenAI-compatible providers
+
+For custom OpenAI-compatible Responses providers, opt in at provider level with `compat.openaiProviderTools.enabled: true`:
+
+```yaml
+providers:
+  compatible-example:
+    api: openai-responses
+    baseUrl: https://gateway.example.invalid/v1
+    compat:
+      openaiProviderTools:
+        enabled: true
+```
+
+This enables provider-native `web_search` for matching Responses models on that provider. The plugin does not infer support for arbitrary gateways from `openai-responses` alone.
 
 ### Model opt-in for `image_generation`
 
-`image_generation` is intentionally gated by both plugin config and model metadata. This prevents a broad provider entry from enabling image generation for every model behind the same provider or gateway.
-
-For OMP 14.7.x model configs, add an opt-in marker to only the model variants that are routed to image-capable backend accounts:
+Enable provider-native image generation only on model variants that route to image-capable backend accounts:
 
 ```yaml
 providers:
@@ -128,41 +107,28 @@ providers:
         api: openai-responses
         reasoning: true
         compat:
-          extraBody:
-            openai_provider_tools:
-              image_generation: true
+          openaiProviderTools:
+            imageGeneration: true
 ```
 
-The plugin also accepts equivalent runtime capability metadata such as `capabilities.openaiProviderTools.imageGeneration: true` when a host runtime exposes it.
+When provider-level and model-level `compat` are both present, OMP merges them into the runtime model. A custom provider can therefore enable provider-native tools once at provider level and enable image generation only on selected model variants.
 
-## Examples
+### Optional image output directory
 
-### Official OpenAI provider
+If the runtime exposes `compat.openaiProviderTools.outputDirectory` or `output_directory`, the plugin uses it as the preferred saved-image directory. Otherwise it falls back to the runtime session artifact directory and then the agent default image directory.
 
 ```yaml
-version: 1
-providers:
-  - name: openai
-    match:
-      api: openai-responses
-      provider: openai
-      baseUrl:
-        host: api.openai.com
-    tools:
-      web_search:
-        enabled: true
-        search_context_size: medium
-      image_generation:
-        enabled: true
-        output_format: png
-        size: 1024x1024
+compat:
+  openaiProviderTools:
+    enabled: true
+    outputDirectory: ./provider-tool-images
 ```
 
-For `image_generation`, this provider config is not sufficient by itself; the selected runtime model must also carry the model opt-in marker shown above.
+### Legacy plugin YAML
 
-### OpenAI-compatible provider
+`openai-provider-tools.yml` remains supported as a legacy fallback for existing projects. New configuration should prefer `models.yml` provider/model metadata.
 
-This example uses a fictional provider name and a reserved example host.
+Legacy YAML shape:
 
 ```yaml
 version: 1
@@ -171,29 +137,27 @@ providers:
     match:
       api: openai-responses
       provider: compatible-example
-      baseUrl:
-        prefix: https://gateway.example.invalid/v1
     tools:
       web_search:
         enabled: true
-        search_context_size: medium
       image_generation:
         enabled: true
         output_format: png
-        quality: high
     output:
       directory: ./provider-tool-images
 ```
+
+Legacy `compat.extraBody.openai_provider_tools.*` markers are still recognized for compatibility, but are no longer recommended because `extraBody` is request-body metadata in some provider paths.
 
 ## Credential policy
 
 The plugin does not read, store, or request API keys. It does not use environment variables for plugin credentials. Provider authentication remains in the runtime/model provider configuration that already owns provider credentials.
 
-Do not put keys or private endpoints in `openai-provider-tools.yml`. Keep plugin configuration limited to matching rules, provider-native tool settings, and optional image output paths.
+Do not put keys or private endpoints in `openai-provider-tools.yml` or plugin settings. Provider credentials stay in the runtime model/provider registry (`models.yml` or the host runtime's equivalent credential store).
 
 ## Behavior
 
-- Tools are disabled by default. A provider entry must match the current OpenAI Responses request, and each tool must set `enabled: true` before injection occurs. `image_generation` additionally requires the selected model to opt in with image-generation model metadata.
+- Official OpenAI Responses models get provider-native `web_search` by default. Custom OpenAI-compatible providers must opt in with `compat.openaiProviderTools.enabled: true`. `image_generation` additionally requires selected-model opt-in with `compat.openaiProviderTools.imageGeneration: true`.
 - The plugin does not set `tool_choice`; provider tool selection remains controlled by the model/provider request.
 - For matching models, corresponding host-side `web_search` or `generate_image` tools are removed only when provider-native injection for that same capability can be ensured.
 - If safe injection or safe host-tool conflict control cannot be ensured, the plugin warns or blocks transparently instead of creating ambiguous behavior.
@@ -205,7 +169,7 @@ Image files are extracted from OpenAI Responses native history, specifically pre
 
 Saved image directory order:
 
-1. `providers[].output.directory`, when configured.
+1. `compat.openaiProviderTools.outputDirectory` / `output_directory`, or legacy `providers[].output.directory`, when configured.
 2. Runtime session artifact directory, when available.
 3. Agent default image directory.
 
@@ -221,8 +185,8 @@ Currently, `web_search_call` history is summarized with the provider action, que
 
 | Symptom | What to check |
 | --- | --- |
-| No provider-native tools appear | Confirm a config file exists in the OMP or Pi path, `version: 1` is present, the provider entry matches the current request, and the desired tool has `enabled: true`. |
-| Invalid config warning | Validate YAML syntax and supported schema fields. Unknown or malformed fields can prevent safe matching. |
+| No provider-native tools appear | For official OpenAI, confirm the selected model is an OpenAI Responses model on provider `openai` or host `api.openai.com`. For custom providers, confirm runtime model metadata contains `compat.openaiProviderTools.enabled: true`. For image generation, also confirm the selected model has `compat.openaiProviderTools.imageGeneration: true`. |
+| Legacy config warning | Validate legacy `openai-provider-tools.yml` YAML syntax and supported schema fields. Unknown or malformed fields can prevent safe matching when the legacy file is present. |
 | Runtime capability warning | Check [runtime compatibility notes](./docs/runtime-compatibility.md). The runtime must expose the capability gate needed for the requested behavior. |
 | Provider request fails | Treat the error as a provider/runtime response first. The plugin keeps provider-native execution in the main request path and reports plugin-side warnings separately. |
 | No image file is saved | Confirm the provider returned native Responses image history and the runtime preserved that history or exposed an artifact-capable session. Also confirm the configured output directory is writable when one is set. |
@@ -237,8 +201,8 @@ Before publishing or enabling the plugin in a runtime, validate the relevant row
 | OMP local link | Run `omp plugin link <path>`. |
 | Pi install | Run `pi install npm:omp-openai-provider-tools`. |
 | Pi explicit package flag | Run `pi -e npm:omp-openai-provider-tools`. |
-| Official OpenAI dry run | Use a non-secret runtime provider configuration named `openai`; confirm the matching entry injects only enabled provider-native tools. |
-| Compatible provider dry run | Use a test runtime provider named `compatible-example` with `https://gateway.example.invalid/v1`; confirm matching uses the compatible entry. |
+| Official OpenAI dry run | Use an official OpenAI Responses runtime provider; confirm provider-native `web_search` is injected without a legacy plugin YAML file and `tool_choice` is absent. |
+| Compatible provider dry run | Use a test runtime provider with `compat.openaiProviderTools.enabled: true`; confirm provider-native `web_search` is injected only when the metadata is present. |
 | Provider-native `web_search` live e2e | Send a real request that allows provider-native search; confirm the Responses request carries `web_search` and the provider returns native search call history or a provider-side error transparently. |
 | Provider-native `image_generation` live e2e | Send a real request that allows provider-native image generation; confirm the Responses request carries `image_generation` and the provider returns native image generation call history or a provider-side error transparently. |
 | Image file saved live e2e | After a provider-native image generation response, confirm the visible custom message reports the saved image path and the file exists in the configured output, session artifact, or agent default image directory. |

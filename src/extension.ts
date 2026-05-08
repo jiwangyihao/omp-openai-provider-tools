@@ -57,6 +57,23 @@ function isExplicitOpenAIResponsesModel(model: RuntimeModelLike | undefined): bo
 	return normalized === "openai-responses" || normalized === "responses" || normalized === "openai_responses" || normalized === "openai.responses";
 }
 
+function baseUrlHost(baseUrl: string | undefined): string | undefined {
+	if (typeof baseUrl !== "string") return undefined;
+	try {
+		return new URL(baseUrl).hostname.trim().toLowerCase();
+	} catch {
+		return undefined;
+	}
+}
+
+function isOfficialOpenAIResponsesProvider(model: RuntimeModelLike | undefined): boolean {
+	if (!isExplicitOpenAIResponsesModel(model)) return false;
+	const host = baseUrlHost(model?.baseUrl);
+	if (host) return host === "api.openai.com";
+	const provider = typeof model?.provider === "string" ? model.provider.trim().toLowerCase() : undefined;
+	return provider === "openai";
+}
+
 function modelPayloadForBeforeAgent(model: RuntimeModelLike | undefined): Record<string, unknown> | undefined {
 	const modelId = model?.id ?? model?.name;
 	if (!modelId) return undefined;
@@ -65,6 +82,11 @@ function modelPayloadForBeforeAgent(model: RuntimeModelLike | undefined): Record
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function openAIProviderToolsMetadata(model: RuntimeModelLike | undefined): NonNullable<RuntimeModelLike["compat"]>["openaiProviderTools"] | undefined {
+	const metadata = model?.compat?.openaiProviderTools;
+	return isRecord(metadata) ? metadata : undefined;
 }
 
 function isEnabledFlag(value: unknown): boolean {
@@ -86,6 +108,10 @@ function nestedValue(value: unknown, path: readonly string[]): unknown {
 
 function modelAllowsProviderImageGeneration(model: RuntimeModelLike | undefined): boolean {
 	if (!model) return false;
+	const metadata = openAIProviderToolsMetadata(model);
+	if (isEnabledFlag(metadata?.imageGeneration)) return true;
+	if (isEnabledFlag(metadata?.image_generation)) return true;
+
 	const capabilityPaths = [
 		["openaiProviderTools", "imageGeneration"],
 		["openaiProviderTools", "image_generation"],
@@ -104,6 +130,28 @@ function modelAllowsProviderImageGeneration(model: RuntimeModelLike | undefined)
 
 	const headers = model.headers ?? {};
 	return isEnabledFlag(headers["x-openai-provider-tools-image-generation"] ?? headers["X-OpenAI-Provider-Tools-Image-Generation"]);
+}
+
+function providerEntryFromModel(model: RuntimeModelLike | undefined): ProviderToolsEntry | undefined {
+	if (!isExplicitOpenAIResponsesModel(model)) return undefined;
+	const metadata = openAIProviderToolsMetadata(model);
+	if (!isOfficialOpenAIResponsesProvider(model) && !isEnabledFlag(metadata?.enabled)) return undefined;
+
+	const tools: ProviderToolsEntry["tools"] = {};
+	if (metadata?.webSearch !== false && metadata?.web_search !== false) {
+		tools.web_search = { enabled: true };
+	}
+	if (modelAllowsProviderImageGeneration(model)) {
+		tools.image_generation = { enabled: true };
+	}
+
+	const outputDirectory = metadata?.outputDirectory ?? metadata?.output_directory;
+	return {
+		name: "runtime-model-openai-provider-tools",
+		match: { api: "openai-responses" },
+		tools,
+		...(typeof outputDirectory === "string" ? { output: { directory: outputDirectory } } : {}),
+	};
 }
 
 function getEnabledProviderToolTypesForModel(entry: ProviderToolsEntry, model: RuntimeModelLike | undefined): ProviderToolType[] {
@@ -526,7 +574,7 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 		const key = targetKey(target);
 		if (incompatibleTargets.has(key)) return undefined;
 
-		const entry = findMatchingProvider(config, target);
+		const entry = findMatchingProvider(config, target) ?? providerEntryFromModel(ctx.model);
 		if (!entry) return undefined;
 
 		const enabledProviderTools = getEnabledProviderToolTypesForModel(entry, ctx.model);
@@ -631,7 +679,7 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 			}
 			return undefined;
 		}
-		const entry = findMatchingProvider(config, target);
+		const entry = findMatchingProvider(config, target) ?? providerEntryFromModel(eligibilityModel);
 		if (!entry) {
 			const expected = expectedByTarget.get(key);
 			const pending: [string, ExpectedToolsState] | undefined = expected ? [key, expected] : pendingRemovedState(expectedByTarget);

@@ -14,6 +14,16 @@ export interface RuntimeModelLike {
 	headers?: Record<string, string>;
 	compat?: {
 		extraBody?: Record<string, unknown>;
+		openaiProviderTools?: {
+			enabled?: unknown;
+			webSearch?: unknown;
+			web_search?: unknown;
+			imageGeneration?: unknown;
+			image_generation?: unknown;
+			outputDirectory?: unknown;
+			output_directory?: unknown;
+			[key: string]: unknown;
+		};
 		[key: string]: unknown;
 	};
 	runtime?: {

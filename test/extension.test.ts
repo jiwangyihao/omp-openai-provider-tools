@@ -20,16 +20,39 @@ const targetModel = {
 	name: "GPT 5",
 	api: "openai-responses",
 	provider: "openai",
-	baseUrl: "https://api.openai.example/v1",
+	baseUrl: "https://api.openai.com/v1",
 };
 
 const imageCapableModel = {
 	...targetModel,
 	compat: {
-		extraBody: {
-			openai_provider_tools: {
-				image_generation: true,
-			},
+		openaiProviderTools: {
+			imageGeneration: true,
+		},
+	},
+};
+
+const customProviderModel = {
+	...targetModel,
+	provider: "custom-openai-compatible",
+	baseUrl: "https://gateway.example.invalid/v1",
+};
+
+const providerToolsEnabledModel = {
+	...customProviderModel,
+	compat: {
+		openaiProviderTools: {
+			enabled: true,
+		},
+	},
+};
+
+const providerToolsImageModel = {
+	...customProviderModel,
+	compat: {
+		openaiProviderTools: {
+			enabled: true,
+			imageGeneration: true,
 		},
 	},
 };
@@ -324,15 +347,15 @@ describe("OpenAI provider tools extension", () => {
 		expect(source).not.toContain("@mariozechner/");
 	});
 
-	it("does not inject or remove active tools when no config exists", async () => {
+	it("does not inject or remove active tools for custom providers without config or opt-in", async () => {
 		const cwd = await makeTempDir();
 		const homeDir = await makeTempDir();
 		const extension = registerExtension();
-		const ctx = context(cwd, homeDir);
+		const ctx = context(cwd, homeDir, { model: customProviderModel });
 		const payload = { model: "gpt-5", input: "hello" };
 
 		await runBeforeAgent(extension, ctx);
-		await runBeforeProvider(extension, payload, ctx);
+		await runBeforeProvider(extension, payload, ctx, { requestModel: customProviderModel });
 
 		expect(extension.activeTools()).toEqual(["read", "web_search", "generate_image"]);
 		expect(payload).toEqual({ model: "gpt-5", input: "hello" });
@@ -405,6 +428,76 @@ describe("OpenAI provider tools extension", () => {
 
 		expect(payload.tools).toEqual([{ type: "web_search" }]);
 		expect(payload).not.toHaveProperty("tool_choice");
+	});
+
+	it("injects web_search for official OpenAI Responses without plugin YAML", async () => {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		const extension = registerExtension({ initialActiveTools: ["read", "generate_image"] });
+		const ctx = context(cwd, homeDir);
+		const payload: Record<string, unknown> = { model: "gpt-5", input: "hello" };
+
+		await runSessionStart(extension, ctx);
+		await runBeforeProvider(extension, payload, ctx, { requestModel: targetModel });
+
+		expect(payload.tools).toEqual([{ type: "web_search" }]);
+		expect(payload).not.toHaveProperty("tool_choice");
+	});
+
+	it("does not inject provider tools for custom providers without provider opt-in", async () => {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		const extension = registerExtension({ initialActiveTools: ["read", "generate_image"] });
+		const ctx = context(cwd, homeDir, { model: customProviderModel });
+		const payload: Record<string, unknown> = { model: "gpt-5", input: "hello" };
+
+		await runSessionStart(extension, ctx);
+		await runBeforeProvider(extension, payload, ctx, { requestModel: customProviderModel });
+
+		expect(payload.tools).toBeUndefined();
+	});
+
+	it("does not treat provider named openai on a custom baseUrl as official OpenAI", async () => {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		const extension = registerExtension({ initialActiveTools: ["read", "generate_image"] });
+		const gatewayNamedOpenAIModel = {
+			...targetModel,
+			baseUrl: "https://gateway.example.invalid/v1",
+		};
+		const ctx = context(cwd, homeDir, { model: gatewayNamedOpenAIModel });
+		const payload: Record<string, unknown> = { model: "gpt-5", input: "hello" };
+
+		await runSessionStart(extension, ctx);
+		await runBeforeProvider(extension, payload, ctx, { requestModel: gatewayNamedOpenAIModel });
+
+		expect(payload.tools).toBeUndefined();
+	});
+
+	it("injects web_search for custom providers with compat.openaiProviderTools enabled", async () => {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		const extension = registerExtension({ initialActiveTools: ["read", "generate_image"] });
+		const ctx = context(cwd, homeDir, { model: providerToolsEnabledModel });
+		const payload: Record<string, unknown> = { model: "gpt-5", input: "hello" };
+
+		await runSessionStart(extension, ctx);
+		await runBeforeProvider(extension, payload, ctx, { requestModel: providerToolsEnabledModel });
+
+		expect(payload.tools).toEqual([{ type: "web_search" }]);
+	});
+
+	it("injects image_generation only when compat.openaiProviderTools imageGeneration is enabled", async () => {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		const extension = registerExtension({ initialActiveTools: ["read"] });
+		const ctx = context(cwd, homeDir, { model: providerToolsImageModel });
+		const payload: Record<string, unknown> = { model: "gpt-5", input: "hello" };
+
+		await runSessionStart(extension, ctx);
+		await runBeforeProvider(extension, payload, ctx, { requestModel: providerToolsImageModel });
+
+		expect(payload.tools).toEqual([{ type: "web_search" }, { type: "image_generation" }]);
 	});
 
 	it("does not inject image_generation unless the request model opts in", async () => {
