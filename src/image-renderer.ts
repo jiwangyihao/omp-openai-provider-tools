@@ -222,11 +222,8 @@ function runtimeImageBox(
 			for (const line of color(theme, "customMessageText", text).split("\n")) {
 				lines.push(backgroundLine(theme, line, width));
 			}
-			if (detailLines.length === 0) {
-				lines.push(backgroundLine(theme, expandHint(theme), width));
-			}
 			lines.push(backgroundLine(theme, "", width));
-			lines.push(...runtimeImagePreview.render(width));
+			lines.push(...backgroundRuntimeImageLines(theme, runtimeImagePreview.render(width), width));
 			if (detailLines.length > 0) {
 				lines.push(backgroundLine(theme, "", width));
 				for (const line of color(theme, "customMessageText", detailLines.join("\n")).split("\n")) {
@@ -240,6 +237,10 @@ function runtimeImageBox(
 			runtimeImagePreview.invalidate();
 		},
 	};
+}
+
+function backgroundRuntimeImageLines(theme: unknown, imageLines: string[], width: number): string[] {
+	return imageLines.map(line => line.length === 0 ? backgroundLine(theme, "", width) : line);
 }
 
 function buildRuntimeImagePreview(runtimePi: RuntimePiLike | undefined, images: ProviderImageDetail[]): ComponentLike | undefined {

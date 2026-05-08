@@ -96,6 +96,12 @@ class FakeRuntimeAssistantMessage implements FakeComponent {
 	invalidate(): void {}
 }
 
+class FakeRuntimeAssistantMessageWithImageRows extends FakeRuntimeAssistantMessage {
+	render(): string[] {
+		return super.render().flatMap(line => ["", "", line]);
+	}
+}
+
 
 const fakeTui = {
 	Container: FakeContainer,
@@ -221,6 +227,23 @@ describe("provider image renderer", () => {
 		expect(expanded).toContain("File: provider-result.png");
 		expect(expanded).toContain("SHA-256: abc123");
 		expect(expanded).not.toContain(imagePath);
+	});
+
+	it("background-fills runtime image rows without a fold hint that can accumulate", async () => {
+		const message = await makeImageMessage();
+
+		const folded = renderMessage(false, message, {
+			pi: {
+				AssistantMessageComponent: FakeRuntimeAssistantMessageWithImageRows,
+			},
+		});
+		const lines = folded.split("\n");
+		const imageLineIndex = lines.findIndex(line => line.includes("RUNTIME_IMAGE:image/png:iVBORw0KGgoA"));
+
+		expect(folded).not.toContain("Ctrl+O for more");
+		expect(imageLineIndex).toBeGreaterThan(1);
+		expect(lines.some(line => line === "")).toBe(false);
+		expect(lines[imageLineIndex - 1]).toContain("BG(customMessageBg:");
 	});
 
 	it("prefers the runtime-matching pi-tui cache module before stale cached versions", async () => {
