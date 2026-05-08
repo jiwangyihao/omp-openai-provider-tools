@@ -184,20 +184,17 @@ function renderProviderImageMessage(
 	}
 
 	const box = new Tui.Box(1, 1, value => background(theme, "customMessageBg", value));
-	const label = color(theme, "customMessageLabel", bold(theme, `[${messageCustomType(message)}]`));
+	const labelBase = color(theme, "customMessageLabel", bold(theme, `[${messageCustomType(message)}]`));
+	const label = !options.expanded && detailLines.length > 0 ? `${labelBase} ${expandHint(theme)}` : labelBase;
 	box.addChild(new Tui.Text(label, 0, 0));
-	box.addChild(new Tui.Spacer(1));
 	if (options.expanded) {
+		box.addChild(new Tui.Spacer(1));
 		box.addChild(new Tui.Text(color(theme, "customMessageText", text || "OpenAI provider image_generation result"), 0, 0));
 	}
 
 	if (images.length > 0) {
 		if (options.expanded) box.addChild(new Tui.Spacer(1));
 		for (const image of images) addImagePreview(box, Tui, image, theme, options.expanded);
-	}
-
-	if (!options.expanded && detailLines.length > 0) {
-		box.addChild(new Tui.Text(expandHint(theme), 0, 0));
 	}
 
 	if (options.expanded && detailLines.length > 0) {
@@ -219,30 +216,24 @@ function runtimeImageBox(
 	return {
 		render(width: number): string[] {
 			const lines: string[] = [];
-			const label = color(theme, "customMessageLabel", bold(theme, `[${customType}]`));
+			const labelBase = color(theme, "customMessageLabel", bold(theme, `[${customType}]`));
+			const label = !expanded && detailLines.length > 0 ? `${labelBase} ${expandHint(theme)}` : labelBase;
 			lines.push(backgroundLine(theme, "", width));
 			lines.push(backgroundLine(theme, label, width));
-			lines.push(backgroundLine(theme, "", width));
 			if (expanded) {
+				lines.push(backgroundLine(theme, "", width));
 				for (const line of color(theme, "customMessageText", text).split("\n")) {
 					lines.push(backgroundLine(theme, line, width));
 				}
-				lines.push(backgroundLine(theme, "", width));
-			}
-			if (!expanded) {
+				if (detailLines.length > 0) {
+					lines.push(backgroundLine(theme, "", width));
+					for (const line of color(theme, "customMessageText", detailLines.join("\n")).split("\n")) {
+						lines.push(backgroundLine(theme, line, width));
+					}
+				}
 				lines.push(backgroundLine(theme, "", width));
 			}
 			lines.push(...backgroundRuntimeImageLines(theme, runtimeImagePreview.render(width), width));
-			if (!expanded && detailLines.length > 0) {
-				lines.push(backgroundLine(theme, expandHint(theme), width));
-			}
-			if (expanded && detailLines.length > 0) {
-				lines.push(backgroundLine(theme, "", width));
-				for (const line of color(theme, "customMessageText", detailLines.join("\n")).split("\n")) {
-					lines.push(backgroundLine(theme, line, width));
-				}
-			}
-			lines.push(backgroundLine(theme, "", width));
 			return lines;
 		},
 		invalidate() {
@@ -252,7 +243,46 @@ function runtimeImageBox(
 }
 
 function backgroundRuntimeImageLines(theme: unknown, imageLines: string[], width: number): string[] {
-	return imageLines.map(line => isBlankRenderLine(line) ? backgroundLine(theme, "", width) : line);
+	return normalizeRuntimeImageLines(imageLines).map(line => isBlankRenderLine(line) ? backgroundLine(theme, "", width) : line);
+}
+
+function normalizeRuntimeImageLines(imageLines: string[]): string[] {
+	const lines = [...imageLines];
+	for (let ordinal = protocolLineIndexes(lines).length - 1; ordinal >= 0; ordinal--) {
+		const protocolLineIndex = protocolLineIndexes(lines)[ordinal];
+		if (protocolLineIndex === undefined) continue;
+		const requiredBlankRows = imageCursorUpRows(lines[protocolLineIndex] ?? "") ?? 0;
+		let blankRunStart = protocolLineIndex;
+		while (blankRunStart > 0 && isBlankRenderLine(lines[blankRunStart - 1] ?? "")) blankRunStart--;
+		const blankRunLength = protocolLineIndex - blankRunStart;
+		const extraBlankRows = Math.max(0, blankRunLength - requiredBlankRows);
+		if (extraBlankRows > 0) {
+			lines.splice(blankRunStart, extraBlankRows);
+		}
+	}
+
+	const finalProtocolLineIndex = protocolLineIndexes(lines).at(-1);
+	if (finalProtocolLineIndex === undefined) return lines;
+	let trailingIndex = finalProtocolLineIndex + 1;
+	while (trailingIndex < lines.length && isBlankRenderLine(lines[trailingIndex] ?? "")) trailingIndex++;
+	if (trailingIndex > finalProtocolLineIndex + 1) {
+		lines.splice(finalProtocolLineIndex + 1, trailingIndex - finalProtocolLineIndex - 1);
+	}
+	return lines;
+}
+
+function protocolLineIndexes(lines: string[]): number[] {
+	return lines.flatMap((line, index) => isImageProtocolLine(line) ? [index] : []);
+}
+
+function isImageProtocolLine(line: string): boolean {
+	const prefix = line.slice(0, 128);
+	return prefix.includes("\x1b_G") || prefix.includes("\x1b]1337;File=") || /\x1bP(?:[0-9;]*)q/u.test(prefix);
+}
+
+function imageCursorUpRows(line: string): number | undefined {
+	const match = /^\x1b\[(\d+)A/u.exec(line);
+	return match ? Number.parseInt(match[1] ?? "0", 10) : undefined;
 }
 
 function isBlankRenderLine(line: string): boolean {
