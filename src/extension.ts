@@ -224,15 +224,24 @@ function eventMessages(event: unknown): unknown[] {
 	return [(candidate as MessageEndEventLike | undefined)?.message ?? event];
 }
 
-function stripProviderImageGenerationReplayItems(message: unknown): void {
+function normalizedProviderImageGenerationReplayItem(item: unknown): unknown | undefined {
+	if (!isRecord(item)) return item;
+	if (item.type !== "image_generation_call") return item;
+	return typeof item.id === "string" && item.id.length > 0 ? { type: "image_generation_call", id: item.id } : undefined;
+}
+
+function normalizeProviderImageGenerationReplayItems(message: unknown): void {
 	if (!isRecord(message)) return;
 	const providerPayload = message.providerPayload;
 	if (!isRecord(providerPayload)) return;
 	if (providerPayload.type !== "openaiResponsesHistory") return;
 	if (!Array.isArray(providerPayload.items)) return;
 
-	const safeItems = providerPayload.items.filter((item) => !isRecord(item) || item.type !== "image_generation_call");
-	if (safeItems.length === providerPayload.items.length) return;
+	const safeItems = providerPayload.items.flatMap((item) => {
+		const normalized = normalizedProviderImageGenerationReplayItem(item);
+		return normalized === undefined ? [] : [normalized];
+	});
+	if (safeItems.length === providerPayload.items.length && safeItems.every((item, index) => item === providerPayload.items[index])) return;
 	if (safeItems.length === 0) {
 		delete message.providerPayload;
 		return;
@@ -240,17 +249,20 @@ function stripProviderImageGenerationReplayItems(message: unknown): void {
 	providerPayload.items = safeItems;
 }
 
-function stripProviderImageGenerationReplayItemsFromEvent(event: unknown): void {
+function normalizeProviderImageGenerationReplayItemsFromEvent(event: unknown): void {
 	for (const message of eventMessages(event)) {
-		stripProviderImageGenerationReplayItems(message);
+		normalizeProviderImageGenerationReplayItems(message);
 	}
 }
 
 
-function stripProviderImageGenerationReplayItemsFromPayload(payload: unknown): void {
+function normalizeProviderImageGenerationReplayItemsFromPayload(payload: unknown): void {
 	if (!isRecord(payload)) return;
 	if (!Array.isArray(payload.input)) return;
-	payload.input = payload.input.filter((item) => !isRecord(item) || item.type !== "image_generation_call");
+	payload.input = payload.input.flatMap((item) => {
+		const normalized = normalizedProviderImageGenerationReplayItem(item);
+		return normalized === undefined ? [] : [normalized];
+	});
 }
 function imageResultsFromMessageEndEvent(event: unknown) {
 	const candidate = event as MessageEndEventLike | undefined;
@@ -394,11 +406,11 @@ function handleAgentEndImageResults({
 		results = [...state.pendingRetries.values(), ...imageResultsFromAgentEndEvent(event)];
 	} catch (error) {
 		notifyWarningLater(api, ctx, `OpenAI provider image results could not be extracted: ${error instanceof Error ? error.message : String(error)}`);
-		stripProviderImageGenerationReplayItemsFromEvent(event);
+		normalizeProviderImageGenerationReplayItemsFromEvent(event);
 		return;
 	}
 	handleImageResults({ api, ctx, results, state, seen });
-	stripProviderImageGenerationReplayItemsFromEvent(event);
+	normalizeProviderImageGenerationReplayItemsFromEvent(event);
 }
 
 function handleMessageEndImageResults({
@@ -419,11 +431,11 @@ function handleMessageEndImageResults({
 		results = imageResultsFromMessageEndEvent(event);
 	} catch (error) {
 		notifyWarningLater(api, ctx, `OpenAI provider image results could not be extracted: ${error instanceof Error ? error.message : String(error)}`);
-		stripProviderImageGenerationReplayItemsFromEvent(event);
+		normalizeProviderImageGenerationReplayItemsFromEvent(event);
 		return;
 	}
 	handleImageResults({ api, ctx, results, state, seen, retainFailures: true });
-	stripProviderImageGenerationReplayItemsFromEvent(event);
+	normalizeProviderImageGenerationReplayItemsFromEvent(event);
 }
 
 async function sendVisibleProviderToolResultMessage(api: ExtensionApiLike, message: unknown): Promise<void> {
@@ -636,7 +648,7 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 
 	api.on?.("before_provider_request", async (event, ctx) => {
 		const payload = requestPayload(event);
-		stripProviderImageGenerationReplayItemsFromPayload(payload);
+		normalizeProviderImageGenerationReplayItemsFromPayload(payload);
 		const eventModel = requestEventModel(event);
 		const eligibilityModel = eventModel ?? ctx.model;
 		imageResultState.outputDirectory = undefined;

@@ -569,7 +569,7 @@ describe("OpenAI provider tools extension", () => {
 		expect(message.content).not.toContain(ONE_BY_ONE_PNG);
 	});
 
-	it("removes provider-native image_generation replay items after saving them", async () => {
+	it("normalizes provider-native image_generation replay items after saving them", async () => {
 		const cwd = await makeTempDir();
 		const homeDir = await makeTempDir();
 		const artifactsDir = path.join(cwd, "artifacts");
@@ -596,10 +596,13 @@ describe("OpenAI provider tools extension", () => {
 		getHandler(extension, "message_end")({ type: "message_end", message }, ctx);
 
 		expect(await directoryEntries(artifactsDir)).toHaveLength(1);
-		expect(message.providerPayload.items).toEqual([{ type: "reasoning", encrypted_content: "opaque", summary: [] }]);
+		expect(message.providerPayload.items).toEqual([
+			{ type: "reasoning", encrypted_content: "opaque", summary: [] },
+			{ type: "image_generation_call", id: "img-1" },
+		]);
 	});
 
-	it("keeps failed image results retryable after stripping unsafe replay items", async () => {
+	it("keeps failed image results retryable after normalizing unsafe replay items", async () => {
 		const cwd = await makeTempDir();
 		const homeDir = await makeTempDir();
 		const outputParentFile = path.join(cwd, "not-a-directory");
@@ -620,12 +623,12 @@ describe("OpenAI provider tools extension", () => {
 		await fs.rm(outputParentFile, { force: true });
 		await runAgentEnd(extension, { message }, ctx);
 
-		expect(message.providerPayload).toBeUndefined();
+		expect(message.providerPayload.items).toEqual([{ type: "image_generation_call", id: "img-1" }]);
 		expect(await directoryEntries(badOutputDir)).toHaveLength(1);
 		expect(extension.sentMessages).toHaveLength(2);
 	});
 
-	it("removes unsafe replayed image_generation_call items from outgoing provider payload", async () => {
+	it("normalizes unsafe replayed image_generation_call items in outgoing provider payload", async () => {
 		const cwd = await makeTempDir();
 		const homeDir = await makeTempDir();
 		const extension = registerExtension({ initialActiveTools: ["read"] });
@@ -641,7 +644,10 @@ describe("OpenAI provider tools extension", () => {
 
 		await runBeforeProvider(extension, payload, ctx, { requestModel: providerToolsImageModel });
 
-		expect(payload.input).toEqual([{ role: "user", content: [{ type: "input_text", text: "next" }] }]);
+		expect(payload.input).toEqual([
+			{ role: "user", content: [{ type: "input_text", text: "next" }] },
+			{ type: "image_generation_call", id: "img-1" },
+		]);
 		expect(payload.tools).toEqual([{ type: "web_search" }, { type: "image_generation" }]);
 	});
 
