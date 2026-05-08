@@ -1,9 +1,9 @@
 {
 	"type": "module",
 	"name": "omp-openai-provider-tools",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"description": "Provider-native OpenAI Responses tools for OMP and Pi-family runtimes.",
-	"license": "MIT",
+	"license": "MPL-2.0",
 	"keywords": [
 		"oh-my-pi",
 		"pi-package",

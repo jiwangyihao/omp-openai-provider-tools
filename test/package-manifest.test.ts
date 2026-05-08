@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import packageJson from "../package.json";
 
@@ -15,11 +15,22 @@ const runtimeCorePackages = [
 const allowedRuntimeDependencies = ["yaml"];
 const forbiddenRuntimePackageScopes = ["@oh-my-pi/", "@mariozechner/"];
 const repoRoot = resolve(import.meta.dir, "..");
+const licensePath = resolve(repoRoot, "LICENSE");
+const readmePath = resolve(repoRoot, "README.md");
 
 describe("package manifest", () => {
 	it("declares both OMP and Pi extension entry points", () => {
 		expect(packageJson.omp).toEqual({ extensions: ["./src/extension.ts"] });
 		expect(packageJson.pi).toEqual({ extensions: ["./src/extension.ts"] });
+	});
+
+	it("declares MPL-2.0 licensing consistently", () => {
+		expect(packageJson.license).toBe("MPL-2.0");
+		expect(existsSync(licensePath)).toBe(true);
+		expect(readFileSync(licensePath, "utf8")).toContain("Mozilla Public License Version 2.0");
+		const readme = readFileSync(readmePath, "utf8");
+		expect(readme).toContain("License: MPL-2.0");
+		expect(readme).toContain("[MPL-2.0](./LICENSE)");
 	});
 
 	it("is discoverable as a Pi package and publishes runtime files", () => {
