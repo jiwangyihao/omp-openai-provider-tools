@@ -45,6 +45,15 @@ describe("package manifest", () => {
 		expect(readme).not.toContain("-Sys");
 	});
 
+	it("explains runtime host-tool conflict handling and provider configuration", () => {
+		const readme = readFileSync(readmePath, "utf8");
+		expect(readme).toContain("安装插件本身不会禁用任何 OMP 原生工具");
+		expect(readme).toContain("before_agent_start");
+		expect(readme).toContain("before_provider_request");
+		expect(readme).toContain("帮助用户配置 OpenAI 官方 provider");
+		expect(readme).toContain("用户自己的 OpenAI-compatible 中转站");
+	});
+
 	it("is discoverable as a Pi package and publishes runtime files", () => {
 		expect(packageJson.keywords).toContain("pi-package");
 		expect(packageJson.files).toEqual(["src", "README.md", "docs/runtime-compatibility.md"]);

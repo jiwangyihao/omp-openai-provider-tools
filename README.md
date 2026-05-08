@@ -76,6 +76,9 @@ OpenAI provider-executed tools 通常不会把原始工具输出暴露给宿主�
 
 - **安全处理本地工具冲突**
   - 只有确认 provider-native tool 能注入成功时，才移除对应的 OMP 本地 `web_search` / `generate_image`。
+  - 安装插件本身不会禁用任何 OMP 原生工具；冲突处理发生在进入会话后的运行时。
+  - 在 `before_agent_start` 阶段，插件会根据当前会话实际选中的 provider/model 和 `compat.openaiProviderTools` 元数据判断 provider-native tools 是否可用；只有当前目标会启用 provider-native `web_search` 或 `image_generation` 时，才快照 active tools 并移除当轮会冲突的本地 `web_search` / `generate_image`。
+  - 在 `before_provider_request` 阶段，插件会再次校验实际 OpenAI Responses 请求目标，并把 provider-native tools 注入请求；如果目标不匹配、无法验证或注入失败，就恢复之前的 active tools 快照并告警或中止，避免出现「本地工具被移除但 provider tool 没有注入」的假成功。
   - 插件不会设置 `tool_choice`，是否调用工具仍由模型和 provider 决定。
   - 插件不读取、不保存、不要求任何 API key；provider 凭据仍归 OMP/Pi 的模型配置管理。
 
@@ -103,7 +106,7 @@ OpenAI provider-executed tools 通常不会把原始工具输出暴露给宿主�
 把下面这段话丢给 OMP / Claude Code / Cursor 等任意 LLM Agent：
 
 ```text
-请先查看 omp-openai-provider-tools 最新 GitHub Release 正文里的安装或升级说明，然后严格执行其中带明确版本号的 OMP 安装命令。不要使用裸包名或 latest。安装后运行 OMP 的插件检查命令确认插件可用。参考说明：https://github.com/jiwangyihao/omp-openai-provider-tools/releases/latest
+请先查看 omp-openai-provider-tools 最新 GitHub Release 正文里的安装或升级说明，然后严格执行其中带明确版本号的 OMP 安装命令。不要使用裸包名或 latest。安装后运行 OMP 的插件检查命令确认插件可用。随后帮助用户配置 OpenAI 官方 provider 或用户自己的 OpenAI-compatible 中转站：检查现有模型/provider 元数据，指导用户把配置放到 `compat.openaiProviderTools`，不要读取、输出、保存或索要 API key 明文。官方 OpenAI Responses provider 可默认使用 provider-native `web_search`；中转站必须显式设置 `compat.openaiProviderTools.enabled: true`；只有图像能力模型才设置 `compat.openaiProviderTools.imageGeneration: true`。参考说明：https://github.com/jiwangyihao/omp-openai-provider-tools/releases/latest
 ```
 
 **选项 B：手动安装**
@@ -141,15 +144,19 @@ omp plugin link <path-to-this-repo>
    omp plugin install npm:omp-openai-provider-tools@0.1.1
    ```
 
-3. 不要手动编辑 OMP 配置来安装插件，不要使用裸包名或 `latest`。
+3. 安装后不要停在插件安装本身。继续帮助用户配置 OpenAI 官方 provider 或用户自己的 OpenAI-compatible 中转站：确认当前模型使用 `openai-responses`，把能力声明写入模型或 provider 元数据的 `compat.openaiProviderTools`，不要新建插件专用配置文件。
 
-4. 安装后运行：
+4. 如果是官方 OpenAI Responses provider，`web_search` 可按默认启用；如果是 OpenAI-compatible 中转站，必须显式设置 `compat.openaiProviderTools.enabled: true`；如果某个模型支持 provider-native `image_generation`，只在该模型变体上设置 `compat.openaiProviderTools.imageGeneration: true`。
+
+5. 不要读取、输出、保存或索要 API key 明文。provider 凭据仍由 OMP/Pi 原有模型配置管理。
+
+6. 安装后运行：
 
    ```bash
    omp plugin doctor
    ```
 
-5. 如果 OMP 已经运行，重启后再进行功能验证。
+7. 如果 OMP 已经运行，重启后再进行功能验证。
 
 </details>
 
@@ -330,6 +337,7 @@ Provider-executed `web_search` lets the main Agent use provider-side search resu
 - Lets selected model variants opt in to provider-native `image_generation`.
 - Safely removes conflicting host-side `web_search` / `generate_image` tools only when provider-native injection is ensured.
 - Never sets `tool_choice`.
+- Installing the plugin does not globally disable host-side tools; host-side conflict handling happens at runtime for the currently selected provider/model, immediately before the agent run and provider request.
 - Emits visible UI-only summaries for provider-native `web_search` calls.
 - Saves provider-native image results, renders them inline in the terminal, and exposes expanded generation metadata.
 - Adds generated images as image attachments for later editing context.
