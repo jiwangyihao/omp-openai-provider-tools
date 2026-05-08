@@ -563,7 +563,7 @@ describe("OpenAI provider tools extension", () => {
 		expect(JSON.stringify(message.details)).not.toContain("OMP provider tools are available.");
 	});
 
-	it("deduplicates provider-native web_search echoes across message_end and agent_end", async () => {
+	it("echoes provider-native web_search at message_end before agent_end and deduplicates later", async () => {
 		const cwd = await makeTempDir();
 		const homeDir = await makeTempDir();
 		const extension = registerExtension();
@@ -575,13 +575,38 @@ describe("OpenAI provider tools extension", () => {
 		const message = webSearchMessage();
 
 		getHandler(extension, "message_end")({ type: "message_end", message }, ctx);
+
+		expect(extension.sentMessages).toHaveLength(1);
+		expect(extension.sentMessages[0]?.options).toBeUndefined();
+		expect((extension.sentMessages[0]?.message as any).content).toBe("");
+		await runAgentEnd(extension, { message }, ctx);
+
+		expect(extension.sentMessages).toHaveLength(1);
+		await runAgentEnd(extension, { message }, ctx);
+
+		expect(extension.sentMessages).toHaveLength(1);
+	});
+
+	it("does not let incomplete message_end web_search echoes suppress final agent_end details", async () => {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		const extension = registerExtension();
+		const ctx = context(cwd, homeDir, {
+			sessionManager: {
+				getSessionId: () => "session-1",
+			},
+		});
+		const partial = webSearchMessage();
+		((partial.providerPayload.items[0] as any).status) = "in_progress";
+		const completed = webSearchMessage();
+
+		getHandler(extension, "message_end")({ type: "message_end", message: partial }, ctx);
 		expect(extension.sentMessages).toHaveLength(0);
-		await runAgentEnd(extension, { message }, ctx);
+
+		await runAgentEnd(extension, { message: completed }, ctx);
 
 		expect(extension.sentMessages).toHaveLength(1);
-		await runAgentEnd(extension, { message }, ctx);
-
-		expect(extension.sentMessages).toHaveLength(1);
+		expect(JSON.stringify((extension.sentMessages[0]?.message as any).details)).toContain("https://example.invalid/omp-provider-tools");
 	});
 
 	it("saves an image_generation_call result and sends a visible message without base64", async () => {

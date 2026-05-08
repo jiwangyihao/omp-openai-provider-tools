@@ -191,15 +191,14 @@ function renderProviderImageMessage(
 	}
 	if (options.expanded) {
 		box.addChild(new Tui.Text(color(theme, "customMessageText", text || "OpenAI provider image_generation result"), 0, 0));
+		if (detailLines.length > 0) {
+			box.addChild(new Tui.Text(color(theme, "customMessageText", detailLines.join("\n")), 0, 0));
+		}
 	}
 
 	if (images.length > 0) {
 		box.addChild(new Tui.Spacer(1));
 		for (const image of images) addImagePreview(box, Tui, image, theme, options.expanded);
-	}
-
-	if (options.expanded && detailLines.length > 0) {
-		box.addChild(new Tui.Text(color(theme, "customMessageText", detailLines.join("\n")), 0, 0));
 	}
 
 	return box;
@@ -226,15 +225,14 @@ function runtimeImageBox(
 				for (const line of color(theme, "customMessageText", text).split("\n")) {
 					lines.push(backgroundLine(theme, line, width));
 				}
+				if (detailLines.length > 0) {
+					for (const line of color(theme, "customMessageText", detailLines.join("\n")).split("\n")) {
+						lines.push(backgroundLine(theme, line, width));
+					}
+				}
 			}
 			lines.push(backgroundLine(theme, "", width));
 			lines.push(...backgroundRuntimeImageLines(theme, runtimeImagePreview.render(width), width));
-			if (expanded && detailLines.length > 0) {
-				for (const line of color(theme, "customMessageText", detailLines.join("\n")).split("\n")) {
-					lines.push(backgroundLine(theme, line, width));
-				}
-				lines.push(backgroundLine(theme, "", width));
-			}
 			return lines;
 		},
 		invalidate() {
