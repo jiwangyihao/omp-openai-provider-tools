@@ -538,10 +538,10 @@ describe("OpenAI provider tools extension", () => {
 			},
 		});
 
-		getHandler(extension, "message_end")({ type: "message_end", message: webSearchMessage() }, ctx);
+		await runAgentEnd(extension, { message: webSearchMessage() }, ctx);
 
 		expect(extension.sentMessages).toHaveLength(1);
-		expect(extension.sentMessages[0]?.options).toEqual({ deliverAs: "nextTurn", triggerTurn: true });
+		expect(extension.sentMessages[0]?.options).toBeUndefined();
 		const message = extension.sentMessages[0]?.message as any;
 		expect(message.display).toBe(true);
 		expect(message.customType).toBe("openai-provider-tool-result");
@@ -563,6 +563,10 @@ describe("OpenAI provider tools extension", () => {
 		const message = webSearchMessage();
 
 		getHandler(extension, "message_end")({ type: "message_end", message }, ctx);
+		expect(extension.sentMessages).toHaveLength(0);
+		await runAgentEnd(extension, { message }, ctx);
+
+		expect(extension.sentMessages).toHaveLength(1);
 		await runAgentEnd(extension, { message }, ctx);
 
 		expect(extension.sentMessages).toHaveLength(1);
@@ -590,7 +594,8 @@ describe("OpenAI provider tools extension", () => {
 		const message = extension.sentMessages[0]?.message as any;
 		expect(message.display).toBe(true);
 		expect(message.customType).toBe("openai-provider-image-generation");
-		expect(message.content).toContain(path.join(artifactsDir, files[0] ?? ""));
+		expect(message.content).toContain("OpenAI provider generated 1 image.");
+		expect(message.content).not.toContain(path.join(artifactsDir, files[0] ?? ""));
 		expect(message.content).not.toContain(ONE_BY_ONE_PNG);
 	});
 
@@ -697,7 +702,9 @@ describe("OpenAI provider tools extension", () => {
 		expect(files[0]?.endsWith(".png")).toBe(true);
 		expect(extension.sentMessages).toHaveLength(1);
 		const message = extension.sentMessages[0]?.message as any;
-		expect(message.content).toContain(path.join(artifactsDir, files[0] ?? ""));
+		expect(message.content).toContain("OpenAI provider generated 1 image.");
+		expect(message.content).not.toContain(path.join(artifactsDir, files[0] ?? ""));
+		expect(message.details.path).toBe(path.join(artifactsDir, files[0] ?? ""));
 		expect(message.content).not.toContain(ONE_BY_ONE_PNG);
 	});
 
@@ -722,7 +729,9 @@ describe("OpenAI provider tools extension", () => {
 		expect(files).toHaveLength(1);
 		expect(extension.sentMessages).toHaveLength(1);
 		const message = extension.sentMessages[0]?.message as any;
-		expect(message.content).toContain(path.join(artifactsDir, files[0] ?? ""));
+		expect(message.content).toContain("OpenAI provider generated 1 image.");
+		expect(message.content).not.toContain(path.join(artifactsDir, files[0] ?? ""));
+		expect(message.details.path).toBe(path.join(artifactsDir, files[0] ?? ""));
 	});
 
 	it("retries image saving on agent_end when message_end save fails before marking seen", async () => {
@@ -751,7 +760,9 @@ describe("OpenAI provider tools extension", () => {
 		expect(files).toHaveLength(1);
 		expect(extension.sentMessages).toHaveLength(2);
 		const savedMessage = extension.sentMessages[1]?.message as any;
-		expect(savedMessage.content).toContain(path.join(badOutputDir, files[0] ?? ""));
+		expect(savedMessage.content).toContain("OpenAI provider generated 1 image.");
+		expect(savedMessage.content).not.toContain(path.join(badOutputDir, files[0] ?? ""));
+		expect(savedMessage.details.path).toBe(path.join(badOutputDir, files[0] ?? ""));
 	});
 	it("reports malformed id-less image results and continues with later valid results", async () => {
 		const cwd = await makeTempDir();
@@ -786,7 +797,9 @@ describe("OpenAI provider tools extension", () => {
 		expect(errorMessage.content).toMatch(/could not be saved|base64 is invalid/i);
 		expect(errorMessage.content).not.toContain(invalidResult);
 		const savedMessage = extension.sentMessages[1]?.message as any;
-		expect(savedMessage.content).toContain(path.join(artifactsDir, files[0] ?? ""));
+		expect(savedMessage.content).toContain("OpenAI provider generated 1 image.");
+		expect(savedMessage.content).not.toContain(path.join(artifactsDir, files[0] ?? ""));
+		expect(savedMessage.details.path).toBe(path.join(artifactsDir, files[0] ?? ""));
 		expect(savedMessage.content).not.toContain(ONE_BY_ONE_PNG);
 	});
 
@@ -849,7 +862,9 @@ describe("OpenAI provider tools extension", () => {
 		expect(await directoryEntries(outputDir)).toHaveLength(1);
 		await expect(fs.stat(artifactsDir)).rejects.toThrow();
 		const message = extension.sentMessages[0]?.message as any;
-		expect(message.content).toContain(outputDir);
+		expect(message.content).toContain("OpenAI provider generated 1 image.");
+		expect(message.content).not.toContain(outputDir);
+		expect(message.details.path).toContain(outputDir);
 	});
 
 	it("clears configured image output directory on session_start", async () => {
@@ -875,7 +890,9 @@ describe("OpenAI provider tools extension", () => {
 		expect(await directoryEntries(outputDir)).toHaveLength(1);
 		expect(await directoryEntries(artifactsDir)).toHaveLength(1);
 		const secondMessage = extension.sentMessages[1]?.message as any;
-		expect(secondMessage.content).toContain(artifactsDir);
+		expect(secondMessage.content).toContain("OpenAI provider generated 1 image.");
+		expect(secondMessage.content).not.toContain(artifactsDir);
+		expect(secondMessage.details.path).toContain(artifactsDir);
 		expect(secondMessage.content).not.toContain(outputDir);
 	});
 
@@ -915,7 +932,9 @@ describe("OpenAI provider tools extension", () => {
 		expect(await directoryEntries(outputDir)).toHaveLength(1);
 		expect(await directoryEntries(artifactsDir)).toHaveLength(1);
 		const secondMessage = extension.sentMessages[1]?.message as any;
-		expect(secondMessage.content).toContain(artifactsDir);
+		expect(secondMessage.content).toContain("OpenAI provider generated 1 image.");
+		expect(secondMessage.content).not.toContain(artifactsDir);
+		expect(secondMessage.details.path).toContain(artifactsDir);
 		expect(secondMessage.content).not.toContain(outputDir);
 	});
 
@@ -934,7 +953,9 @@ describe("OpenAI provider tools extension", () => {
 
 		expect(await directoryEntries(defaultDir)).toHaveLength(1);
 		const message = extension.sentMessages[0]?.message as any;
-		expect(message.content).toContain(defaultDir);
+		expect(message.content).toContain("OpenAI provider generated 1 image.");
+		expect(message.content).not.toContain(defaultDir);
+		expect(message.details.path).toContain(defaultDir);
 	});
 
 	it("uses Pi agent default image directory from context model runtime metadata", async () => {
@@ -958,7 +979,9 @@ describe("OpenAI provider tools extension", () => {
 		expect(await directoryEntries(piDefaultDir)).toHaveLength(1);
 		await expect(fs.stat(ompDefaultDir)).rejects.toThrow();
 		const message = extension.sentMessages[0]?.message as any;
-		expect(message.content).toContain(piDefaultDir);
+		expect(message.content).toContain("OpenAI provider generated 1 image.");
+		expect(message.content).not.toContain(piDefaultDir);
+		expect(message.details.path).toContain(piDefaultDir);
 	});
 
 	it("sends a visible error message when saving an image result fails", async () => {
@@ -1003,8 +1026,8 @@ describe("OpenAI provider tools extension", () => {
 
 		expect(extension.sentMessages).toHaveLength(1);
 		const message = extension.sentMessages[0]?.message as any;
-		expect(message.content).toContain("saved 2 image_generation results");
-		expect(message.content).toContain("Images:");
+		expect(message.content).toContain("OpenAI provider generated 2 images.");
+		expect(message.content).not.toContain("Images:");
 		expect(message.content).not.toContain("MIME:");
 		expect(message.content).not.toContain("Bytes:");
 		expect(message.details.images).toHaveLength(2);
@@ -1027,9 +1050,10 @@ describe("OpenAI provider tools extension", () => {
 			},
 		});
 
-		getHandler(extension, "message_end")({ type: "message_end", message }, ctx);
+		await runAgentEnd(extension, { message }, ctx);
 
 		expect(extension.sentMessages).toHaveLength(1);
+		expect(extension.sentMessages[0]?.options).toBeUndefined();
 		const sent = extension.sentMessages[0]?.message as any;
 		expect(sent.content).toContain("completed web_search (2 calls)");
 		expect(sent.content).toContain("Queries: provider native image_generation; latest OMP provider tools");

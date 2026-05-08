@@ -182,14 +182,8 @@ export function buildImageMessage(result: ProviderImageGenerationResult, saved: 
 export function buildImageSummaryMessage(savedResults: SavedProviderImageResult[]): ProviderImageMessage {
 	const images = savedResults.map(({ result, saved }) => imageDetails(result, saved));
 	const lines = [
-		`OpenAI provider saved ${images.length === 1 ? "1 image_generation result" : `${images.length} image_generation results`}.`,
+		`OpenAI provider generated ${images.length === 1 ? "1 image" : `${images.length} images`}.`,
 	];
-	if (images.length === 1) {
-		lines.push(`Image: ${images[0]?.path ?? "unknown"}`);
-	} else {
-		lines.push("Images:");
-		for (const image of images) lines.push(`- ${image.path}`);
-	}
 
 	return {
 		customType: PROVIDER_IMAGE_MESSAGE_TYPE,

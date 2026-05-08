@@ -128,7 +128,7 @@ async function makeImageMessage() {
 		customType: PROVIDER_IMAGE_MESSAGE_TYPE,
 		display: true,
 		attribution: "agent",
-		content: `OpenAI provider saved 1 image_generation result.\nImage: ${imagePath}`,
+		content: "OpenAI provider generated 1 image.",
 		details: {
 			path: imagePath,
 			mimeType: "image/png",
@@ -173,21 +173,26 @@ describe("provider image renderer", () => {
 
 		expect(folded).toContain("BG(customMessageBg:");
 		expect(folded).toContain("FG(customMessageLabel:BOLD([openai-provider-image-generation]))");
-		expect(folded).toContain("FG(customMessageText:OpenAI provider saved 1 image_generation result.");
+		expect(folded).toContain("FG(customMessageText:OpenAI provider generated 1 image.");
 	});
 
-	it("shows an image preview when folded and adds metadata when expanded", async () => {
+	it("shows an image preview when folded and adds concise metadata when expanded", async () => {
 		const message = await makeImageMessage();
+		const imagePath = ((message.details as any).images[0] as any).path as string;
 
 		const folded = renderMessage(false, message);
 		const expanded = renderMessage(true, message);
 
 		expect(folded).toContain("[Image: provider-result.png [image/png]");
+		expect(folded).toContain("[(Ctrl+O for more)]");
+		expect(folded).not.toContain(imagePath);
 		expect(folded).not.toContain("SHA-256:");
 		expect(expanded).toContain("[Image: provider-result.png [image/png]");
+		expect(expanded).toContain("File: provider-result.png");
 		expect(expanded).toContain("Bytes: 68");
 		expect(expanded).toContain("SHA-256: abc123");
 		expect(expanded).toContain("Revised prompt: A tiny blue square cat.");
+		expect(expanded).not.toContain(imagePath);
 	});
 
 	it("uses the runtime assistant image renderer when the OMP runtime exports it", async () => {
@@ -202,6 +207,20 @@ describe("provider image renderer", () => {
 		expect(folded).toContain("BG(customMessageBg:");
 		expect(folded).toContain("RUNTIME_IMAGE:image/png:iVBORw0KGgoA");
 		expect(folded).not.toContain("[Image: provider-result.png [image/png]");
+		const expanded = renderMessage(true, message, {
+			pi: {
+				AssistantMessageComponent: FakeRuntimeAssistantMessage,
+			},
+		});
+		const imagePath = ((message.details as any).images[0] as any).path as string;
+		const lines = folded.split("\n");
+		const imageLineIndex = lines.findIndex(line => line.includes("RUNTIME_IMAGE:image/png:iVBORw0KGgoA"));
+		expect(imageLineIndex).toBeGreaterThan(0);
+		expect(lines.at(-1)).toContain("BG(customMessageBg:");
+		expect(expanded).toContain("RUNTIME_IMAGE:image/png:iVBORw0KGgoA");
+		expect(expanded).toContain("File: provider-result.png");
+		expect(expanded).toContain("SHA-256: abc123");
+		expect(expanded).not.toContain(imagePath);
 	});
 
 	it("prefers the runtime-matching pi-tui cache module before stale cached versions", async () => {

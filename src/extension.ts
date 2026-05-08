@@ -456,7 +456,7 @@ function handleMessageEndImageResults({
 }
 
 async function sendVisibleProviderToolResultMessage(api: ExtensionApiLike, message: unknown): Promise<void> {
-	await api.sendMessage?.(message, { deliverAs: "nextTurn", triggerTurn: true });
+	await api.sendMessage?.(message);
 }
 
 function handleProviderToolResults({
@@ -510,11 +510,11 @@ function handleAgentEndProviderToolResults({
 }
 
 function handleMessageEndProviderToolResults({
-	api,
-	ctx,
-	event,
-	state,
-	seen,
+	api: _api,
+	ctx: _ctx,
+	event: _event,
+	state: _state,
+	seen: _seen,
 }: {
 	api: ExtensionApiLike;
 	ctx: ExtensionContextLike;
@@ -522,14 +522,9 @@ function handleMessageEndProviderToolResults({
 	state: ImageResultState;
 	seen: Set<string>;
 }): void {
-	let results;
-	try {
-		results = providerToolResultsFromMessageEndEvent(event);
-	} catch (error) {
-		notifyWarningLater(api, ctx, `OpenAI provider tool results could not be extracted: ${error instanceof Error ? error.message : String(error)}`);
-		return;
-	}
-	handleProviderToolResults({ api, ctx, results, state, seen });
+	// Provider-native web_search summaries are UI-only. Delivering them during message_end
+	// with nextTurn/triggerTurn makes the agent continue from a low-signal custom message.
+	// Defer to agent_end, where the summary is visible without re-entering the agent loop.
 }
 async function notifyWarning(api: ExtensionApiLike, ctx: ExtensionContextLike, message: string): Promise<void> {
 	api.logger?.warn?.(message);

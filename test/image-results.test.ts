@@ -183,7 +183,7 @@ describe("image result keys and messages", () => {
 		expect(withoutId).not.toContain(ONE_BY_ONE_PNG);
 	});
 
-	it("builds a concise visible custom message with path details and no base64 content", () => {
+	it("builds a concise visible custom message without path or base64 content", () => {
 		const message = buildImageMessage(
 			imageResult({ revisedPrompt: "A tiny PNG.", size: "1024x1024", quality: "high" }),
 			{ path: "C:/tmp/provider-image.png", bytes: 68, mimeType: "image/png", sha256: "abc123", reusedExisting: false },
@@ -210,7 +210,8 @@ describe("image result keys and messages", () => {
 				],
 			},
 		});
-		expect(message.content).toContain("C:/tmp/provider-image.png");
+		expect(message.content).toContain("OpenAI provider generated 1 image.");
+		expect(message.content).not.toContain("C:/tmp/provider-image.png");
 		expect(message.content).not.toContain("68 bytes");
 		expect(message.content).not.toContain("image/png");
 		expect(message.content).not.toContain("A tiny PNG.");

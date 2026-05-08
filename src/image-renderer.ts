@@ -170,31 +170,76 @@ function renderProviderImageMessage(
 	const images = imageDetails(message);
 	if (!Tui) return undefined;
 
+	const detailLines = expandedImageDetailLines(images);
 	const runtimeImagePreview = buildRuntimeImagePreview(runtimePi, images);
+	if (runtimeImagePreview) {
+		return runtimeImageBox(
+			theme,
+			messageCustomType(message),
+			text || "OpenAI provider image_generation result",
+			runtimeImagePreview,
+			options.expanded ? detailLines : [],
+		);
+	}
+
 	const box = new Tui.Box(1, 1, value => background(theme, "customMessageBg", value));
 	const label = color(theme, "customMessageLabel", bold(theme, `[${messageCustomType(message)}]`));
 	box.addChild(new Tui.Text(label, 0, 0));
 	box.addChild(new Tui.Spacer(1));
 	box.addChild(new Tui.Text(color(theme, "customMessageText", text || "OpenAI provider image_generation result"), 0, 0));
 
-	if (images.length > 0 && !runtimeImagePreview) {
+	if (images.length > 0) {
 		box.addChild(new Tui.Spacer(1));
 		for (const image of images) addImagePreview(box, Tui, image, theme, options.expanded);
 	}
 
-	if (options.expanded) {
-		const detailLines = expandedImageDetailLines(images);
-		if (detailLines.length > 0) {
-			box.addChild(new Tui.Spacer(1));
-			box.addChild(new Tui.Text(color(theme, "customMessageText", detailLines.join("\n")), 0, 0));
-		}
+	if (!options.expanded && detailLines.length > 0) {
+		box.addChild(new Tui.Text(expandHint(theme), 0, 0));
 	}
 
-	if (!runtimeImagePreview) return box;
-	const container = new Tui.Container();
-	container.addChild(box);
-	container.addChild(runtimeImagePreview);
-	return container;
+	if (options.expanded && detailLines.length > 0) {
+		box.addChild(new Tui.Spacer(1));
+		box.addChild(new Tui.Text(color(theme, "customMessageText", detailLines.join("\n")), 0, 0));
+	}
+
+	return box;
+}
+
+function runtimeImageBox(
+	theme: unknown,
+	customType: string,
+	text: string,
+	runtimeImagePreview: ComponentLike,
+	detailLines: string[],
+): ComponentLike {
+	return {
+		render(width: number): string[] {
+			const lines: string[] = [];
+			const label = color(theme, "customMessageLabel", bold(theme, `[${customType}]`));
+			lines.push(backgroundLine(theme, "", width));
+			lines.push(backgroundLine(theme, label, width));
+			lines.push(backgroundLine(theme, "", width));
+			for (const line of color(theme, "customMessageText", text).split("\n")) {
+				lines.push(backgroundLine(theme, line, width));
+			}
+			if (detailLines.length === 0) {
+				lines.push(backgroundLine(theme, expandHint(theme), width));
+			}
+			lines.push(backgroundLine(theme, "", width));
+			lines.push(...runtimeImagePreview.render(width));
+			if (detailLines.length > 0) {
+				lines.push(backgroundLine(theme, "", width));
+				for (const line of color(theme, "customMessageText", detailLines.join("\n")).split("\n")) {
+					lines.push(backgroundLine(theme, line, width));
+				}
+			}
+			lines.push(backgroundLine(theme, "", width));
+			return lines;
+		},
+		invalidate() {
+			runtimeImagePreview.invalidate();
+		},
+	};
 }
 
 function buildRuntimeImagePreview(runtimePi: RuntimePiLike | undefined, images: ProviderImageDetail[]): ComponentLike | undefined {
@@ -245,7 +290,7 @@ function expandedImageDetailLines(images: ProviderImageDetail[]): string[] {
 		const image = images[index];
 		if (!image) continue;
 		if (images.length > 1) lines.push(`Image ${index + 1}:`);
-		lines.push(`Path: ${image.path}`);
+		lines.push(`File: ${path.basename(image.path)}`);
 		if (image.mimeType) lines.push(`MIME: ${image.mimeType}`);
 		if (typeof image.bytes === "number") lines.push(`Bytes: ${image.bytes}`);
 		if (image.sha256) lines.push(`SHA-256: ${image.sha256}`);
@@ -258,6 +303,33 @@ function expandedImageDetailLines(images: ProviderImageDetail[]): string[] {
 		if (index < images.length - 1) lines.push("");
 	}
 	return lines;
+}
+
+function expandHint(theme: unknown): string {
+	return color(theme, "dim", `${bracket(theme, "left")}(Ctrl+O for more)${bracket(theme, "right")}`);
+}
+
+function bracket(theme: unknown, side: "left" | "right"): string {
+	if (theme && typeof theme === "object" && "format" in theme && typeof (theme as { format?: unknown }).format === "object") {
+		const format = (theme as { format: { bracketLeft?: unknown; bracketRight?: unknown } }).format;
+		const value = side === "left" ? format.bracketLeft : format.bracketRight;
+		if (typeof value === "string") return value;
+	}
+	return side === "left" ? "[" : "]";
+}
+
+function backgroundLine(theme: unknown, value: string, width: number): string {
+	const padded = padVisible(value, Math.max(0, width));
+	return background(theme, "customMessageBg", padded);
+}
+
+function padVisible(value: string, width: number): string {
+	const length = visibleLength(value);
+	return `${value}${" ".repeat(Math.max(0, width - length))}`;
+}
+
+function visibleLength(value: string): number {
+	return value.replace(/\x1b\[[0-9;]*m/g, "").length;
 }
 function background(theme: unknown, key: string, value: string): string {
 	if (theme && typeof theme === "object" && "bg" in theme && typeof (theme as { bg?: unknown }).bg === "function") {
