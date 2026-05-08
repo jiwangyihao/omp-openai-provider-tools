@@ -12,6 +12,11 @@ import {
 	imageResultKey,
 	saveImageResultSync,
 } from "./image-results";
+import {
+	buildProviderToolResultMessage,
+	extractDisplayableProviderToolResults,
+	providerToolResultKey,
+} from "./provider-results";
 import type { ExtensionApiLike, ExtensionContextLike, ProviderToolType, ProviderToolsEntry, RuntimeModelLike } from "./types";
 
 interface ProviderRequestEventLike {
@@ -56,6 +61,66 @@ function modelPayloadForBeforeAgent(model: RuntimeModelLike | undefined): Record
 	const modelId = model?.id ?? model?.name;
 	if (!modelId) return undefined;
 	return { model: modelId, input: "" };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isEnabledFlag(value: unknown): boolean {
+	if (value === true) return true;
+	if (value === 1) return true;
+	if (typeof value !== "string") return false;
+	const normalized = value.trim().toLowerCase();
+	return normalized === "true" || normalized === "1" || normalized === "yes" || normalized === "enabled";
+}
+
+function nestedValue(value: unknown, path: readonly string[]): unknown {
+	let current = value;
+	for (const key of path) {
+		if (!isRecord(current)) return undefined;
+		current = current[key];
+	}
+	return current;
+}
+
+function modelAllowsProviderImageGeneration(model: RuntimeModelLike | undefined): boolean {
+	if (!model) return false;
+	const capabilityPaths = [
+		["openaiProviderTools", "imageGeneration"],
+		["openaiProviderTools", "image_generation"],
+		["openai_provider_tools", "image_generation"],
+	] as const;
+	for (const path of capabilityPaths) {
+		if (isEnabledFlag(nestedValue(model.capabilities, path))) return true;
+		if (isEnabledFlag(nestedValue(model.runtime?.capabilities, path))) return true;
+	}
+
+	const extraBody = model.compat?.extraBody;
+	if (isEnabledFlag(nestedValue(extraBody, ["openai_provider_tools", "image_generation"]))) return true;
+	if (isEnabledFlag(nestedValue(extraBody, ["openaiProviderTools", "imageGeneration"]))) return true;
+	if (isEnabledFlag(nestedValue(extraBody, ["openaiProviderTools", "image_generation"]))) return true;
+	if (isEnabledFlag(extraBody?.openai_provider_tools_image_generation)) return true;
+
+	const headers = model.headers ?? {};
+	return isEnabledFlag(headers["x-openai-provider-tools-image-generation"] ?? headers["X-OpenAI-Provider-Tools-Image-Generation"]);
+}
+
+function getEnabledProviderToolTypesForModel(entry: ProviderToolsEntry, model: RuntimeModelLike | undefined): ProviderToolType[] {
+	const enabled = getEnabledProviderToolTypes(entry);
+	if (modelAllowsProviderImageGeneration(model)) return enabled;
+	return enabled.filter((tool) => tool !== "image_generation");
+}
+
+function providerEntryWithEnabledTools(entry: ProviderToolsEntry, enabledProviderTools: readonly ProviderToolType[]): ProviderToolsEntry {
+	const enabled = new Set(enabledProviderTools);
+	return {
+		...entry,
+		tools: {
+			...(enabled.has("web_search") && entry.tools.web_search ? { web_search: entry.tools.web_search } : {}),
+			...(enabled.has("image_generation") && entry.tools.image_generation ? { image_generation: entry.tools.image_generation } : {}),
+		},
+	};
 }
 
 function targetKey(target: RequestTarget): string {
@@ -109,6 +174,17 @@ function imageResultsFromAgentEndEvent(event: unknown) {
 function imageResultsFromMessageEndEvent(event: unknown) {
 	const candidate = event as MessageEndEventLike | undefined;
 	return extractImageGenerationResults(candidate?.message ?? event);
+}
+
+function providerToolResultsFromAgentEndEvent(event: unknown) {
+	const candidate = event as AgentEndEventLike | undefined;
+	const messages = Array.isArray(candidate?.messages) ? candidate.messages : [candidate?.message ?? event];
+	return messages.flatMap((message) => extractDisplayableProviderToolResults(message));
+}
+
+function providerToolResultsFromMessageEndEvent(event: unknown) {
+	const candidate = event as MessageEndEventLike | undefined;
+	return extractDisplayableProviderToolResults(candidate?.message ?? event);
 }
 
 async function preloadImageRuntimeState(state: ImageResultState, ctx: ExtensionContextLike): Promise<void> {
@@ -252,6 +328,79 @@ function handleMessageEndImageResults({
 	}
 	handleImageResults({ api, ctx, results, state, seen });
 }
+
+async function sendVisibleProviderToolResultMessage(api: ExtensionApiLike, message: unknown): Promise<void> {
+	await api.sendMessage?.(message, { deliverAs: "nextTurn" });
+}
+
+function handleProviderToolResults({
+	api,
+	ctx,
+	results,
+	state,
+	seen,
+}: {
+	api: ExtensionApiLike;
+	ctx: ExtensionContextLike;
+	results: ReturnType<typeof extractDisplayableProviderToolResults>;
+	state: ImageResultState;
+	seen: Set<string>;
+}): void {
+	if (results.length === 0) return;
+	const sessionId = runtimeSessionId(ctx, api, state);
+	for (const result of results) {
+		const key = providerToolResultKey(sessionId, result);
+		if (seen.has(key)) continue;
+		seen.add(key);
+		consumePromiseLater(api, ctx, sendVisibleProviderToolResultMessage(api, buildProviderToolResultMessage(result)), "OpenAI provider tool result message delivery failed");
+	}
+}
+
+function handleAgentEndProviderToolResults({
+	api,
+	ctx,
+	event,
+	state,
+	seen,
+}: {
+	api: ExtensionApiLike;
+	ctx: ExtensionContextLike;
+	event: unknown;
+	state: ImageResultState;
+	seen: Set<string>;
+}): void {
+	let results;
+	try {
+		results = providerToolResultsFromAgentEndEvent(event);
+	} catch (error) {
+		notifyWarningLater(api, ctx, `OpenAI provider tool results could not be extracted: ${error instanceof Error ? error.message : String(error)}`);
+		return;
+	}
+	handleProviderToolResults({ api, ctx, results, state, seen });
+}
+
+function handleMessageEndProviderToolResults({
+	api,
+	ctx,
+	event,
+	state,
+	seen,
+}: {
+	api: ExtensionApiLike;
+	ctx: ExtensionContextLike;
+	event: unknown;
+	state: ImageResultState;
+	seen: Set<string>;
+}): void {
+	let results;
+	try {
+		results = providerToolResultsFromMessageEndEvent(event);
+	} catch (error) {
+		notifyWarningLater(api, ctx, `OpenAI provider tool results could not be extracted: ${error instanceof Error ? error.message : String(error)}`);
+		return;
+	}
+	handleProviderToolResults({ api, ctx, results, state, seen });
+}
 async function notifyWarning(api: ExtensionApiLike, ctx: ExtensionContextLike, message: string): Promise<void> {
 	api.logger?.warn?.(message);
 	ctx.logger?.warn?.(message);
@@ -347,6 +496,7 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 	const incompatibleTargets = new Set<string>();
 	const imageResultState: ImageResultState = {};
 	const seenImageResults = new Set<string>();
+	const seenProviderToolResults = new Set<string>();
 	const visibleConfigWarnings = new Set<string>();
 	let loadedRuntimeConfig: LoadedRuntimeConfig | undefined;
 
@@ -354,6 +504,7 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 		expectedByTarget.clear();
 		incompatibleTargets.clear();
 		seenImageResults.clear();
+		seenProviderToolResults.clear();
 		imageResultState.outputDirectory = undefined;
 		imageResultState.sessionId = undefined;
 		imageResultState.artifactDirectory = undefined;
@@ -378,7 +529,7 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 		const entry = findMatchingProvider(config, target);
 		if (!entry) return undefined;
 
-		const enabledProviderTools = getEnabledProviderToolTypes(entry);
+		const enabledProviderTools = getEnabledProviderToolTypesForModel(entry, ctx.model);
 		if (enabledProviderTools.length === 0) return undefined;
 
 		if (!api.getActiveTools || !api.setActiveTools) {
@@ -499,7 +650,33 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 			return undefined;
 		}
 		const expected = expectedByTarget.get(key);
-		const enabledProviderTools = getEnabledProviderToolTypes(entry);
+		const enabledProviderTools = getEnabledProviderToolTypesForModel(entry, eligibilityModel);
+		if (enabledProviderTools.length === 0) {
+			if (expected) {
+				await failAfterRemoval({
+					api,
+					ctx,
+					reason: "provider request enabled fewer provider tools than host-side removal expected",
+					state: expected,
+					incompatibleTargets,
+					key,
+				});
+				expectedByTarget.delete(key);
+			}
+			return undefined;
+		}
+		if (expected && !coversExpected(enabledProviderTools, expected.expected)) {
+			await failAfterRemoval({
+				api,
+				ctx,
+				reason: "provider request enabled fewer provider tools than host-side removal expected",
+				state: expected,
+				incompatibleTargets,
+				key,
+			});
+			expectedByTarget.delete(key);
+			return undefined;
+		}
 		const hostToolsToRemove = enabledProviderToolsToHostTools(enabledProviderTools);
 		if (!expected && eventModel && hostToolsToRemove.length > 0) {
 			if (!api.getActiveTools) {
@@ -532,8 +709,9 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 			}
 		}
 
-		updateImageResultState(imageResultState, entry);
-		const result = injectConfiguredTools(payload, entry);
+		const injectionEntry = providerEntryWithEnabledTools(entry, enabledProviderTools);
+		updateImageResultState(imageResultState, injectionEntry);
+		const result = injectConfiguredTools(payload, injectionEntry);
 		if (!result.ok) {
 			await failAfterRemoval({ api, ctx, reason: result.reason, state: expected, incompatibleTargets, key });
 			expectedByTarget.delete(key);
@@ -559,6 +737,7 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 
 	api.on?.("message_end", (event, ctx) => {
 		handleMessageEndImageResults({ api, ctx, event, state: imageResultState, seen: seenImageResults });
+		handleMessageEndProviderToolResults({ api, ctx, event, state: imageResultState, seen: seenProviderToolResults });
 	});
 
 	api.on?.("agent_end", async (event, ctx) => {
@@ -575,5 +754,6 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 			expectedByTarget.delete(key);
 		}
 		handleAgentEndImageResults({ api, ctx, event, state: imageResultState, seen: seenImageResults });
+		handleAgentEndProviderToolResults({ api, ctx, event, state: imageResultState, seen: seenProviderToolResults });
 	});
 }

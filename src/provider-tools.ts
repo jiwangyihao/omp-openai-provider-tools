@@ -1,5 +1,6 @@
 export * from "./request-injection";
 export * from "./image-results";
+export * from "./provider-results";
 export * from "./active-tools";
 export * from "./config";
 export * from "./match";

@@ -423,3 +423,37 @@ TDD 步骤：先写失败测试，再实现，再运行本任务针对性测试�
 - `bun test` 通过。
 - `bun pm pack --dry-run` 通过，输出包内容符合预期。
 - README 说明 OMP/Pi 双 runtime 安装配置、错误透明、手动验证矩阵。
+
+---
+
+## 2026-05-08 追加计划：provider 结果回显、图片模型门控与图片子代理
+
+**用户选择：** 实施推荐方案：provider-result echo、插件侧模型标记门控、`gpt-5.5` 图片变体，以及专用图片生成子代理。
+
+**范围与边界：**
+
+- 插件继续只通过 OpenAI Responses provider request path 注入 provider-native tools，不设置 `tool_choice`，不保存 API key，不硬编码 provider 名称、私有 base URL 或凭据。
+- `web_search` 仍只受插件配置 `enabled: true` 与 provider match 控制。
+- `image_generation` 必须同时满足插件配置 `enabled: true` 与当前 runtime model 显式 opt-in；这样同一 provider/gateway 下的非图片模型不会被误启用图片工具。
+- 用户级 `gpt-5.5-image` 变体只添加模型元数据和等价映射，不复制或改写现有凭据。
+- 专用图片子代理只作为 OMP agent markdown 定义，使用图片模型变体和最小 host tool 集；provider-native 图片能力仍由插件注入。
+
+**实现步骤：**
+
+1. 先写失败测试：覆盖未 opt-in 模型不注入 `image_generation`、已 opt-in 模型注入 `image_generation`、provider-native `web_search_call` 可见回显、`message_end` 与 `agent_end` 回显去重。
+2. 在 `src/types.ts` 扩展最小 runtime model shape，支持 `headers`、`compat.extraBody`、`runtime.capabilities` 和 `capabilities`。
+3. 在 `src/extension.ts` 增加模型 opt-in 判定与 per-model enabled tool 过滤；`before_agent_start` 和 `before_provider_request` 都使用过滤后的 provider tool 集合。
+4. 新增 `src/provider-results.ts`：从 `providerPayload.type === "openaiResponsesHistory"` 中解析 displayable provider-native 结果，当前支持 `web_search_call` 与 URL citation/source 摘要；禁止把 base64 写入 custom message。
+5. 在 `message_end` 与 `agent_end` 中发送 provider 结果 visible custom message，并按 session/result key 去重。
+6. 更新 README 和 runtime compatibility 文档，说明图片模型 opt-in、provider 结果回显和图片保存路径的 next-turn 可见性。
+7. 在用户模型配置中添加 `sub2api-openai/gpt-5.5-image` 变体，使用 `compat.extraBody.openai_provider_tools.image_generation: true` 标记图片能力。
+8. 在用户 agent 目录添加 `image_generator` 子代理定义，绑定 `sub2api-openai/gpt-5.5-image`，仅启用最小 host tool。
+9. 验证：运行 focused extension tests、全量 `bun test`、`bun pm pack --dry-run`、确认 no `.tgz` 残留、确认 OMP 能列出 `gpt-5.5-image` 模型变体。
+
+**验收标准：**
+
+- 非 opt-in 模型即使 provider config 启用 `image_generation` 也不会注入 provider-native 图片工具，也不会移除 host-side `generate_image`。
+- opt-in 模型在相同 config 下会注入 `image_generation`，并继续保持不设置 `tool_choice`。
+- provider-native `web_search_call` 至少回显 call/status/action/query/citations/sources 中可获得的信息，并对同一结果去重。
+- 图片保存消息继续不包含 base64；保存路径作为 visible custom message 和 next-turn context 传递。
+- `gpt-5.5-image` 可被 OMP 模型发现，`image_generator` agent 文件可被 OMP agent discovery 路径读取。

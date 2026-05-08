@@ -11,6 +11,11 @@ export interface RuntimeModelLike {
 	api?: string;
 	provider?: string;
 	baseUrl?: string;
+	headers?: Record<string, string>;
+	compat?: {
+		extraBody?: Record<string, unknown>;
+		[key: string]: unknown;
+	};
 	runtime?: {
 		name?: string;
 		kind?: string;

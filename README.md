@@ -105,13 +105,35 @@ Supported fields:
 | `providers[].match.modelName` | No | Exact model display-name match. |
 | `providers[].tools.web_search.enabled` | Yes to enable | Defaults to disabled unless set to `true`. |
 | `providers[].tools.web_search.search_context_size` | No | Provider-native search context size, such as `low`, `medium`, or `high`. |
-| `providers[].tools.image_generation.enabled` | Yes to enable | Defaults to disabled unless set to `true`. |
+| `providers[].tools.image_generation.enabled` | Yes to enable | Defaults to disabled unless set to `true`; also requires the selected runtime model to opt in to provider-native image generation. |
 | `providers[].tools.image_generation.output_format` | No | Provider-native image output format, such as `png`, `jpeg`, or `webp`. |
 | `providers[].tools.image_generation.quality` | No | Provider-native image quality option. |
 | `providers[].tools.image_generation.size` | No | Provider-native image size option. |
 | `providers[].tools.image_generation.background` | No | Provider-native background option. |
 | `providers[].tools.image_generation.action` | No | Provider-native action option. |
 | `providers[].output.directory` | No | Directory for saved image files from native response history. |
+
+### Model opt-in for `image_generation`
+
+`image_generation` is intentionally gated by both plugin config and model metadata. This prevents a broad provider entry from enabling image generation for every model behind the same provider or gateway.
+
+For OMP 14.7.x model configs, add an opt-in marker to only the model variants that are routed to image-capable backend accounts:
+
+```yaml
+providers:
+  compatible-example:
+    models:
+      - id: gpt-5.5-image
+        name: GPT-5.5 Image
+        api: openai-responses
+        reasoning: true
+        compat:
+          extraBody:
+            openai_provider_tools:
+              image_generation: true
+```
+
+The plugin also accepts equivalent runtime capability metadata such as `capabilities.openaiProviderTools.imageGeneration: true` when a host runtime exposes it.
 
 ## Examples
 
@@ -135,6 +157,8 @@ providers:
         output_format: png
         size: 1024x1024
 ```
+
+For `image_generation`, this provider config is not sufficient by itself; the selected runtime model must also carry the model opt-in marker shown above.
 
 ### OpenAI-compatible provider
 
@@ -169,7 +193,7 @@ Do not put keys or private endpoints in `openai-provider-tools.yml`. Keep plugin
 
 ## Behavior
 
-- Tools are disabled by default. A provider entry must match the current OpenAI Responses request, and each tool must set `enabled: true` before injection occurs.
+- Tools are disabled by default. A provider entry must match the current OpenAI Responses request, and each tool must set `enabled: true` before injection occurs. `image_generation` additionally requires the selected model to opt in with image-generation model metadata.
 - The plugin does not set `tool_choice`; provider tool selection remains controlled by the model/provider request.
 - For matching models, corresponding host-side `web_search` or `generate_image` tools are removed only when provider-native injection for that same capability can be ensured.
 - If safe injection or safe host-tool conflict control cannot be ensured, the plugin warns or blocks transparently instead of creating ambiguous behavior.
@@ -185,7 +209,13 @@ Saved image directory order:
 2. Runtime session artifact directory, when available.
 3. Agent default image directory.
 
-When an image is saved, the plugin sends a visible custom message with the saved path. If saving fails, the failure is logged and reported visibly when the runtime supports visible messages.
+When an image is saved, the plugin sends a visible custom message with the saved path. The message is delivered as next-turn context, so the agent can read the path on a later turn instead of receiving an opaque base64 payload. If saving fails, the failure is logged and reported visibly when the runtime supports visible messages.
+
+## Provider tool result echoes
+
+Provider-native tools do not pass through the host-side tool renderer. To keep the user from seeing a silent provider-side action, the plugin emits visible custom messages for displayable provider results preserved in OpenAI Responses native history.
+
+Currently, `web_search_call` history is summarized with the provider action, query, citations, and sources when available. Image generation is echoed through the saved-image message described above.
 
 ## Troubleshooting
 
