@@ -157,17 +157,15 @@ export function buildProviderToolResultSummaryMessage(results: DisplayableProvid
 	const queries = uniqueStrings(results.flatMap(result => result.queries.length > 0 ? result.queries : result.query ? [result.query] : []));
 	const citations = uniqueReferences(results.flatMap(result => result.citations));
 	const sources = uniqueReferences(results.flatMap(result => result.sources));
-	const lines = [`OpenAI provider completed web_search (${results.length === 1 ? "1 call" : `${results.length} calls`}).`];
-	if (queries.length > 0) lines.push(`Queries: ${queries.join("; ")}`);
-	appendReferences(lines, "Citations", citations.slice(0, 3));
-	appendReferences(lines, "Sources", sources.slice(0, 3));
+	const summary = `OpenAI provider completed web_search (${results.length === 1 ? "1 call" : `${results.length} calls`}).`;
 
 	return {
 		customType: PROVIDER_TOOL_RESULT_MESSAGE_TYPE,
 		display: true,
 		attribution: "agent",
-		content: lines.join("\n"),
+		content: "",
 		details: withoutUndefined({
+			summary,
 			type: "web_search",
 			queries,
 			citations,

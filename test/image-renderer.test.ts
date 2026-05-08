@@ -111,6 +111,13 @@ const fakeTui = {
 	Image: FakeImage,
 };
 
+const fakeTuiWithoutImage = {
+	Container: FakeContainer,
+	Box: FakeBox,
+	Text: FakeText,
+	Spacer: FakeSpacer,
+};
+
 function testTheme() {
 	return {
 		fg(key: string, value: string) {
@@ -134,10 +141,14 @@ async function makeImageMessage() {
 		customType: PROVIDER_IMAGE_MESSAGE_TYPE,
 		display: true,
 		attribution: "agent",
-		content: "OpenAI provider generated 1 image.",
+		content: [
+			{ type: "text", text: `OpenAI provider generated 1 image.\nSaved image path: ${imagePath}\nUse the attached image when editing this generation.` },
+			{ type: "image", data: ONE_BY_ONE_PNG, mimeType: "image/png" },
+		],
 		details: {
 			path: imagePath,
 			mimeType: "image/png",
+			summary: "OpenAI provider generated 1 image.",
 			images: [
 				{
 					id: "ig_123",
@@ -156,7 +167,7 @@ async function makeImageMessage() {
 	};
 }
 
-function renderMessage(expanded: boolean, message: unknown, apiOverrides: Record<string, unknown> = {}): string {
+function renderMessage(expanded: boolean, message: unknown, apiOverrides: Record<string, unknown> = {}, tui = fakeTui): string {
 	const renderers = new Map<string, Function>();
 	registerProviderImageRenderer({
 		registerMessageRenderer(customType: string, renderer: Function) {
@@ -164,7 +175,7 @@ function renderMessage(expanded: boolean, message: unknown, apiOverrides: Record
 		},
 		logger: { warn() {} },
 		...apiOverrides,
-	}, fakeTui);
+	}, tui);
 	const renderer = renderers.get(PROVIDER_IMAGE_MESSAGE_TYPE);
 	expect(renderer).toBeDefined();
 	const component = renderer!(message, { expanded }, testTheme());
@@ -175,11 +186,11 @@ describe("provider image renderer", () => {
 	it("wraps provider image messages in the native custom-message background", async () => {
 		const message = await makeImageMessage();
 
-		const folded = renderMessage(false, message);
+		const expanded = renderMessage(true, message);
 
-		expect(folded).toContain("BG(customMessageBg:");
-		expect(folded).toContain("FG(customMessageLabel:BOLD([openai-provider-image-generation]))");
-		expect(folded).toContain("FG(customMessageText:OpenAI provider generated 1 image.");
+		expect(expanded).toContain("BG(customMessageBg:");
+		expect(expanded).toContain("FG(customMessageLabel:BOLD([openai-provider-image-generation]))");
+		expect(expanded).toContain("FG(customMessageText:OpenAI provider generated 1 image.");
 	});
 
 	it("shows an image preview when folded and adds concise metadata when expanded", async () => {
@@ -191,6 +202,7 @@ describe("provider image renderer", () => {
 
 		expect(folded).toContain("[Image: provider-result.png [image/png]");
 		expect(folded).toContain("[(Ctrl+O for more)]");
+		expect(folded).not.toContain("OpenAI provider generated 1 image.");
 		expect(folded).not.toContain(imagePath);
 		expect(folded).not.toContain("SHA-256:");
 		expect(expanded).toContain("[Image: provider-result.png [image/png]");
@@ -198,6 +210,19 @@ describe("provider image renderer", () => {
 		expect(expanded).toContain("Bytes: 68");
 		expect(expanded).toContain("SHA-256: abc123");
 		expect(expanded).toContain("Revised prompt: A tiny blue square cat.");
+		expect(expanded).not.toContain(imagePath);
+	});
+
+	it("does not leak full paths when image preview fallback is used", async () => {
+		const message = await makeImageMessage();
+		const imagePath = ((message.details as any).images[0] as any).path as string;
+
+		const folded = renderMessage(false, message, {}, fakeTuiWithoutImage);
+		const expanded = renderMessage(true, message, {}, fakeTuiWithoutImage);
+
+		expect(folded).toContain("provider-result.png");
+		expect(folded).not.toContain(imagePath);
+		expect(expanded).toContain("provider-result.png");
 		expect(expanded).not.toContain(imagePath);
 	});
 
@@ -213,6 +238,8 @@ describe("provider image renderer", () => {
 		expect(folded).toContain("BG(customMessageBg:");
 		expect(folded).toContain("RUNTIME_IMAGE:image/png:iVBORw0KGgoA");
 		expect(folded).not.toContain("[Image: provider-result.png [image/png]");
+		expect(folded).toContain("[(Ctrl+O for more)]");
+		expect(folded).not.toContain("OpenAI provider generated 1 image.");
 		const expanded = renderMessage(true, message, {
 			pi: {
 				AssistantMessageComponent: FakeRuntimeAssistantMessage,
@@ -240,10 +267,11 @@ describe("provider image renderer", () => {
 		const lines = folded.split("\n");
 		const imageLineIndex = lines.findIndex(line => line.includes("RUNTIME_IMAGE:image/png:iVBORw0KGgoA"));
 
-		expect(folded).not.toContain("Ctrl+O for more");
+		expect((folded.match(/Ctrl\+O for more/g) ?? [])).toHaveLength(1);
 		expect(imageLineIndex).toBeGreaterThan(1);
 		expect(lines.some(line => line === "")).toBe(false);
 		expect(lines[imageLineIndex - 1]).toContain("BG(customMessageBg:");
+		expect(lines.at(-1)).toContain("BG(customMessageBg:");
 	});
 
 	it("prefers the runtime-matching pi-tui cache module before stale cached versions", async () => {

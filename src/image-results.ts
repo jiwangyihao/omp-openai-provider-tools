@@ -39,11 +39,25 @@ export interface FailedProviderImageResult {
 	error: unknown;
 }
 
+export interface ProviderTextContent {
+	type: "text";
+	text: string;
+}
+
+export interface ProviderImageContent {
+	type: "image";
+	data: string;
+	mimeType: SupportedMimeType;
+}
+
+export type ProviderImageMessageContent = string | Array<ProviderTextContent | ProviderImageContent>;
+
+
 export interface ProviderImageMessage {
 	customType: typeof PROVIDER_IMAGE_MESSAGE_TYPE;
 	display: true;
 	attribution: "agent";
-	content: string;
+	content: ProviderImageMessageContent;
 	details: Record<string, unknown>;
 }
 
@@ -181,16 +195,15 @@ export function buildImageMessage(result: ProviderImageGenerationResult, saved: 
 
 export function buildImageSummaryMessage(savedResults: SavedProviderImageResult[]): ProviderImageMessage {
 	const images = savedResults.map(({ result, saved }) => imageDetails(result, saved));
-	const lines = [
-		`OpenAI provider generated ${images.length === 1 ? "1 image" : `${images.length} images`}.`,
-	];
+	const summary = `OpenAI provider generated ${images.length === 1 ? "1 image" : `${images.length} images`}.`;
 
 	return {
 		customType: PROVIDER_IMAGE_MESSAGE_TYPE,
 		display: true,
 		attribution: "agent",
-		content: lines.join("\n"),
+		content: buildImageContextContent(savedResults, summary),
 		details: withoutUndefined({
+			summary,
 			path: images[0]?.path,
 			mimeType: images[0]?.mimeType,
 			images,
@@ -242,10 +255,38 @@ function imageDetails(result: ProviderImageGenerationResult, saved: SavedImageRe
 	});
 }
 
+function buildImageContextContent(savedResults: SavedProviderImageResult[], summary: string): Array<ProviderTextContent | ProviderImageContent> {
+	const paths = savedResults.map(({ saved }) => saved.path);
+	const pathLines = paths.length === 1
+		? [`Saved image path: ${paths[0]}`]
+		: ["Saved image paths:", ...paths.map((filePath, index) => `${index + 1}. ${filePath}`)];
+	return [
+		{
+			type: "text",
+			text: [
+				summary,
+				`The generated ${savedResults.length === 1 ? "image is" : "images are"} attached to this message.`,
+				...pathLines,
+				"If the user asks to edit, redraw, revise, or continue from this generation, use the attached image content as the visual reference instead of creating an unrelated new image.",
+			].join("\n"),
+		},
+		...savedResults.map(({ result, saved }) => imageContent(result, saved)),
+	];
+}
+
+function imageContent(result: ProviderImageGenerationResult, saved: SavedImageResult): ProviderImageContent {
+	return {
+		type: "image",
+		data: normalizeImageResultInput(result.result).base64,
+		mimeType: saved.mimeType,
+	};
+}
+
 function decodeImageResult(result: Pick<ProviderImageGenerationResult, "result" | "mimeType" | "outputFormat">): {
 	bytes: Buffer;
 	mimeType: SupportedMimeType;
 	sha256: string;
+	base64: string;
 } {
 	const normalized = normalizeImageResultInput(result.result);
 	const base64 = normalized.base64;
@@ -270,6 +311,7 @@ function decodeImageResult(result: Pick<ProviderImageGenerationResult, "result" 
 		bytes,
 		mimeType,
 		sha256: crypto.createHash("sha256").update(bytes).digest("hex"),
+		base64,
 	};
 }
 

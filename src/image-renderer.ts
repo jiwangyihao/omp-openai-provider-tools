@@ -166,7 +166,7 @@ function renderProviderImageMessage(
 	Tui: TuiLike | undefined,
 	runtimePi: RuntimePiLike | undefined,
 ): ComponentLike | undefined {
-	const text = messageContent(message);
+	const text = imageSummary(message) || messageContent(message);
 	const images = imageDetails(message);
 	if (!Tui) return undefined;
 
@@ -178,18 +178,21 @@ function renderProviderImageMessage(
 			messageCustomType(message),
 			text || "OpenAI provider image_generation result",
 			runtimeImagePreview,
-			options.expanded ? detailLines : [],
+			detailLines,
+			options.expanded,
 		);
 	}
 
 	const box = new Tui.Box(1, 1, value => background(theme, "customMessageBg", value));
-	const label = color(theme, "customMessageLabel", bold(theme, `[${messageCustomType(message)}]`));
-	box.addChild(new Tui.Text(label, 0, 0));
-	box.addChild(new Tui.Spacer(1));
-	box.addChild(new Tui.Text(color(theme, "customMessageText", text || "OpenAI provider image_generation result"), 0, 0));
+	if (options.expanded) {
+		const label = color(theme, "customMessageLabel", bold(theme, `[${messageCustomType(message)}]`));
+		box.addChild(new Tui.Text(label, 0, 0));
+		box.addChild(new Tui.Spacer(1));
+		box.addChild(new Tui.Text(color(theme, "customMessageText", text || "OpenAI provider image_generation result"), 0, 0));
+	}
 
 	if (images.length > 0) {
-		box.addChild(new Tui.Spacer(1));
+		if (options.expanded) box.addChild(new Tui.Spacer(1));
 		for (const image of images) addImagePreview(box, Tui, image, theme, options.expanded);
 	}
 
@@ -211,20 +214,29 @@ function runtimeImageBox(
 	text: string,
 	runtimeImagePreview: ComponentLike,
 	detailLines: string[],
+	expanded: boolean,
 ): ComponentLike {
 	return {
 		render(width: number): string[] {
 			const lines: string[] = [];
-			const label = color(theme, "customMessageLabel", bold(theme, `[${customType}]`));
-			lines.push(backgroundLine(theme, "", width));
-			lines.push(backgroundLine(theme, label, width));
-			lines.push(backgroundLine(theme, "", width));
-			for (const line of color(theme, "customMessageText", text).split("\n")) {
-				lines.push(backgroundLine(theme, line, width));
+			if (expanded) {
+				const label = color(theme, "customMessageLabel", bold(theme, `[${customType}]`));
+				lines.push(backgroundLine(theme, "", width));
+				lines.push(backgroundLine(theme, label, width));
+				lines.push(backgroundLine(theme, "", width));
+				for (const line of color(theme, "customMessageText", text).split("\n")) {
+					lines.push(backgroundLine(theme, line, width));
+				}
+				lines.push(backgroundLine(theme, "", width));
 			}
-			lines.push(backgroundLine(theme, "", width));
+			if (!expanded) {
+				lines.push(backgroundLine(theme, "", width));
+			}
 			lines.push(...backgroundRuntimeImageLines(theme, runtimeImagePreview.render(width), width));
-			if (detailLines.length > 0) {
+			if (!expanded && detailLines.length > 0) {
+				lines.push(backgroundLine(theme, expandHint(theme), width));
+			}
+			if (expanded && detailLines.length > 0) {
 				lines.push(backgroundLine(theme, "", width));
 				for (const line of color(theme, "customMessageText", detailLines.join("\n")).split("\n")) {
 					lines.push(backgroundLine(theme, line, width));
@@ -267,7 +279,7 @@ function buildRuntimeImagePreview(runtimePi: RuntimePiLike | undefined, images: 
 function addImagePreview(box: BoxLike, Tui: TuiLike, image: ProviderImageDetail, theme: unknown, expanded: boolean): void {
 	if (!image.path) return;
 	if (!Tui.Image) {
-		box.addChild(new Tui.Text(color(theme, "toolOutput", `图片预览不可用：${image.path}`), 0, 0));
+		box.addChild(new Tui.Text(color(theme, "toolOutput", unavailableImagePreviewText(image.path)), 0, 0));
 		return;
 	}
 	try {
@@ -280,8 +292,12 @@ function addImagePreview(box: BoxLike, Tui: TuiLike, image: ProviderImageDetail,
 			filename: path.basename(image.path),
 		}));
 	} catch {
-		box.addChild(new Tui.Text(color(theme, "toolOutput", `图片预览不可用：${image.path}`), 0, 0));
+		box.addChild(new Tui.Text(color(theme, "toolOutput", unavailableImagePreviewText(image.path)), 0, 0));
 	}
+}
+
+function unavailableImagePreviewText(filePath: string): string {
+	return `图片预览不可用：${path.basename(filePath)}`;
 }
 
 function expandedImageDetailLines(images: ProviderImageDetail[]): string[] {
@@ -370,6 +386,13 @@ function color(theme: unknown, key: string, value: string): string {
 		}
 	}
 	return value;
+}
+
+function imageSummary(message: unknown): string {
+	if (!isRecord(message)) return "";
+	const details = message.details;
+	if (!isRecord(details)) return "";
+	return typeof details.summary === "string" ? details.summary : "";
 }
 
 function messageContent(message: unknown): string {

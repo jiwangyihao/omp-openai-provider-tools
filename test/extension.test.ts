@@ -214,6 +214,18 @@ function imageGenerationMessage(id = "img-1", result = ONE_BY_ONE_PNG) {
 	};
 }
 
+function messageText(message: any): string {
+	const content = message.content;
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content.flatMap(part => part?.type === "text" ? [part.text] : []).join("\n");
+}
+
+function messageImages(message: any): Array<{ type: string; data: string; mimeType: string }> {
+	return Array.isArray(message.content) ? message.content.filter(part => part?.type === "image") : [];
+}
+
+
 function sseEvent(event: Record<string, unknown>): string {
 	return `data: ${JSON.stringify(event)}\n\n`;
 }
@@ -545,10 +557,10 @@ describe("OpenAI provider tools extension", () => {
 		const message = extension.sentMessages[0]?.message as any;
 		expect(message.display).toBe(true);
 		expect(message.customType).toBe("openai-provider-tool-result");
-		expect(message.content).toContain("web_search");
-		expect(message.content).toContain("latest OMP provider tools");
-		expect(message.content).toContain("https://example.invalid/omp-provider-tools");
-		expect(message.content).not.toContain("OMP provider tools are available.");
+		expect(message.content).toBe("");
+		expect(message.details.queries).toContain("latest OMP provider tools");
+		expect(JSON.stringify(message.details)).toContain("https://example.invalid/omp-provider-tools");
+		expect(JSON.stringify(message.details)).not.toContain("OMP provider tools are available.");
 	});
 
 	it("deduplicates provider-native web_search echoes across message_end and agent_end", async () => {
@@ -594,9 +606,10 @@ describe("OpenAI provider tools extension", () => {
 		const message = extension.sentMessages[0]?.message as any;
 		expect(message.display).toBe(true);
 		expect(message.customType).toBe("openai-provider-image-generation");
-		expect(message.content).toContain("OpenAI provider generated 1 image.");
-		expect(message.content).not.toContain(path.join(artifactsDir, files[0] ?? ""));
-		expect(message.content).not.toContain(ONE_BY_ONE_PNG);
+		expect(messageText(message)).toContain("OpenAI provider generated 1 image.");
+		expect(messageText(message)).toContain(path.join(artifactsDir, files[0] ?? ""));
+		expect(messageText(message)).not.toContain(ONE_BY_ONE_PNG);
+		expect(messageImages(message)).toEqual([{ type: "image", data: ONE_BY_ONE_PNG, mimeType: "image/png" }]);
 	});
 
 	it("normalizes provider-native image_generation replay items after saving them", async () => {
@@ -702,10 +715,10 @@ describe("OpenAI provider tools extension", () => {
 		expect(files[0]?.endsWith(".png")).toBe(true);
 		expect(extension.sentMessages).toHaveLength(1);
 		const message = extension.sentMessages[0]?.message as any;
-		expect(message.content).toContain("OpenAI provider generated 1 image.");
-		expect(message.content).not.toContain(path.join(artifactsDir, files[0] ?? ""));
+		expect(messageText(message)).toContain("OpenAI provider generated 1 image.");
+		expect(messageText(message)).toContain(path.join(artifactsDir, files[0] ?? ""));
 		expect(message.details.path).toBe(path.join(artifactsDir, files[0] ?? ""));
-		expect(message.content).not.toContain(ONE_BY_ONE_PNG);
+		expect(messageText(message)).not.toContain(ONE_BY_ONE_PNG);
 	});
 
 
@@ -729,8 +742,8 @@ describe("OpenAI provider tools extension", () => {
 		expect(files).toHaveLength(1);
 		expect(extension.sentMessages).toHaveLength(1);
 		const message = extension.sentMessages[0]?.message as any;
-		expect(message.content).toContain("OpenAI provider generated 1 image.");
-		expect(message.content).not.toContain(path.join(artifactsDir, files[0] ?? ""));
+		expect(messageText(message)).toContain("OpenAI provider generated 1 image.");
+		expect(messageText(message)).toContain(path.join(artifactsDir, files[0] ?? ""));
 		expect(message.details.path).toBe(path.join(artifactsDir, files[0] ?? ""));
 	});
 
@@ -760,8 +773,8 @@ describe("OpenAI provider tools extension", () => {
 		expect(files).toHaveLength(1);
 		expect(extension.sentMessages).toHaveLength(2);
 		const savedMessage = extension.sentMessages[1]?.message as any;
-		expect(savedMessage.content).toContain("OpenAI provider generated 1 image.");
-		expect(savedMessage.content).not.toContain(path.join(badOutputDir, files[0] ?? ""));
+		expect(messageText(savedMessage)).toContain("OpenAI provider generated 1 image.");
+		expect(messageText(savedMessage)).toContain(path.join(badOutputDir, files[0] ?? ""));
 		expect(savedMessage.details.path).toBe(path.join(badOutputDir, files[0] ?? ""));
 	});
 	it("reports malformed id-less image results and continues with later valid results", async () => {
@@ -797,10 +810,11 @@ describe("OpenAI provider tools extension", () => {
 		expect(errorMessage.content).toMatch(/could not be saved|base64 is invalid/i);
 		expect(errorMessage.content).not.toContain(invalidResult);
 		const savedMessage = extension.sentMessages[1]?.message as any;
-		expect(savedMessage.content).toContain("OpenAI provider generated 1 image.");
-		expect(savedMessage.content).not.toContain(path.join(artifactsDir, files[0] ?? ""));
+		expect(messageText(savedMessage)).toContain("OpenAI provider generated 1 image.");
+		expect(messageText(savedMessage)).toContain(path.join(artifactsDir, files[0] ?? ""));
 		expect(savedMessage.details.path).toBe(path.join(artifactsDir, files[0] ?? ""));
-		expect(savedMessage.content).not.toContain(ONE_BY_ONE_PNG);
+		expect(messageText(savedMessage)).not.toContain(ONE_BY_ONE_PNG);
+		expect(messageImages(savedMessage)).toEqual([{ type: "image", data: ONE_BY_ONE_PNG, mimeType: "image/png" }]);
 	});
 
 	it("deduplicates the same image result within one session", async () => {
@@ -862,8 +876,8 @@ describe("OpenAI provider tools extension", () => {
 		expect(await directoryEntries(outputDir)).toHaveLength(1);
 		await expect(fs.stat(artifactsDir)).rejects.toThrow();
 		const message = extension.sentMessages[0]?.message as any;
-		expect(message.content).toContain("OpenAI provider generated 1 image.");
-		expect(message.content).not.toContain(outputDir);
+		expect(messageText(message)).toContain("OpenAI provider generated 1 image.");
+		expect(messageText(message)).toContain(outputDir);
 		expect(message.details.path).toContain(outputDir);
 	});
 
@@ -890,10 +904,10 @@ describe("OpenAI provider tools extension", () => {
 		expect(await directoryEntries(outputDir)).toHaveLength(1);
 		expect(await directoryEntries(artifactsDir)).toHaveLength(1);
 		const secondMessage = extension.sentMessages[1]?.message as any;
-		expect(secondMessage.content).toContain("OpenAI provider generated 1 image.");
-		expect(secondMessage.content).not.toContain(artifactsDir);
+		expect(messageText(secondMessage)).toContain("OpenAI provider generated 1 image.");
+		expect(messageText(secondMessage)).toContain(artifactsDir);
 		expect(secondMessage.details.path).toContain(artifactsDir);
-		expect(secondMessage.content).not.toContain(outputDir);
+		expect(messageText(secondMessage)).not.toContain(outputDir);
 	});
 
 	it("clears previous image output directory for requests without image generation enabled", async () => {
@@ -932,10 +946,10 @@ describe("OpenAI provider tools extension", () => {
 		expect(await directoryEntries(outputDir)).toHaveLength(1);
 		expect(await directoryEntries(artifactsDir)).toHaveLength(1);
 		const secondMessage = extension.sentMessages[1]?.message as any;
-		expect(secondMessage.content).toContain("OpenAI provider generated 1 image.");
-		expect(secondMessage.content).not.toContain(artifactsDir);
+		expect(messageText(secondMessage)).toContain("OpenAI provider generated 1 image.");
+		expect(messageText(secondMessage)).toContain(artifactsDir);
 		expect(secondMessage.details.path).toContain(artifactsDir);
-		expect(secondMessage.content).not.toContain(outputDir);
+		expect(messageText(secondMessage)).not.toContain(outputDir);
 	});
 
 	it("uses the agent default image directory when no artifact directory is available", async () => {
@@ -953,8 +967,8 @@ describe("OpenAI provider tools extension", () => {
 
 		expect(await directoryEntries(defaultDir)).toHaveLength(1);
 		const message = extension.sentMessages[0]?.message as any;
-		expect(message.content).toContain("OpenAI provider generated 1 image.");
-		expect(message.content).not.toContain(defaultDir);
+		expect(messageText(message)).toContain("OpenAI provider generated 1 image.");
+		expect(messageText(message)).toContain(defaultDir);
 		expect(message.details.path).toContain(defaultDir);
 	});
 
@@ -979,8 +993,8 @@ describe("OpenAI provider tools extension", () => {
 		expect(await directoryEntries(piDefaultDir)).toHaveLength(1);
 		await expect(fs.stat(ompDefaultDir)).rejects.toThrow();
 		const message = extension.sentMessages[0]?.message as any;
-		expect(message.content).toContain("OpenAI provider generated 1 image.");
-		expect(message.content).not.toContain(piDefaultDir);
+		expect(messageText(message)).toContain("OpenAI provider generated 1 image.");
+		expect(messageText(message)).toContain(piDefaultDir);
 		expect(message.details.path).toContain(piDefaultDir);
 	});
 
@@ -1026,10 +1040,11 @@ describe("OpenAI provider tools extension", () => {
 
 		expect(extension.sentMessages).toHaveLength(1);
 		const message = extension.sentMessages[0]?.message as any;
-		expect(message.content).toContain("OpenAI provider generated 2 images.");
-		expect(message.content).not.toContain("Images:");
-		expect(message.content).not.toContain("MIME:");
-		expect(message.content).not.toContain("Bytes:");
+		expect(messageText(message)).toContain("OpenAI provider generated 2 images.");
+		expect(messageText(message)).not.toContain("Images:");
+		expect(messageText(message)).not.toContain("MIME:");
+		expect(messageText(message)).not.toContain("Bytes:");
+		expect(messageImages(message)).toHaveLength(2);
 		expect(message.details.images).toHaveLength(2);
 	});
 
@@ -1055,10 +1070,10 @@ describe("OpenAI provider tools extension", () => {
 		expect(extension.sentMessages).toHaveLength(1);
 		expect(extension.sentMessages[0]?.options).toBeUndefined();
 		const sent = extension.sentMessages[0]?.message as any;
-		expect(sent.content).toContain("completed web_search (2 calls)");
-		expect(sent.content).toContain("Queries: provider native image_generation; latest OMP provider tools");
-		expect(sent.content).not.toContain("Call:");
-		expect(sent.content).not.toContain("Status:");
+		expect(sent.content).toBe("");
+		expect(sent.details.queries).toEqual(["provider native image_generation", "latest OMP provider tools"]);
+		expect(JSON.stringify(sent.details)).not.toContain("Call:");
+		expect(JSON.stringify(sent.details)).not.toContain("Status:");
 		expect(sent.details.results).toHaveLength(2);
 	});
 

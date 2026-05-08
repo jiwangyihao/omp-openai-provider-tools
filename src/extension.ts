@@ -18,6 +18,7 @@ import {
 	extractDisplayableProviderToolResults,
 	providerToolResultKey,
 } from "./provider-results";
+import { registerProviderToolResultRenderer } from "./provider-result-renderer";
 import { installOpenAIResponsesImageInterruption, registerInterruptibleImageGenerationRequest, clearInterruptibleImageGenerationRequests } from "./stream-interruption";
 import type { ExtensionApiLike, ExtensionContextLike, ProviderToolType, ProviderToolsEntry, RuntimeModelLike } from "./types";
 
@@ -599,6 +600,7 @@ function requestPayload(event: unknown): unknown {
 export default function openAIProviderToolsExtension(api: ExtensionApiLike): void {
 	api.setLabel?.("OpenAI Provider Tools");
 	registerProviderImageRenderer(api);
+	registerProviderToolResultRenderer(api);
 	installOpenAIResponsesImageInterruption();
 
 	const expectedByTarget = new Map<string, ExpectedToolsState>();
