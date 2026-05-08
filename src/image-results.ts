@@ -1,4 +1,5 @@
 import * as crypto from "node:crypto";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
@@ -127,6 +128,41 @@ export async function saveImageResult(
 		sha256: decoded.sha256,
 		reusedExisting: false,
 	};
+}
+
+export function saveImageResultSync(
+	result: ProviderImageGenerationResult,
+	locations: SaveImageLocations,
+): SavedImageResult {
+	const directory = locations.outputDirectory ?? locations.artifactDirectory ?? locations.agentImageDirectory;
+	if (!directory) {
+		throw new Error("No image output directory is available.");
+	}
+
+	const decoded = decodeImageResult(result);
+	const extension = EXTENSION_BY_MIME[decoded.mimeType];
+	const filePath = path.join(directory, `${decoded.sha256}.${extension}`);
+
+	fsSync.mkdirSync(directory, { recursive: true });
+	try {
+		fsSync.writeFileSync(filePath, decoded.bytes, { flag: "wx" });
+		return {
+			path: filePath,
+			bytes: decoded.bytes.byteLength,
+			mimeType: decoded.mimeType,
+			sha256: decoded.sha256,
+			reusedExisting: false,
+		};
+	} catch (error) {
+		if (!isAlreadyExistsError(error)) throw error;
+		return {
+			path: filePath,
+			bytes: decoded.bytes.byteLength,
+			mimeType: decoded.mimeType,
+			sha256: decoded.sha256,
+			reusedExisting: true,
+		};
+	}
 }
 
 export function buildImageMessage(result: ProviderImageGenerationResult, saved: SavedImageResult): ProviderImageMessage {
@@ -279,4 +315,8 @@ function withoutUndefined(input: Record<string, unknown>): Record<string, unknow
 
 function isNotFoundError(error: unknown): boolean {
 	return isRecord(error) && error.code === "ENOENT";
+}
+
+function isAlreadyExistsError(error: unknown): boolean {
+	return isRecord(error) && error.code === "EEXIST";
 }

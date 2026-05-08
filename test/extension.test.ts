@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -157,12 +158,14 @@ function registerExtension({
 	sendMessage = true,
 	activeToolMethods = true,
 	setActiveTools,
+	getActiveTools,
 }: {
 	runtime?: RuntimeKind;
 	initialActiveTools?: any[];
 	sendMessage?: boolean;
 	activeToolMethods?: boolean;
 	setActiveTools?: (next: any[]) => unknown | Promise<unknown>;
+	getActiveTools?: () => any[] | Promise<any[]>;
 } = {}) {
 	const handlers = new Map<string, Handler[]>();
 	const warnings: unknown[][] = [];
@@ -189,7 +192,7 @@ function registerExtension({
 		...(activeToolMethods
 			? {
 				getActiveTools() {
-					return activeTools;
+					return getActiveTools ? getActiveTools() : activeTools;
 				},
 				async setActiveTools(next: any[]) {
 					if (setActiveTools) {
@@ -233,6 +236,7 @@ async function runBeforeProvider(extension: ReturnType<typeof registerExtension>
 async function runAgentEnd(extension: ReturnType<typeof registerExtension>, event: unknown, ctx: any) {
 	return getHandler(extension, "agent_end")(event, ctx);
 }
+
 
 async function runSessionStart(extension: ReturnType<typeof registerExtension>, ctx: any) {
 	return getHandler(extension, "session_start")({ type: "session_start" }, ctx);
@@ -331,6 +335,7 @@ describe("OpenAI provider tools extension", () => {
 		});
 		const requestModel = { ...targetModel };
 		const payload: Record<string, unknown> = { model: "gpt-5", input: "hello" };
+		await runSessionStart(extension, ctx);
 
 		await runBeforeProvider(extension, payload, ctx, { requestModel });
 
@@ -348,11 +353,82 @@ describe("OpenAI provider tools extension", () => {
 		});
 		const requestModel = { ...targetModel };
 		const payload: Record<string, unknown> = { model: "gpt-5", input: "hello" };
+		await runSessionStart(extension, ctx);
 
 		await runBeforeProvider(extension, payload, ctx, { requestModel });
 
 		expect(payload.tools).toEqual([{ type: "web_search" }]);
 		expect(payload).not.toHaveProperty("tool_choice");
+	});
+	it("mutates request-scoped provider payload synchronously when host tools are inactive", async () => {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		await writeConfig({ cwd, runtime: "omp", content: webSearchOnlyConfig() });
+		const extension = registerExtension({ initialActiveTools: ["read"] });
+		const ctx = context(cwd, homeDir, {
+			model: { id: targetModel.id, name: targetModel.name, provider: targetModel.provider, baseUrl: targetModel.baseUrl },
+		});
+		const requestModel = { ...targetModel };
+		const payload: Record<string, unknown> = { model: "gpt-5", input: "hello" };
+
+		await runSessionStart(extension, ctx);
+		const result = getHandler(extension, "before_provider_request")(
+			{ type: "before_provider_request", payload, requestModel },
+			ctx,
+		);
+
+		expect(payload.tools).toEqual([{ type: "web_search" }]);
+		await result;
+	});
+	it("does not inject request-scoped tools when active tool inspection is asynchronous", async () => {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		await writeConfig({ cwd, runtime: "omp", content: webSearchOnlyConfig() });
+		const extension = registerExtension({
+			getActiveTools: () => Promise.resolve(["read"]),
+		});
+		const ctx = context(cwd, homeDir, {
+			model: { id: targetModel.id, name: targetModel.name, provider: targetModel.provider, baseUrl: targetModel.baseUrl },
+		});
+		const requestModel = { ...targetModel };
+		const payload: Record<string, unknown> = { model: "gpt-5", input: "hello" };
+
+		await runSessionStart(extension, ctx);
+		const result = getHandler(extension, "before_provider_request")(
+			{ type: "before_provider_request", payload, requestModel },
+			ctx,
+		);
+
+		expect(payload.tools).toBeUndefined();
+		await result;
+		expect(payload.tools).toBeUndefined();
+		expect(extension.warnings.join("\n")).toContain("active tool inspection is asynchronous");
+	});
+
+	it("consumes rejected asynchronous active tool inspection", async () => {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		await writeConfig({ cwd, runtime: "omp", content: webSearchOnlyConfig() });
+		const extension = registerExtension({
+			getActiveTools: () => Promise.reject(new Error("boom")),
+		});
+		const ctx = context(cwd, homeDir, {
+			model: { id: targetModel.id, name: targetModel.name, provider: targetModel.provider, baseUrl: targetModel.baseUrl },
+		});
+		const requestModel = { ...targetModel };
+		const payload: Record<string, unknown> = { model: "gpt-5", input: "hello" };
+
+		await runSessionStart(extension, ctx);
+		const result = getHandler(extension, "before_provider_request")(
+			{ type: "before_provider_request", payload, requestModel },
+			ctx,
+		);
+
+		expect(payload.tools).toBeUndefined();
+		await result;
+		await Promise.resolve();
+		expect(payload.tools).toBeUndefined();
+		expect(extension.warnings.join("\n")).toContain("OpenAI provider tools active tool inspection failed: boom");
 	});
 	it("does not inject request-scoped Responses tools when active tool API is unavailable", async () => {
 		const cwd = await makeTempDir();
@@ -364,6 +440,7 @@ describe("OpenAI provider tools extension", () => {
 		});
 		const requestModel = { ...targetModel };
 		const payload: Record<string, unknown> = { model: "gpt-5", input: "hello" };
+		await runSessionStart(extension, ctx);
 
 		await runBeforeProvider(extension, payload, ctx, { requestModel });
 
@@ -394,12 +471,32 @@ describe("OpenAI provider tools extension", () => {
 		const homeDir = await makeTempDir();
 		await writeConfig({ cwd, runtime: "omp", content: webSearchOnlyConfig() });
 		const extension = registerExtension();
+		const ctx = context(cwd, homeDir);
 		const payload: Record<string, unknown> = { model: "gpt-5", input: "hello" };
 
-		await runBeforeProvider(extension, payload, context(cwd, homeDir));
+		await runSessionStart(extension, ctx);
+		await runBeforeProvider(extension, payload, ctx);
 
 		expect(payload.tools).toEqual([{ type: "web_search" }]);
 		expect(payload).not.toHaveProperty("tool_choice");
+	});
+
+	it("mutates provider payload synchronously after config is preloaded", async () => {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		await writeConfig({ cwd, runtime: "omp", content: webSearchOnlyConfig() });
+		const extension = registerExtension({ initialActiveTools: [] });
+		const ctx = context(cwd, homeDir);
+		const payload: Record<string, unknown> = { model: "gpt-5", input: "hello" };
+
+		await runSessionStart(extension, ctx);
+		const result = getHandler(extension, "before_provider_request")(
+			{ type: "before_provider_request", payload },
+			ctx,
+		);
+
+		expect(payload.tools).toEqual([{ type: "web_search" }]);
+		await result;
 	});
 
 	it("removes only host-side web_search when only web search provider tool is enabled", async () => {
@@ -454,6 +551,36 @@ describe("OpenAI provider tools extension", () => {
 		expect(extension.activeTools()).toEqual(["read", "web_search", "generate_image"]);
 	});
 
+	it("aborts synchronously when injection fails after host-side removal", async () => {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		await writeConfig({ cwd, runtime: "omp", content: webSearchOnlyConfig() });
+		let setActiveToolsCalls = 0;
+		const extension = registerExtension({
+			setActiveTools() {
+				setActiveToolsCalls++;
+				if (setActiveToolsCalls === 1) return undefined;
+				return new Promise(() => {});
+			},
+		});
+		let abortMessage = "";
+		const ctx = context(cwd, homeDir, {
+			abort: (message: string) => {
+				abortMessage = message;
+			},
+		});
+
+		await runBeforeAgent(extension, ctx);
+		const result = getHandler(extension, "before_provider_request")(
+			{ type: "before_provider_request", payload: { model: "gpt-5", input: "hello", tools: "bad" } },
+			ctx,
+		);
+
+		expect(setActiveToolsCalls).toBe(2);
+		expect(abortMessage).toContain("OpenAI Responses payload tools field must be an array");
+		void result;
+	});
+
 	it("restores active tools and warns when injection fails without abort support", async () => {
 		const cwd = await makeTempDir();
 		const homeDir = await makeTempDir();
@@ -468,7 +595,7 @@ describe("OpenAI provider tools extension", () => {
 		expect(extension.warnings.join("\n")).toContain("provider tools");
 	});
 
-	it("treats before-agent expected provider tools not covered by before-provider ensured tools as injection failure", async () => {
+	it("uses preloaded config when the config file changes before provider request", async () => {
 		const cwd = await makeTempDir();
 		const homeDir = await makeTempDir();
 		await writeConfig({ cwd, runtime: "omp", content: bothToolsConfig() });
@@ -479,13 +606,15 @@ describe("OpenAI provider tools extension", () => {
 		await runBeforeAgent(extension, ctx);
 		expect(extension.activeTools()).toEqual(["read"]);
 		await writeConfig({ cwd, runtime: "omp", content: webSearchOnlyConfig() });
-		await runBeforeProvider(extension, { model: "gpt-5", input: "hello" }, ctx);
+		const payload: Record<string, unknown> = { model: "gpt-5", input: "hello" };
+		await runBeforeProvider(extension, payload, ctx);
 
-		expect(aborted).toBe(true);
-		expect(extension.activeTools()).toEqual(["read", "web_search", "generate_image"]);
+		expect(aborted).toBe(false);
+		expect(payload.tools).toEqual([{ type: "web_search" }, { type: "image_generation" }]);
+		expect(extension.activeTools()).toEqual(["read"]);
 	});
 
-	it("restores active tools and aborts when provider entry disappears after host-side removal", async () => {
+	it("uses the preloaded provider entry when the config file changes before provider request", async () => {
 		const cwd = await makeTempDir();
 		const homeDir = await makeTempDir();
 		await writeConfig({ cwd, runtime: "omp", content: webSearchOnlyConfig() });
@@ -500,11 +629,37 @@ describe("OpenAI provider tools extension", () => {
 		await runBeforeAgent(extension, ctx);
 		expect(extension.activeTools()).toEqual(["read", "generate_image"]);
 		await writeConfig({ cwd, runtime: "omp", content: noMatchingProviderConfig() });
-		await runBeforeProvider(extension, { model: "gpt-5", input: "hello" }, ctx);
+		const payload: Record<string, unknown> = { model: "gpt-5", input: "hello" };
+		await runBeforeProvider(extension, payload, ctx);
 
-		expect(abortMessage).toContain("provider request no longer matched configured provider tools after host-side tool removal");
-		expect(extension.activeTools()).toEqual(["read", "web_search", "generate_image"]);
-		expect(extension.warnings.join("\n")).toContain("provider request no longer matched configured provider tools after host-side tool removal");
+		expect(abortMessage).toBe("");
+		expect(payload.tools).toEqual([{ type: "web_search" }]);
+		expect(extension.activeTools()).toEqual(["read", "generate_image"]);
+	});
+
+	it("clears cached config before a failed lifecycle reload", async () => {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		await writeConfig({ cwd, runtime: "omp", content: webSearchOnlyConfig() });
+		const extension = registerExtension();
+		const ctx = context(cwd, homeDir);
+		const firstPayload: Record<string, unknown> = { model: "gpt-5", input: "hello" };
+
+		await runSessionStart(extension, ctx);
+		await runBeforeProvider(extension, firstPayload, ctx);
+		expect(firstPayload.tools).toEqual([{ type: "web_search" }]);
+
+		await writeConfig({ cwd, runtime: "omp", content: "version: 1\nproviders: invalid\n" });
+		const rejectingCtx = context(cwd, homeDir, {
+			ui: {
+				notify: () => Promise.reject(new Error("notify failed")),
+			},
+		});
+		await expect(runSessionStart(extension, rejectingCtx)).rejects.toThrow("notify failed");
+		const secondPayload: Record<string, unknown> = { model: "gpt-5", input: "hello" };
+
+		await runBeforeProvider(extension, secondPayload, rejectingCtx);
+		expect(secondPayload.tools).toBeUndefined();
 	});
 
 	it("clears incompatible targets on session_start so a later before-agent can remove host tools", async () => {
@@ -712,9 +867,11 @@ describe("OpenAI provider tools extension", () => {
 		const homeDir = await makeTempDir();
 		await writeConfig({ cwd, runtime: "pi", content: webSearchOnlyConfig() });
 		const extension = registerExtension({ runtime: "pi" });
+		const ctx = context(cwd, homeDir);
 		const payload: Record<string, unknown> = { model: "gpt-5", input: "hello" };
 
-		await runBeforeProvider(extension, payload, context(cwd, homeDir));
+		await runSessionStart(extension, ctx);
+		await runBeforeProvider(extension, payload, ctx);
 
 		expect(payload.tools).toEqual([{ type: "web_search" }]);
 	});
@@ -724,10 +881,12 @@ describe("OpenAI provider tools extension", () => {
 		const homeDir = await makeTempDir();
 		await writeConfig({ cwd, runtime: "pi", content: webSearchOnlyConfig() });
 		const extension = registerExtension({ runtime: "unknown" });
+		const ctx = context(cwd, homeDir);
 		const payload: Record<string, unknown> = { model: "gpt-5", input: "hello" };
 
-		await runBeforeProvider(extension, payload, context(cwd, homeDir));
-		await runBeforeProvider(extension, { model: "gpt-5", input: "hello" }, context(cwd, homeDir));
+		await runSessionStart(extension, ctx);
+		await runBeforeProvider(extension, payload, ctx);
+		await runBeforeProvider(extension, { model: "gpt-5", input: "hello" }, ctx);
 
 		expect(payload.tools).toEqual([{ type: "web_search" }]);
 		expect(extension.warnings.join("\n")).toContain("runtime identity is unknown");
@@ -776,6 +935,83 @@ describe("OpenAI provider tools extension", () => {
 		expect(message.content).not.toContain(ONE_BY_ONE_PNG);
 	});
 
+	it("saves an image_generation_call result from message_end before agent_end", async () => {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		const artifactsDir = path.join(cwd, "artifacts");
+		const extension = registerExtension();
+		const ctx = context(cwd, homeDir, {
+			sessionManager: {
+				getSessionId: () => "session-1",
+				getArtifactsDir: () => artifactsDir,
+			},
+		});
+
+		const result = getHandler(extension, "message_end")({ type: "message_end", message: imageGenerationMessage() }, ctx);
+
+		const files = fsSync.readdirSync(artifactsDir);
+		expect(result).toBeUndefined();
+
+		expect(files).toHaveLength(1);
+		expect(files[0]?.endsWith(".png")).toBe(true);
+		expect(extension.sentMessages).toHaveLength(1);
+		const message = extension.sentMessages[0]?.message as any;
+		expect(message.content).toContain(path.join(artifactsDir, files[0] ?? ""));
+		expect(message.content).not.toContain(ONE_BY_ONE_PNG);
+	});
+
+
+	it("uses preloaded asynchronous session artifact directory for synchronous message_end image saving", async () => {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		const artifactsDir = path.join(cwd, "async-artifacts");
+		const extension = registerExtension();
+		const ctx = context(cwd, homeDir, {
+			sessionManager: {
+				getSessionId: async () => "async-session-1",
+				getArtifactsDir: async () => artifactsDir,
+			},
+		});
+
+		await runSessionStart(extension, ctx);
+		const result = getHandler(extension, "message_end")({ type: "message_end", message: imageGenerationMessage() }, ctx);
+
+		const files = fsSync.readdirSync(artifactsDir);
+		expect(result).toBeUndefined();
+		expect(files).toHaveLength(1);
+		expect(extension.sentMessages).toHaveLength(1);
+		const message = extension.sentMessages[0]?.message as any;
+		expect(message.content).toContain(path.join(artifactsDir, files[0] ?? ""));
+	});
+
+	it("retries image saving on agent_end when message_end save fails before marking seen", async () => {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		const outputParentFile = path.join(cwd, "not-a-directory");
+		const badOutputDir = path.join(outputParentFile, "images");
+		const artifactsDir = path.join(cwd, "artifacts");
+		await fs.writeFile(outputParentFile, "file blocks directory creation");
+		await writeConfig({ cwd, runtime: "omp", content: imageConfigWithOutput(badOutputDir) });
+		const extension = registerExtension();
+		const ctx = context(cwd, homeDir, {
+			sessionManager: {
+				getSessionId: () => "session-1",
+				getArtifactsDir: () => artifactsDir,
+			},
+		});
+
+		await runSessionStart(extension, ctx);
+		await runBeforeProvider(extension, { model: "gpt-5", input: "hello" }, ctx);
+		getHandler(extension, "message_end")({ type: "message_end", message: imageGenerationMessage() }, ctx);
+		await fs.rm(outputParentFile, { force: true });
+		await runAgentEnd(extension, { message: imageGenerationMessage() }, ctx);
+
+		const files = await directoryEntries(badOutputDir);
+		expect(files).toHaveLength(1);
+		expect(extension.sentMessages).toHaveLength(2);
+		const savedMessage = extension.sentMessages[1]?.message as any;
+		expect(savedMessage.content).toContain(path.join(badOutputDir, files[0] ?? ""));
+	});
 	it("reports malformed id-less image results and continues with later valid results", async () => {
 		const cwd = await makeTempDir();
 		const homeDir = await makeTempDir();
@@ -864,6 +1100,7 @@ describe("OpenAI provider tools extension", () => {
 				getArtifactsDir: () => artifactsDir,
 			},
 		});
+		await runSessionStart(extension, ctx);
 		await runBeforeProvider(extension, { model: "gpt-5", input: "hello" }, ctx);
 
 		await runAgentEnd(extension, imageGenerationMessage(), ctx);
@@ -888,6 +1125,7 @@ describe("OpenAI provider tools extension", () => {
 			},
 		});
 
+		await runSessionStart(extension, ctx);
 		await runBeforeProvider(extension, { model: "gpt-5", input: "hello" }, ctx);
 		await runAgentEnd(extension, { message: imageGenerationMessage("img-1") }, ctx);
 		await runSessionStart(extension, ctx);
@@ -914,9 +1152,11 @@ describe("OpenAI provider tools extension", () => {
 			},
 		});
 
+		await runSessionStart(extension, ctx);
 		await runBeforeProvider(extension, { model: "gpt-5", input: "hello" }, ctx);
 		await runAgentEnd(extension, { message: imageGenerationMessage("img-1") }, ctx);
 		await writeConfig({ cwd, runtime: "omp", content: webSearchOnlyConfig() });
+		await runSessionStart(extension, ctx);
 		await runBeforeProvider(extension, { model: "gpt-5", input: "hello" }, ctx);
 		await runAgentEnd(extension, { message: imageGenerationMessage("img-2") }, ctx);
 
@@ -959,6 +1199,7 @@ describe("OpenAI provider tools extension", () => {
 				getArtifactsDir: () => path.join(cwd, "artifacts"),
 			},
 		});
+		await runSessionStart(extension, ctx);
 		await runBeforeProvider(extension, { model: "gpt-5", input: "hello" }, ctx);
 
 		await runAgentEnd(extension, { message: imageGenerationMessage() }, ctx);
@@ -984,6 +1225,7 @@ describe("OpenAI provider tools extension", () => {
 				getArtifactsDir: () => path.join(cwd, "artifacts"),
 			},
 		});
+		await runSessionStart(extension, ctx);
 		await runBeforeProvider(extension, { model: "gpt-5", input: "hello" }, ctx);
 
 		await expect(runAgentEnd(extension, { message: imageGenerationMessage() }, ctx)).resolves.toBeUndefined();

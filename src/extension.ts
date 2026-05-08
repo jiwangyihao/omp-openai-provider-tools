@@ -10,7 +10,7 @@ import {
 	buildImageMessage,
 	extractImageGenerationResults,
 	imageResultKey,
-	saveImageResult,
+	saveImageResultSync,
 } from "./image-results";
 import type { ExtensionApiLike, ExtensionContextLike, ProviderToolType, ProviderToolsEntry, RuntimeModelLike } from "./types";
 
@@ -22,6 +22,10 @@ interface ProviderRequestEventLike {
 
 interface AgentEndEventLike {
 	messages?: unknown;
+	message?: unknown;
+}
+
+interface MessageEndEventLike {
 	message?: unknown;
 }
 
@@ -37,6 +41,8 @@ interface LoadedRuntimeConfig {
 
 interface ImageResultState {
 	outputDirectory?: string;
+	sessionId?: string;
+	artifactDirectory?: string;
 }
 
 function isExplicitOpenAIResponsesModel(model: RuntimeModelLike | undefined): boolean {
@@ -75,6 +81,24 @@ function warningMessage(reason: string): string {
 	return `OpenAI provider tools could not be safely injected: ${reason}`;
 }
 
+function logAsyncFailure(api: ExtensionApiLike, ctx: ExtensionContextLike, message: string, error: unknown): void {
+	const detail = error instanceof Error ? error.message : String(error);
+	api.logger?.warn?.(`${message}: ${detail}`, error);
+	ctx.logger?.warn?.(`${message}: ${detail}`, error);
+}
+
+function consumePromiseLater(api: ExtensionApiLike, ctx: ExtensionContextLike, promise: PromiseLike<unknown>, message: string): void {
+	void Promise.resolve(promise).catch((error) => logAsyncFailure(api, ctx, message, error));
+}
+
+function notifyWarningLater(api: ExtensionApiLike, ctx: ExtensionContextLike, message: string): void {
+	consumePromiseLater(api, ctx, notifyWarning(api, ctx, message), "OpenAI provider tools warning delivery failed");
+}
+
+function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
+	return typeof value === "object" && value !== null && "then" in value && typeof (value as { then?: unknown }).then === "function";
+}
+
 
 function imageResultsFromAgentEndEvent(event: unknown) {
 	const candidate = event as AgentEndEventLike | undefined;
@@ -82,15 +106,47 @@ function imageResultsFromAgentEndEvent(event: unknown) {
 	return messages.flatMap((message) => extractImageGenerationResults(message));
 }
 
-async function runtimeSessionId(ctx: ExtensionContextLike, api: ExtensionApiLike): Promise<string> {
-	const explicit = await ctx.sessionManager?.getSessionId?.();
-	if (explicit) return explicit;
+function imageResultsFromMessageEndEvent(event: unknown) {
+	const candidate = event as MessageEndEventLike | undefined;
+	return extractImageGenerationResults(candidate?.message ?? event);
+}
+
+async function preloadImageRuntimeState(state: ImageResultState, ctx: ExtensionContextLike): Promise<void> {
+	try {
+		const sessionId = ctx.sessionManager?.getSessionId?.();
+		state.sessionId = typeof sessionId === "string" ? sessionId : isPromiseLike(sessionId) ? await sessionId : undefined;
+	} catch {
+		state.sessionId = undefined;
+	}
+
+	try {
+		const artifactDirectory = ctx.sessionManager?.getArtifactsDir?.();
+		state.artifactDirectory = typeof artifactDirectory === "string" ? artifactDirectory : isPromiseLike(artifactDirectory) ? await artifactDirectory : undefined;
+	} catch {
+		state.artifactDirectory = undefined;
+	}
+}
+
+function runtimeSessionId(ctx: ExtensionContextLike, api: ExtensionApiLike, state: ImageResultState): string {
+	if (state.sessionId) return state.sessionId;
+	try {
+		const explicit = ctx.sessionManager?.getSessionId?.();
+		if (typeof explicit === "string" && explicit.length > 0) return explicit;
+	} catch {
+		// Fall back to a deterministic session key; image saving must remain best-effort.
+	}
 	const runtime = detectRuntimeKind(api, ctx);
 	return `fallback:${runtime}:${ctx.homeDir ?? "no-home"}:${ctx.cwd ?? "no-cwd"}`;
 }
 
-async function sessionArtifactDirectory(ctx: ExtensionContextLike): Promise<string | undefined> {
-	return ctx.sessionManager?.getArtifactsDir?.();
+function sessionArtifactDirectory(ctx: ExtensionContextLike, state: ImageResultState): string | undefined {
+	if (state.artifactDirectory) return state.artifactDirectory;
+	try {
+		const directory = ctx.sessionManager?.getArtifactsDir?.();
+		return typeof directory === "string" && directory.length > 0 ? directory : undefined;
+	} catch {
+		return undefined;
+	}
 }
 
 function agentImageDirectory(ctx: ExtensionContextLike, api: ExtensionApiLike): string {
@@ -114,7 +170,44 @@ async function sendVisibleImageMessage(api: ExtensionApiLike, message: unknown):
 	await api.sendMessage?.(message, { deliverAs: "nextTurn" });
 }
 
-async function handleAgentEndImageResults({
+function handleImageResults({
+	api,
+	ctx,
+	results,
+	state,
+	seen,
+}: {
+	api: ExtensionApiLike;
+	ctx: ExtensionContextLike;
+	results: ReturnType<typeof extractImageGenerationResults>;
+	state: ImageResultState;
+	seen: Set<string>;
+}): void {
+	if (results.length === 0) return;
+
+	const sessionId = runtimeSessionId(ctx, api, state);
+	const artifactDirectory = sessionArtifactDirectory(ctx, state);
+	const locations = {
+		outputDirectory: state.outputDirectory,
+		artifactDirectory,
+		agentImageDirectory: agentImageDirectory(ctx, api),
+	};
+
+	for (const result of results) {
+		try {
+			const key = imageResultKey(sessionId, result);
+			if (seen.has(key)) continue;
+			const saved = saveImageResultSync(result, locations);
+			seen.add(key);
+			consumePromiseLater(api, ctx, sendVisibleImageMessage(api, buildImageMessage(result, saved)), "OpenAI provider image message delivery failed");
+		} catch (error) {
+			logImageSaveFailure(api, ctx, error);
+			consumePromiseLater(api, ctx, sendVisibleImageMessage(api, buildImageErrorMessage(result, error)), "OpenAI provider image error message delivery failed");
+		}
+	}
+}
+
+function handleAgentEndImageResults({
 	api,
 	ctx,
 	event,
@@ -126,36 +219,38 @@ async function handleAgentEndImageResults({
 	event: unknown;
 	state: ImageResultState;
 	seen: Set<string>;
-}): Promise<void> {
+}): void {
 	let results;
 	try {
 		results = imageResultsFromAgentEndEvent(event);
 	} catch (error) {
-		await notifyWarning(api, ctx, `OpenAI provider image results could not be extracted: ${error instanceof Error ? error.message : String(error)}`);
+		notifyWarningLater(api, ctx, `OpenAI provider image results could not be extracted: ${error instanceof Error ? error.message : String(error)}`);
 		return;
 	}
-	if (results.length === 0) return;
+	handleImageResults({ api, ctx, results, state, seen });
+}
 
-	const sessionId = await runtimeSessionId(ctx, api);
-	const artifactDirectory = await sessionArtifactDirectory(ctx);
-	const locations = {
-		outputDirectory: state.outputDirectory,
-		artifactDirectory,
-		agentImageDirectory: agentImageDirectory(ctx, api),
-	};
-
-	for (const result of results) {
-		try {
-			const key = imageResultKey(sessionId, result);
-			if (seen.has(key)) continue;
-			seen.add(key);
-			const saved = await saveImageResult(result, locations);
-			await sendVisibleImageMessage(api, buildImageMessage(result, saved));
-		} catch (error) {
-			logImageSaveFailure(api, ctx, error);
-			await sendVisibleImageMessage(api, buildImageErrorMessage(result, error));
-		}
+function handleMessageEndImageResults({
+	api,
+	ctx,
+	event,
+	state,
+	seen,
+}: {
+	api: ExtensionApiLike;
+	ctx: ExtensionContextLike;
+	event: unknown;
+	state: ImageResultState;
+	seen: Set<string>;
+}): void {
+	let results;
+	try {
+		results = imageResultsFromMessageEndEvent(event);
+	} catch (error) {
+		notifyWarningLater(api, ctx, `OpenAI provider image results could not be extracted: ${error instanceof Error ? error.message : String(error)}`);
+		return;
 	}
+	handleImageResults({ api, ctx, results, state, seen });
 }
 async function notifyWarning(api: ExtensionApiLike, ctx: ExtensionContextLike, message: string): Promise<void> {
 	api.logger?.warn?.(message);
@@ -195,16 +290,25 @@ async function failAfterRemoval({
 	incompatibleTargets: Set<string>;
 	key?: string;
 }): Promise<void> {
-	await restoreActiveTools(api, state);
 	if (key) incompatibleTargets.add(key);
 
 	const message = warningMessage(reason);
 	if (ctx.abort) {
 		api.logger?.warn?.(message);
 		ctx.logger?.warn?.(message);
-		await ctx.abort(message);
+		try {
+			const abortResult = ctx.abort(message);
+			if (isPromiseLike(abortResult)) {
+				consumePromiseLater(api, ctx, abortResult, "OpenAI provider tools abort failed");
+			}
+		} catch (error) {
+			logAsyncFailure(api, ctx, "OpenAI provider tools abort failed", error);
+		}
+		consumePromiseLater(api, ctx, restoreActiveTools(api, state), "OpenAI provider tools active tool restoration failed");
 		return;
 	}
+
+	await restoreActiveTools(api, state);
 	await notifyWarning(api, ctx, message);
 }
 
@@ -244,13 +348,18 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 	const imageResultState: ImageResultState = {};
 	const seenImageResults = new Set<string>();
 	const visibleConfigWarnings = new Set<string>();
+	let loadedRuntimeConfig: LoadedRuntimeConfig | undefined;
 
 	api.on?.("session_start", async (_event, ctx) => {
 		expectedByTarget.clear();
 		incompatibleTargets.clear();
 		seenImageResults.clear();
 		imageResultState.outputDirectory = undefined;
-		await loadConfig(api, ctx, visibleConfigWarnings);
+		imageResultState.sessionId = undefined;
+		imageResultState.artifactDirectory = undefined;
+		await preloadImageRuntimeState(imageResultState, ctx);
+		loadedRuntimeConfig = undefined;
+		loadedRuntimeConfig = await loadConfig(api, ctx, visibleConfigWarnings);
 	});
 
 	api.on?.("before_agent_start", async (_event, ctx) => {
@@ -258,7 +367,9 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 		if (!isExplicitOpenAIResponsesModel(ctx.model)) return undefined;
 		if (!syntheticPayload) return undefined;
 
-		const { config } = await loadConfig(api, ctx, visibleConfigWarnings);
+		loadedRuntimeConfig = undefined;
+		loadedRuntimeConfig = await loadConfig(api, ctx, visibleConfigWarnings);
+		const { config } = loadedRuntimeConfig;
 		const target = buildRequestTarget({ payload: syntheticPayload, contextModel: ctx.model });
 		if (!target) return undefined;
 		const key = targetKey(target);
@@ -320,7 +431,12 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 			}
 			return undefined;
 		}
-		const { config } = await loadConfig(api, ctx, visibleConfigWarnings);
+		const cached = loadedRuntimeConfig;
+		if (!cached) {
+			notifyWarningLater(api, ctx, warningMessage("configuration was not preloaded before provider request"));
+			return undefined;
+		}
+		const { config } = cached;
 		const target = buildRequestTarget({ payload, contextModel: ctx.model, eventModel });
 		if (!target) {
 			const pending = pendingRemovedState(expectedByTarget);
@@ -388,23 +504,30 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 		if (!expected && eventModel && hostToolsToRemove.length > 0) {
 			if (!api.getActiveTools) {
 				incompatibleTargets.add(key);
-				await notifyWarning(api, ctx, warningMessage("active tool control API is unavailable"));
+				notifyWarningLater(api, ctx, warningMessage("active tool control API is unavailable"));
 				return undefined;
 			}
 
 			let activeToolNames: string[];
 			try {
-				activeToolNames = normalizeActiveToolNames(await api.getActiveTools());
+				const activeTools = api.getActiveTools();
+				if (isPromiseLike(activeTools)) {
+					incompatibleTargets.add(key);
+					consumePromiseLater(api, ctx, activeTools, "OpenAI provider tools active tool inspection failed");
+					notifyWarningLater(api, ctx, warningMessage("active tool inspection is asynchronous and cannot safely precede provider request injection"));
+					return undefined;
+				}
+				activeToolNames = normalizeActiveToolNames(activeTools);
 			} catch (error) {
 				incompatibleTargets.add(key);
-				await notifyWarning(api, ctx, warningMessage(`active tool inspection failed: ${error instanceof Error ? error.message : String(error)}`));
+				notifyWarningLater(api, ctx, warningMessage(`active tool inspection failed: ${error instanceof Error ? error.message : String(error)}`));
 				return undefined;
 			}
 
 			const activeHostConflicts = hostToolsToRemove.filter((toolName) => activeToolNames.includes(toolName));
 			if (activeHostConflicts.length > 0) {
 				incompatibleTargets.add(key);
-				await notifyWarning(api, ctx, warningMessage(`active host-side tools remain: ${activeHostConflicts.join(", ")}`));
+				notifyWarningLater(api, ctx, warningMessage(`active host-side tools remain: ${activeHostConflicts.join(", ")}`));
 				return undefined;
 			}
 		}
@@ -434,6 +557,10 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 		return undefined;
 	});
 
+	api.on?.("message_end", (event, ctx) => {
+		handleMessageEndImageResults({ api, ctx, event, state: imageResultState, seen: seenImageResults });
+	});
+
 	api.on?.("agent_end", async (event, ctx) => {
 		const pending = [...expectedByTarget.entries()].filter(([, state]) => state.removed);
 		for (const [key, state] of pending) {
@@ -447,6 +574,6 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 			});
 			expectedByTarget.delete(key);
 		}
-		await handleAgentEndImageResults({ api, ctx, event, state: imageResultState, seen: seenImageResults });
+		handleAgentEndImageResults({ api, ctx, event, state: imageResultState, seen: seenImageResults });
 	});
 }
