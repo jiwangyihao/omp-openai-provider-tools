@@ -33,6 +33,13 @@ describe("package manifest", () => {
 		expect(readme).toContain("[MPL-2.0](./LICENSE)");
 	});
 
+	it("declares the GitHub repository for npm provenance", () => {
+		expect(packageJson.repository).toEqual({
+			type: "git",
+			url: "git+https://github.com/jiwangyihao/omp-openai-provider-tools.git",
+		});
+	});
+
 	it("is discoverable as a Pi package and publishes runtime files", () => {
 		expect(packageJson.keywords).toContain("pi-package");
 		expect(packageJson.files).toEqual(["src", "README.md", "docs/runtime-compatibility.md"]);

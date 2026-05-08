@@ -3,6 +3,10 @@
 	"name": "omp-openai-provider-tools",
 	"version": "0.1.1",
 	"description": "Provider-native OpenAI Responses tools for OMP and Pi-family runtimes.",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/jiwangyihao/omp-openai-provider-tools.git"
+	},
 	"license": "MPL-2.0",
 	"keywords": [
 		"oh-my-pi",
