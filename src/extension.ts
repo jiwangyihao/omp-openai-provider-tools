@@ -10,6 +10,7 @@ import {
 	extractImageGenerationResults,
 	imageResultKey,
 	saveImageResultSync,
+	type ProviderImageGenerationResult,
 } from "./image-results";
 import {
 	buildProviderToolResultMessage,
@@ -44,6 +45,7 @@ interface ImageResultState {
 	outputDirectory?: string;
 	sessionId?: string;
 	artifactDirectory?: string;
+	pendingRetries: Map<string, ProviderImageGenerationResult>;
 }
 
 function isExplicitOpenAIResponsesModel(model: RuntimeModelLike | undefined): boolean {
@@ -216,6 +218,40 @@ function imageResultsFromAgentEndEvent(event: unknown) {
 	return messages.flatMap((message) => extractImageGenerationResults(message));
 }
 
+function eventMessages(event: unknown): unknown[] {
+	const candidate = event as AgentEndEventLike | MessageEndEventLike | undefined;
+	if (Array.isArray((candidate as AgentEndEventLike | undefined)?.messages)) return (candidate as AgentEndEventLike).messages ?? [];
+	return [(candidate as MessageEndEventLike | undefined)?.message ?? event];
+}
+
+function stripProviderImageGenerationReplayItems(message: unknown): void {
+	if (!isRecord(message)) return;
+	const providerPayload = message.providerPayload;
+	if (!isRecord(providerPayload)) return;
+	if (providerPayload.type !== "openaiResponsesHistory") return;
+	if (!Array.isArray(providerPayload.items)) return;
+
+	const safeItems = providerPayload.items.filter((item) => !isRecord(item) || item.type !== "image_generation_call");
+	if (safeItems.length === providerPayload.items.length) return;
+	if (safeItems.length === 0) {
+		delete message.providerPayload;
+		return;
+	}
+	providerPayload.items = safeItems;
+}
+
+function stripProviderImageGenerationReplayItemsFromEvent(event: unknown): void {
+	for (const message of eventMessages(event)) {
+		stripProviderImageGenerationReplayItems(message);
+	}
+}
+
+
+function stripProviderImageGenerationReplayItemsFromPayload(payload: unknown): void {
+	if (!isRecord(payload)) return;
+	if (!Array.isArray(payload.input)) return;
+	payload.input = payload.input.filter((item) => !isRecord(item) || item.type !== "image_generation_call");
+}
 function imageResultsFromMessageEndEvent(event: unknown) {
 	const candidate = event as MessageEndEventLike | undefined;
 	return extractImageGenerationResults(candidate?.message ?? event);
@@ -288,7 +324,7 @@ function logImageSaveFailure(api: ExtensionApiLike, ctx: ExtensionContextLike, e
 }
 
 async function sendVisibleImageMessage(api: ExtensionApiLike, message: unknown): Promise<void> {
-	await api.sendMessage?.(message, { deliverAs: "nextTurn" });
+	await api.sendMessage?.(message, { deliverAs: "followUp" });
 }
 
 function handleImageResults({
@@ -297,12 +333,14 @@ function handleImageResults({
 	results,
 	state,
 	seen,
+	retainFailures = false,
 }: {
 	api: ExtensionApiLike;
 	ctx: ExtensionContextLike;
-	results: ReturnType<typeof extractImageGenerationResults>;
+	results: ProviderImageGenerationResult[];
 	state: ImageResultState;
 	seen: Set<string>;
+	retainFailures?: boolean;
 }): void {
 	if (results.length === 0) return;
 
@@ -315,13 +353,23 @@ function handleImageResults({
 	};
 
 	for (const result of results) {
+		let key: string | undefined;
 		try {
-			const key = imageResultKey(sessionId, result);
-			if (seen.has(key)) continue;
+			key = imageResultKey(sessionId, result);
+			if (seen.has(key)) {
+				state.pendingRetries.delete(key);
+				continue;
+			}
 			const saved = saveImageResultSync(result, locations);
 			seen.add(key);
+			state.pendingRetries.delete(key);
 			consumePromiseLater(api, ctx, sendVisibleImageMessage(api, buildImageMessage(result, saved)), "OpenAI provider image message delivery failed");
 		} catch (error) {
+			if (key && retainFailures) {
+				state.pendingRetries.set(key, result);
+			} else if (key) {
+				state.pendingRetries.delete(key);
+			}
 			logImageSaveFailure(api, ctx, error);
 			consumePromiseLater(api, ctx, sendVisibleImageMessage(api, buildImageErrorMessage(result, error)), "OpenAI provider image error message delivery failed");
 		}
@@ -343,12 +391,14 @@ function handleAgentEndImageResults({
 }): void {
 	let results;
 	try {
-		results = imageResultsFromAgentEndEvent(event);
+		results = [...state.pendingRetries.values(), ...imageResultsFromAgentEndEvent(event)];
 	} catch (error) {
 		notifyWarningLater(api, ctx, `OpenAI provider image results could not be extracted: ${error instanceof Error ? error.message : String(error)}`);
+		stripProviderImageGenerationReplayItemsFromEvent(event);
 		return;
 	}
 	handleImageResults({ api, ctx, results, state, seen });
+	stripProviderImageGenerationReplayItemsFromEvent(event);
 }
 
 function handleMessageEndImageResults({
@@ -369,9 +419,11 @@ function handleMessageEndImageResults({
 		results = imageResultsFromMessageEndEvent(event);
 	} catch (error) {
 		notifyWarningLater(api, ctx, `OpenAI provider image results could not be extracted: ${error instanceof Error ? error.message : String(error)}`);
+		stripProviderImageGenerationReplayItemsFromEvent(event);
 		return;
 	}
-	handleImageResults({ api, ctx, results, state, seen });
+	handleImageResults({ api, ctx, results, state, seen, retainFailures: true });
+	stripProviderImageGenerationReplayItemsFromEvent(event);
 }
 
 async function sendVisibleProviderToolResultMessage(api: ExtensionApiLike, message: unknown): Promise<void> {
@@ -521,7 +573,7 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 
 	const expectedByTarget = new Map<string, ExpectedToolsState>();
 	const incompatibleTargets = new Set<string>();
-	const imageResultState: ImageResultState = {};
+	const imageResultState: ImageResultState = { pendingRetries: new Map() };
 	const seenImageResults = new Set<string>();
 	const seenProviderToolResults = new Set<string>();
 
@@ -533,6 +585,7 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 		imageResultState.outputDirectory = undefined;
 		imageResultState.sessionId = undefined;
 		imageResultState.artifactDirectory = undefined;
+		imageResultState.pendingRetries.clear();
 		await preloadImageRuntimeState(imageResultState, ctx);
 	});
 
@@ -583,6 +636,7 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 
 	api.on?.("before_provider_request", async (event, ctx) => {
 		const payload = requestPayload(event);
+		stripProviderImageGenerationReplayItemsFromPayload(payload);
 		const eventModel = requestEventModel(event);
 		const eligibilityModel = eventModel ?? ctx.model;
 		imageResultState.outputDirectory = undefined;

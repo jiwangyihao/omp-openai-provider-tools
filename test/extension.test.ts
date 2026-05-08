@@ -561,12 +561,88 @@ describe("OpenAI provider tools extension", () => {
 		expect(files).toHaveLength(1);
 		expect(files[0]?.endsWith(".png")).toBe(true);
 		expect(extension.sentMessages).toHaveLength(1);
-		expect(extension.sentMessages[0]?.options).toEqual({ deliverAs: "nextTurn" });
+		expect(extension.sentMessages[0]?.options).toEqual({ deliverAs: "followUp" });
 		const message = extension.sentMessages[0]?.message as any;
 		expect(message.display).toBe(true);
 		expect(message.customType).toBe("openai-provider-image-generation");
 		expect(message.content).toContain(path.join(artifactsDir, files[0] ?? ""));
 		expect(message.content).not.toContain(ONE_BY_ONE_PNG);
+	});
+
+	it("removes provider-native image_generation replay items after saving them", async () => {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		const artifactsDir = path.join(cwd, "artifacts");
+		const extension = registerExtension();
+		const ctx = context(cwd, homeDir, {
+			sessionManager: {
+				getSessionId: () => "session-1",
+				getArtifactsDir: () => artifactsDir,
+			},
+		});
+		const message: any = {
+			providerPayload: {
+				type: "openaiResponsesHistory",
+				provider: "sub2api-openai-image",
+				dt: true,
+				items: [
+					{ type: "reasoning", encrypted_content: "opaque", summary: [] },
+					{ type: "image_generation_call", status: "generating", action: "generate", background: "opaque", output_format: "png", quality: "high" },
+					{ type: "image_generation_call", id: "img-1", status: "completed", action: "generate", result: ONE_BY_ONE_PNG, output_format: "png", quality: "high" },
+				],
+			},
+		};
+
+		getHandler(extension, "message_end")({ type: "message_end", message }, ctx);
+
+		expect(await directoryEntries(artifactsDir)).toHaveLength(1);
+		expect(message.providerPayload.items).toEqual([{ type: "reasoning", encrypted_content: "opaque", summary: [] }]);
+	});
+
+	it("keeps failed image results retryable after stripping unsafe replay items", async () => {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		const outputParentFile = path.join(cwd, "not-a-directory");
+		const badOutputDir = path.join(outputParentFile, "images");
+		await fs.writeFile(outputParentFile, "file blocks directory creation");
+		const extension = registerExtension();
+		const ctx = context(cwd, homeDir, {
+			model: imageModelWithOutput(badOutputDir),
+			sessionManager: {
+				getSessionId: () => "session-1",
+			},
+		});
+		const message: any = imageGenerationMessage();
+
+		await runSessionStart(extension, ctx);
+		await runBeforeProvider(extension, { model: "gpt-5", input: "hello" }, ctx);
+		getHandler(extension, "message_end")({ type: "message_end", message }, ctx);
+		await fs.rm(outputParentFile, { force: true });
+		await runAgentEnd(extension, { message }, ctx);
+
+		expect(message.providerPayload).toBeUndefined();
+		expect(await directoryEntries(badOutputDir)).toHaveLength(1);
+		expect(extension.sentMessages).toHaveLength(2);
+	});
+
+	it("removes unsafe replayed image_generation_call items from outgoing provider payload", async () => {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		const extension = registerExtension({ initialActiveTools: ["read"] });
+		const ctx = context(cwd, homeDir, { model: providerToolsImageModel });
+		const payload: Record<string, unknown> = {
+			model: "gpt-5.5-Sys",
+			input: [
+				{ role: "user", content: [{ type: "input_text", text: "next" }] },
+				{ type: "image_generation_call", status: "generating", action: "generate", output_format: "png", quality: "high" },
+				{ type: "image_generation_call", id: "img-1", status: "completed", action: "generate", result: ONE_BY_ONE_PNG, output_format: "png" },
+			],
+		};
+
+		await runBeforeProvider(extension, payload, ctx, { requestModel: providerToolsImageModel });
+
+		expect(payload.input).toEqual([{ role: "user", content: [{ type: "input_text", text: "next" }] }]);
+		expect(payload.tools).toEqual([{ type: "web_search" }, { type: "image_generation" }]);
 	});
 
 	it("saves an image_generation_call result from message_end before agent_end", async () => {
