@@ -184,21 +184,21 @@ function renderProviderImageMessage(
 	}
 
 	const box = new Tui.Box(1, 1, value => background(theme, "customMessageBg", value));
-	const labelBase = color(theme, "customMessageLabel", bold(theme, `[${messageCustomType(message)}]`));
-	const label = !options.expanded && detailLines.length > 0 ? `${labelBase} ${expandHint(theme)}` : labelBase;
+	const label = color(theme, "customMessageLabel", bold(theme, `[${messageCustomType(message)}]`));
 	box.addChild(new Tui.Text(label, 0, 0));
+	if (!options.expanded && detailLines.length > 0) {
+		box.addChild(new Tui.Text(expandHint(theme), 0, 0));
+	}
 	if (options.expanded) {
-		box.addChild(new Tui.Spacer(1));
 		box.addChild(new Tui.Text(color(theme, "customMessageText", text || "OpenAI provider image_generation result"), 0, 0));
 	}
 
 	if (images.length > 0) {
-		if (options.expanded) box.addChild(new Tui.Spacer(1));
+		box.addChild(new Tui.Spacer(1));
 		for (const image of images) addImagePreview(box, Tui, image, theme, options.expanded);
 	}
 
 	if (options.expanded && detailLines.length > 0) {
-		box.addChild(new Tui.Spacer(1));
 		box.addChild(new Tui.Text(color(theme, "customMessageText", detailLines.join("\n")), 0, 0));
 	}
 
@@ -216,24 +216,25 @@ function runtimeImageBox(
 	return {
 		render(width: number): string[] {
 			const lines: string[] = [];
-			const labelBase = color(theme, "customMessageLabel", bold(theme, `[${customType}]`));
-			const label = !expanded && detailLines.length > 0 ? `${labelBase} ${expandHint(theme)}` : labelBase;
+			const label = color(theme, "customMessageLabel", bold(theme, `[${customType}]`));
 			lines.push(backgroundLine(theme, "", width));
 			lines.push(backgroundLine(theme, label, width));
+			if (!expanded && detailLines.length > 0) {
+				lines.push(backgroundLine(theme, expandHint(theme), width));
+			}
 			if (expanded) {
-				lines.push(backgroundLine(theme, "", width));
 				for (const line of color(theme, "customMessageText", text).split("\n")) {
 					lines.push(backgroundLine(theme, line, width));
 				}
-				if (detailLines.length > 0) {
-					lines.push(backgroundLine(theme, "", width));
-					for (const line of color(theme, "customMessageText", detailLines.join("\n")).split("\n")) {
-						lines.push(backgroundLine(theme, line, width));
-					}
+			}
+			lines.push(backgroundLine(theme, "", width));
+			lines.push(...backgroundRuntimeImageLines(theme, runtimeImagePreview.render(width), width));
+			if (expanded && detailLines.length > 0) {
+				for (const line of color(theme, "customMessageText", detailLines.join("\n")).split("\n")) {
+					lines.push(backgroundLine(theme, line, width));
 				}
 				lines.push(backgroundLine(theme, "", width));
 			}
-			lines.push(...backgroundRuntimeImageLines(theme, runtimeImagePreview.render(width), width));
 			return lines;
 		},
 		invalidate() {

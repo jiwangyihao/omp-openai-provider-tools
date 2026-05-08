@@ -216,6 +216,9 @@ describe("image result keys and messages", () => {
 		expect(text).toContain("OpenAI provider generated 1 image.");
 		expect(text).toContain("The generated image is attached to this message.");
 		expect(text).toContain("C:/tmp/provider-image.png");
+		expect(text).toContain("This provider-native image_generation call is complete.");
+		expect(text).toContain("Before starting another image_generation call, compare the attached image against the user's requested changes.");
+		expect(text).toContain("Only generate again when the attached image materially fails the request or the user asks for another revision.");
 		expect(images).toEqual([{ type: "image", data: ONE_BY_ONE_PNG, mimeType: "image/png" }]);
 		expect(JSON.stringify(message.details)).not.toContain(ONE_BY_ONE_PNG);
 	});

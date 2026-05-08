@@ -265,9 +265,12 @@ function buildImageContextContent(savedResults: SavedProviderImageResult[], summ
 			type: "text",
 			text: [
 				summary,
+				"This provider-native image_generation call is complete.",
 				`The generated ${savedResults.length === 1 ? "image is" : "images are"} attached to this message.`,
 				...pathLines,
-				"If the user asks to edit, redraw, revise, or continue from this generation, use the attached image content as the visual reference instead of creating an unrelated new image.",
+				"Before starting another image_generation call, compare the attached image against the user's requested changes.",
+				"Only generate again when the attached image materially fails the request or the user asks for another revision.",
+				"When editing, redrawing, revising, or continuing from this generation, use the attached image content as the visual reference instead of creating an unrelated new image.",
 			].join("\n"),
 		},
 		...savedResults.map(({ result, saved }) => imageContent(result, saved)),

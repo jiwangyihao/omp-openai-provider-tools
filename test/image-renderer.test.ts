@@ -318,7 +318,7 @@ describe("provider image renderer", () => {
 		expect(lines[imageLineIndex + 2]).not.toBe("\t");
 	});
 
-	it("keeps real image protocol lines last and removes the runtime spacer before them", async () => {
+	it("keeps the runtime image position stable across fold state changes", async () => {
 		const message = await makeImageMessage();
 
 		const folded = renderMessage(false, message, {
@@ -330,9 +330,12 @@ describe("provider image renderer", () => {
 		const foldedImageLineIndex = foldedLines.findIndex(line => line.includes("FAKE_SIXEL_IMAGE"));
 
 		expect(folded).toContain("[(Ctrl+O for more)]");
+		const foldedLabelIndex = foldedLines.findIndex(line => line.includes("[openai-provider-image-generation]"));
+		expect(foldedLabelIndex).toBeGreaterThanOrEqual(0);
+		expect(foldedLines[foldedLabelIndex + 1]).toContain("Ctrl+O for more");
+		expect(foldedLines[foldedLabelIndex + 2]).toContain("BG(customMessageBg:");
 		expect(foldedImageLineIndex).toBe(foldedLines.length - 1);
 		expect(foldedLines[foldedImageLineIndex]).toBe("\x1b[2A\x1bPqFAKE_SIXEL_IMAGE");
-		expect(foldedLines.slice(0, foldedImageLineIndex).filter(line => line.trim() === "BG(customMessageBg:)" || line.includes("                                                                                                ")).length).toBeLessThan(4);
 
 		const expanded = renderMessage(true, message, {
 			pi: {
@@ -344,7 +347,9 @@ describe("provider image renderer", () => {
 
 		expect(expanded).toContain("OpenAI provider generated 1 image.");
 		expect(expanded).toContain("SHA-256: abc123");
-		expect(expandedImageLineIndex).toBe(expandedLines.length - 1);
+		expect(expandedImageLineIndex).toBe(foldedImageLineIndex);
+		expect(expandedLines[expandedImageLineIndex]).toBe("\x1b[2A\x1bPqFAKE_SIXEL_IMAGE");
+		expect(expandedLines.findIndex(line => line.includes("SHA-256: abc123"))).toBeGreaterThan(expandedImageLineIndex);
 	});
 
 	it("preserves placeholder rows for each runtime image protocol block", async () => {
