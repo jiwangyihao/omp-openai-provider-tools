@@ -184,10 +184,10 @@ function renderProviderImageMessage(
 	}
 
 	const box = new Tui.Box(1, 1, value => background(theme, "customMessageBg", value));
+	const label = color(theme, "customMessageLabel", bold(theme, `[${messageCustomType(message)}]`));
+	box.addChild(new Tui.Text(label, 0, 0));
+	box.addChild(new Tui.Spacer(1));
 	if (options.expanded) {
-		const label = color(theme, "customMessageLabel", bold(theme, `[${messageCustomType(message)}]`));
-		box.addChild(new Tui.Text(label, 0, 0));
-		box.addChild(new Tui.Spacer(1));
 		box.addChild(new Tui.Text(color(theme, "customMessageText", text || "OpenAI provider image_generation result"), 0, 0));
 	}
 
@@ -219,11 +219,11 @@ function runtimeImageBox(
 	return {
 		render(width: number): string[] {
 			const lines: string[] = [];
+			const label = color(theme, "customMessageLabel", bold(theme, `[${customType}]`));
+			lines.push(backgroundLine(theme, "", width));
+			lines.push(backgroundLine(theme, label, width));
+			lines.push(backgroundLine(theme, "", width));
 			if (expanded) {
-				const label = color(theme, "customMessageLabel", bold(theme, `[${customType}]`));
-				lines.push(backgroundLine(theme, "", width));
-				lines.push(backgroundLine(theme, label, width));
-				lines.push(backgroundLine(theme, "", width));
 				for (const line of color(theme, "customMessageText", text).split("\n")) {
 					lines.push(backgroundLine(theme, line, width));
 				}
@@ -252,7 +252,11 @@ function runtimeImageBox(
 }
 
 function backgroundRuntimeImageLines(theme: unknown, imageLines: string[], width: number): string[] {
-	return imageLines.map(line => line.length === 0 ? backgroundLine(theme, "", width) : line);
+	return imageLines.map(line => isBlankRenderLine(line) ? backgroundLine(theme, "", width) : line);
+}
+
+function isBlankRenderLine(line: string): boolean {
+	return line.replace(/\x1b\[[0-?]*[ -/]*[@-~]/gu, "").trim().length === 0;
 }
 
 function buildRuntimeImagePreview(runtimePi: RuntimePiLike | undefined, images: ProviderImageDetail[]): ComponentLike | undefined {

@@ -102,6 +102,12 @@ class FakeRuntimeAssistantMessageWithImageRows extends FakeRuntimeAssistantMessa
 	}
 }
 
+class FakeRuntimeAssistantMessageWithTrailingBlankRows extends FakeRuntimeAssistantMessage {
+	render(): string[] {
+		return super.render().flatMap(line => [line, "   ", "\t"]);
+	}
+}
+
 
 const fakeTui = {
 	Container: FakeContainer,
@@ -202,6 +208,7 @@ describe("provider image renderer", () => {
 
 		expect(folded).toContain("[Image: provider-result.png [image/png]");
 		expect(folded).toContain("[(Ctrl+O for more)]");
+		expect(folded).toContain("FG(customMessageLabel:BOLD([openai-provider-image-generation]))");
 		expect(folded).not.toContain("OpenAI provider generated 1 image.");
 		expect(folded).not.toContain(imagePath);
 		expect(folded).not.toContain("SHA-256:");
@@ -239,6 +246,7 @@ describe("provider image renderer", () => {
 		expect(folded).toContain("RUNTIME_IMAGE:image/png:iVBORw0KGgoA");
 		expect(folded).not.toContain("[Image: provider-result.png [image/png]");
 		expect(folded).toContain("[(Ctrl+O for more)]");
+		expect(folded).toContain("FG(customMessageLabel:BOLD([openai-provider-image-generation]))");
 		expect(folded).not.toContain("OpenAI provider generated 1 image.");
 		const expanded = renderMessage(true, message, {
 			pi: {
@@ -272,6 +280,25 @@ describe("provider image renderer", () => {
 		expect(lines.some(line => line === "")).toBe(false);
 		expect(lines[imageLineIndex - 1]).toContain("BG(customMessageBg:");
 		expect(lines.at(-1)).toContain("BG(customMessageBg:");
+	});
+
+	it("background-fills trailing runtime blank rows under the image", async () => {
+		const message = await makeImageMessage();
+
+		const folded = renderMessage(false, message, {
+			pi: {
+				AssistantMessageComponent: FakeRuntimeAssistantMessageWithTrailingBlankRows,
+			},
+		});
+		const lines = folded.split("\n");
+		const imageLineIndex = lines.findIndex(line => line.includes("RUNTIME_IMAGE:image/png:iVBORw0KGgoA"));
+
+		expect(imageLineIndex).toBeGreaterThan(0);
+		expect(lines[imageLineIndex]).toBe("RUNTIME_IMAGE:image/png:iVBORw0KGgoA");
+		expect(lines[imageLineIndex + 1]).toContain("BG(customMessageBg:");
+		expect(lines[imageLineIndex + 2]).toContain("BG(customMessageBg:");
+		expect(lines[imageLineIndex + 1]).not.toBe("   ");
+		expect(lines[imageLineIndex + 2]).not.toBe("\t");
 	});
 
 	it("prefers the runtime-matching pi-tui cache module before stale cached versions", async () => {
