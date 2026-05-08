@@ -336,7 +336,7 @@ function logImageSaveFailure(api: ExtensionApiLike, ctx: ExtensionContextLike, e
 }
 
 async function sendVisibleImageMessage(api: ExtensionApiLike, message: unknown): Promise<void> {
-	await api.sendMessage?.(message, { deliverAs: "followUp" });
+	await api.sendMessage?.(message, { deliverAs: "nextTurn", triggerTurn: true });
 }
 
 function handleImageResults({
@@ -439,7 +439,7 @@ function handleMessageEndImageResults({
 }
 
 async function sendVisibleProviderToolResultMessage(api: ExtensionApiLike, message: unknown): Promise<void> {
-	await api.sendMessage?.(message, { deliverAs: "nextTurn" });
+	await api.sendMessage?.(message, { deliverAs: "nextTurn", triggerTurn: true });
 }
 
 function handleProviderToolResults({

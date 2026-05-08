@@ -516,7 +516,7 @@ describe("OpenAI provider tools extension", () => {
 		getHandler(extension, "message_end")({ type: "message_end", message: webSearchMessage() }, ctx);
 
 		expect(extension.sentMessages).toHaveLength(1);
-		expect(extension.sentMessages[0]?.options).toEqual({ deliverAs: "nextTurn" });
+		expect(extension.sentMessages[0]?.options).toEqual({ deliverAs: "nextTurn", triggerTurn: true });
 		const message = extension.sentMessages[0]?.message as any;
 		expect(message.display).toBe(true);
 		expect(message.customType).toBe("openai-provider-tool-result");
@@ -561,7 +561,7 @@ describe("OpenAI provider tools extension", () => {
 		expect(files).toHaveLength(1);
 		expect(files[0]?.endsWith(".png")).toBe(true);
 		expect(extension.sentMessages).toHaveLength(1);
-		expect(extension.sentMessages[0]?.options).toEqual({ deliverAs: "followUp" });
+		expect(extension.sentMessages[0]?.options).toEqual({ deliverAs: "nextTurn", triggerTurn: true });
 		const message = extension.sentMessages[0]?.message as any;
 		expect(message.display).toBe(true);
 		expect(message.customType).toBe("openai-provider-image-generation");
