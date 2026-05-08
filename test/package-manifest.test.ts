@@ -40,6 +40,11 @@ describe("package manifest", () => {
 		});
 	});
 
+	it("does not document Sys-suffixed route ids in README examples", () => {
+		const readme = readFileSync(readmePath, "utf8");
+		expect(readme).not.toContain("-Sys");
+	});
+
 	it("is discoverable as a Pi package and publishes runtime files", () => {
 		expect(packageJson.keywords).toContain("pi-package");
 		expect(packageJson.files).toEqual(["src", "README.md", "docs/runtime-compatibility.md"]);

@@ -176,8 +176,8 @@ providers:
 providers:
   openai:
     models:
-      - id: gpt-5.5-Sys
-        name: GPT-5.5 Image (Sys)
+      - id: image-capable-model
+        name: Image-capable model
         api: openai-responses
         compat:
           openaiProviderTools:
@@ -204,8 +204,8 @@ providers:
 providers:
   compatible-example:
     models:
-      - id: gpt-5.5-Sys
-        name: GPT-5.5 Image (Sys)
+      - id: gateway-image-model
+        name: Gateway image model
         api: openai-responses
         compat:
           openaiProviderTools:
