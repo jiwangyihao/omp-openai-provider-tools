@@ -183,7 +183,7 @@ describe("image result keys and messages", () => {
 		expect(withoutId).not.toContain(ONE_BY_ONE_PNG);
 	});
 
-	it("builds a visible custom message with path, bytes, mime, details, and no base64 content", () => {
+	it("builds a concise visible custom message with path details and no base64 content", () => {
 		const message = buildImageMessage(
 			imageResult({ revisedPrompt: "A tiny PNG.", size: "1024x1024", quality: "high" }),
 			{ path: "C:/tmp/provider-image.png", bytes: 68, mimeType: "image/png", sha256: "abc123", reusedExisting: false },
@@ -194,20 +194,26 @@ describe("image result keys and messages", () => {
 			display: true,
 			attribution: "agent",
 			details: {
-				id: "ig_1",
 				path: "C:/tmp/provider-image.png",
-				bytes: 68,
 				mimeType: "image/png",
-				outputFormat: "png",
-				size: "1024x1024",
-				quality: "high",
-				reusedExisting: false,
+				images: [
+					{
+						id: "ig_1",
+						path: "C:/tmp/provider-image.png",
+						bytes: 68,
+						mimeType: "image/png",
+						outputFormat: "png",
+						size: "1024x1024",
+						quality: "high",
+						reusedExisting: false,
+					},
+				],
 			},
 		});
 		expect(message.content).toContain("C:/tmp/provider-image.png");
-		expect(message.content).toContain("68 bytes");
-		expect(message.content).toContain("image/png");
-		expect(message.content).toContain("A tiny PNG.");
+		expect(message.content).not.toContain("68 bytes");
+		expect(message.content).not.toContain("image/png");
+		expect(message.content).not.toContain("A tiny PNG.");
 		expect(message.content).not.toContain(ONE_BY_ONE_PNG);
 		expect(JSON.stringify(message.details)).not.toContain(ONE_BY_ONE_PNG);
 	});

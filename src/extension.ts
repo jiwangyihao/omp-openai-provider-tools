@@ -5,18 +5,20 @@ import { enabledProviderToolsToHostTools, normalizeActiveToolNames, removeHostSi
 import { buildRequestTarget, type RequestTarget } from "./match";
 import { getEnabledProviderToolTypes, injectConfiguredTools } from "./request-injection";
 import {
-	buildImageErrorMessage,
-	buildImageMessage,
+	buildImageErrorSummaryMessage,
+	buildImageSummaryMessage,
 	extractImageGenerationResults,
 	imageResultKey,
 	saveImageResultSync,
 	type ProviderImageGenerationResult,
 } from "./image-results";
+import { registerProviderImageRenderer } from "./image-renderer";
 import {
-	buildProviderToolResultMessage,
+	buildProviderToolResultSummaryMessage,
 	extractDisplayableProviderToolResults,
 	providerToolResultKey,
 } from "./provider-results";
+import { installOpenAIResponsesImageInterruption, registerInterruptibleImageGenerationRequest, clearInterruptibleImageGenerationRequests } from "./stream-interruption";
 import type { ExtensionApiLike, ExtensionContextLike, ProviderToolType, ProviderToolsEntry, RuntimeModelLike } from "./types";
 
 interface ProviderRequestEventLike {
@@ -131,6 +133,13 @@ function isEnabledFlag(value: unknown): boolean {
 function modelAllowsProviderImageGeneration(model: RuntimeModelLike | undefined): boolean {
 	const metadata = openAIProviderToolsMetadata(model);
 	return isEnabledFlag(metadata?.imageGeneration);
+}
+
+function modelInterruptsProviderImageGeneration(model: RuntimeModelLike | undefined): boolean {
+	const metadata = openAIProviderToolsMetadata(model);
+	if (isEnabledFlag(metadata?.interruptOnImageResult)) return true;
+	const experimental = isRecord(metadata?.experimental) ? metadata.experimental : undefined;
+	return isEnabledFlag(experimental?.interruptImageStreamOnResult);
 }
 
 function providerEntryFromModel(model: RuntimeModelLike | undefined): ProviderToolsEntry | undefined {
@@ -364,6 +373,8 @@ function handleImageResults({
 		agentImageDirectory: agentImageDirectory(ctx, api),
 	};
 
+	const savedResults: Array<{ result: ProviderImageGenerationResult; saved: ReturnType<typeof saveImageResultSync> }> = [];
+	const failedResults: Array<{ result: ProviderImageGenerationResult; error: unknown }> = [];
 	for (const result of results) {
 		let key: string | undefined;
 		try {
@@ -375,7 +386,7 @@ function handleImageResults({
 			const saved = saveImageResultSync(result, locations);
 			seen.add(key);
 			state.pendingRetries.delete(key);
-			consumePromiseLater(api, ctx, sendVisibleImageMessage(api, buildImageMessage(result, saved)), "OpenAI provider image message delivery failed");
+			savedResults.push({ result, saved });
 		} catch (error) {
 			if (key && retainFailures) {
 				state.pendingRetries.set(key, result);
@@ -383,8 +394,14 @@ function handleImageResults({
 				state.pendingRetries.delete(key);
 			}
 			logImageSaveFailure(api, ctx, error);
-			consumePromiseLater(api, ctx, sendVisibleImageMessage(api, buildImageErrorMessage(result, error)), "OpenAI provider image error message delivery failed");
+			failedResults.push({ result, error });
 		}
+	}
+	if (failedResults.length > 0) {
+		consumePromiseLater(api, ctx, sendVisibleImageMessage(api, buildImageErrorSummaryMessage(failedResults)), "OpenAI provider image error message delivery failed");
+	}
+	if (savedResults.length > 0) {
+		consumePromiseLater(api, ctx, sendVisibleImageMessage(api, buildImageSummaryMessage(savedResults)), "OpenAI provider image message delivery failed");
 	}
 }
 
@@ -457,11 +474,15 @@ function handleProviderToolResults({
 }): void {
 	if (results.length === 0) return;
 	const sessionId = runtimeSessionId(ctx, api, state);
+	const newResults: ReturnType<typeof extractDisplayableProviderToolResults> = [];
 	for (const result of results) {
 		const key = providerToolResultKey(sessionId, result);
 		if (seen.has(key)) continue;
 		seen.add(key);
-		consumePromiseLater(api, ctx, sendVisibleProviderToolResultMessage(api, buildProviderToolResultMessage(result)), "OpenAI provider tool result message delivery failed");
+		newResults.push(result);
+	}
+	if (newResults.length > 0) {
+		consumePromiseLater(api, ctx, sendVisibleProviderToolResultMessage(api, buildProviderToolResultSummaryMessage(newResults)), "OpenAI provider tool result message delivery failed");
 	}
 }
 
@@ -582,6 +603,8 @@ function requestPayload(event: unknown): unknown {
 
 export default function openAIProviderToolsExtension(api: ExtensionApiLike): void {
 	api.setLabel?.("OpenAI Provider Tools");
+	registerProviderImageRenderer(api);
+	installOpenAIResponsesImageInterruption();
 
 	const expectedByTarget = new Map<string, ExpectedToolsState>();
 	const incompatibleTargets = new Set<string>();
@@ -598,6 +621,7 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 		imageResultState.sessionId = undefined;
 		imageResultState.artifactDirectory = undefined;
 		imageResultState.pendingRetries.clear();
+		clearInterruptibleImageGenerationRequests();
 		await preloadImageRuntimeState(imageResultState, ctx);
 	});
 
@@ -811,6 +835,9 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 			return undefined;
 		}
 
+		if (result.ensured.includes("image_generation") && modelInterruptsProviderImageGeneration(eligibilityModel)) {
+			registerInterruptibleImageGenerationRequest(payload);
+		}
 		expectedByTarget.delete(key);
 		return undefined;
 	});

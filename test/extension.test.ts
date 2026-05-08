@@ -57,6 +57,19 @@ const providerToolsImageModel = {
 	},
 };
 
+const providerToolsInterruptImageModel = {
+	...customProviderModel,
+	compat: {
+		openaiProviderTools: {
+			enabled: true,
+			imageGeneration: true,
+			experimental: {
+				interruptImageStreamOnResult: true,
+			},
+		},
+	},
+};
+
 afterEach(async () => {
 	for (const dir of tempDirs.splice(0)) {
 		await fs.rm(dir, { recursive: true, force: true });
@@ -108,6 +121,7 @@ function registerExtension({
 	const handlers = new Map<string, Handler[]>();
 	const warnings: unknown[][] = [];
 	const sentMessages: Array<{ message: unknown; options: unknown }> = [];
+	const renderers = new Map<string, Function>();
 	let activeTools = initialActiveTools;
 	let label: string | undefined;
 	const api: any = {
@@ -148,9 +162,12 @@ function registerExtension({
 				},
 			}
 			: {}),
+		registerMessageRenderer(customType: string, renderer: Function) {
+			renderers.set(customType, renderer);
+		},
 	};
 	providerToolsExtension(api);
-	return { activeTools: () => activeTools, handlers, label: () => label, sentMessages, warnings };
+	return { activeTools: () => activeTools, handlers, label: () => label, sentMessages, warnings, renderers };
 }
 
 function getHandler(extension: ReturnType<typeof registerExtension>, name: string): Handler {
@@ -195,6 +212,14 @@ function imageGenerationMessage(id = "img-1", result = ONE_BY_ONE_PNG) {
 			],
 		},
 	};
+}
+
+function sseEvent(event: Record<string, unknown>): string {
+	return `data: ${JSON.stringify(event)}\n\n`;
+}
+
+async function responseText(response: Response): Promise<string> {
+	return await response.text();
 }
 
 function webSearchMessage() {
@@ -960,6 +985,167 @@ describe("OpenAI provider tools extension", () => {
 		expect(message.display).toBe(true);
 		expect(message.content).toContain("could not be saved");
 		expect(message.content).not.toContain(ONE_BY_ONE_PNG);
+	});
+
+	it("shortens and combines image_generation result display while preserving saved metadata", async () => {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		const artifactsDir = path.join(cwd, "artifacts");
+		const extension = registerExtension();
+		const ctx = context(cwd, homeDir, {
+			sessionManager: {
+				getSessionId: () => "session-1",
+				getArtifactsDir: () => artifactsDir,
+			},
+		});
+
+		await runAgentEnd(extension, { messages: [imageGenerationMessage("img-1"), imageGenerationMessage("img-2")] }, ctx);
+
+		expect(extension.sentMessages).toHaveLength(1);
+		const message = extension.sentMessages[0]?.message as any;
+		expect(message.content).toContain("saved 2 image_generation results");
+		expect(message.content).toContain("Images:");
+		expect(message.content).not.toContain("MIME:");
+		expect(message.content).not.toContain("Bytes:");
+		expect(message.details.images).toHaveLength(2);
+	});
+
+	it("combines provider-native web_search echoes into one short end-of-turn summary", async () => {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		const extension = registerExtension();
+		const message = webSearchMessage() as any;
+		message.providerPayload.items.unshift({
+			type: "web_search_call",
+			id: "ws-2",
+			status: "completed",
+			action: { type: "search", query: "provider native image_generation" },
+		});
+		const ctx = context(cwd, homeDir, {
+			sessionManager: {
+				getSessionId: () => "session-1",
+			},
+		});
+
+		getHandler(extension, "message_end")({ type: "message_end", message }, ctx);
+
+		expect(extension.sentMessages).toHaveLength(1);
+		const sent = extension.sentMessages[0]?.message as any;
+		expect(sent.content).toContain("completed web_search (2 calls)");
+		expect(sent.content).toContain("Queries: provider native image_generation; latest OMP provider tools");
+		expect(sent.content).not.toContain("Call:");
+		expect(sent.content).not.toContain("Status:");
+		expect(sent.details.results).toHaveLength(2);
+	});
+
+	it("interrupts opt-in OpenAI Responses streams after an image_generation result event", async () => {
+		const originalFetch = globalThis.fetch;
+		try {
+			const imageEvent = sseEvent({
+				type: "response.output_item.done",
+				item: { type: "image_generation_call", id: "ig-1", result: ONE_BY_ONE_PNG, output_format: "png" },
+			});
+			globalThis.fetch = (async () => new Response(
+				sseEvent({ type: "response.created", response: { id: "resp-1" } }) +
+				imageEvent +
+				sseEvent({ type: "response.output_text.delta", delta: "SHOULD_NOT_PASS" }),
+				{ headers: { "content-type": "text/event-stream" } },
+			)) as typeof fetch;
+			const cwd = await makeTempDir();
+			const homeDir = await makeTempDir();
+			const extension = registerExtension({ initialActiveTools: ["read"] });
+			const ctx = context(cwd, homeDir, { model: providerToolsInterruptImageModel });
+			const payload: Record<string, unknown> = { model: "gpt-5", input: "hello", stream: true };
+
+			await runBeforeProvider(extension, payload, ctx, { requestModel: providerToolsInterruptImageModel });
+			const response = await fetch("https://gateway.example.invalid/v1/responses", {
+				method: "POST",
+				body: JSON.stringify(payload),
+			});
+
+			const text = await responseText(response);
+			expect(text).toContain(imageEvent);
+			expect(text).toContain("data: [DONE]");
+			expect(text).not.toContain("SHOULD_NOT_PASS");
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	it("interrupts each registered image_generation request when identical payloads are retried", async () => {
+		const originalFetch = globalThis.fetch;
+		try {
+			globalThis.fetch = (async () => new Response(
+				sseEvent({
+					type: "response.output_item.done",
+					item: { type: "image_generation_call", id: "ig-1", result: ONE_BY_ONE_PNG, output_format: "png" },
+				}) +
+				sseEvent({ type: "response.output_text.delta", delta: "SHOULD_NOT_PASS" }),
+				{ headers: { "content-type": "text/event-stream" } },
+			)) as typeof fetch;
+			const cwd = await makeTempDir();
+			const homeDir = await makeTempDir();
+			const extension = registerExtension({ initialActiveTools: ["read"] });
+			const ctx = context(cwd, homeDir, { model: providerToolsInterruptImageModel });
+			const payload: Record<string, unknown> = { model: "gpt-5", input: "hello", stream: true };
+
+			await runBeforeProvider(extension, payload, ctx, { requestModel: providerToolsInterruptImageModel });
+			await runBeforeProvider(extension, payload, ctx, { requestModel: providerToolsInterruptImageModel });
+
+			const first = await responseText(await fetch("https://gateway.example.invalid/v1/responses", {
+				method: "POST",
+				body: JSON.stringify(payload),
+			}));
+			const second = await responseText(await fetch("https://gateway.example.invalid/v1/responses", {
+				method: "POST",
+				body: JSON.stringify(payload),
+			}));
+
+			expect(first).toContain("data: [DONE]");
+			expect(first).not.toContain("SHOULD_NOT_PASS");
+			expect(second).toContain("data: [DONE]");
+			expect(second).not.toContain("SHOULD_NOT_PASS");
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	it("does not interrupt image_generation streams without explicit experimental opt-in", async () => {
+		const originalFetch = globalThis.fetch;
+		try {
+			globalThis.fetch = (async () => new Response(
+				sseEvent({
+					type: "response.output_item.done",
+					item: { type: "image_generation_call", id: "ig-1", result: ONE_BY_ONE_PNG, output_format: "png" },
+				}) +
+				sseEvent({ type: "response.output_text.delta", delta: "SHOULD_PASS" }),
+				{ headers: { "content-type": "text/event-stream" } },
+			)) as typeof fetch;
+			const cwd = await makeTempDir();
+			const homeDir = await makeTempDir();
+			const extension = registerExtension({ initialActiveTools: ["read"] });
+			const ctx = context(cwd, homeDir, { model: providerToolsImageModel });
+			const payload: Record<string, unknown> = { model: "gpt-5", input: "hello", stream: true };
+
+			await runBeforeProvider(extension, payload, ctx, { requestModel: providerToolsImageModel });
+			const response = await fetch("https://gateway.example.invalid/v1/responses", {
+				method: "POST",
+				body: JSON.stringify(payload),
+			});
+
+			const text = await responseText(response);
+			expect(text).toContain("SHOULD_PASS");
+			expect(text).not.toContain("data: [DONE]");
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	it("registers a folded image renderer for provider image messages", () => {
+		const extension = registerExtension();
+
+		const renderer = extension.renderers.get("openai-provider-image-generation");
+		expect(renderer).toBeDefined();
 	});
 
 	it("logs image save failures when visible messaging is unavailable", async () => {

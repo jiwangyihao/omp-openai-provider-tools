@@ -18,6 +18,11 @@ export interface RuntimeModelLike {
 			webSearch?: unknown;
 			imageGeneration?: unknown;
 			outputDirectory?: unknown;
+			interruptOnImageResult?: unknown;
+			experimental?: {
+				interruptImageStreamOnResult?: unknown;
+				[key: string]: unknown;
+			};
 			[key: string]: unknown;
 		};
 		[key: string]: unknown;
@@ -61,6 +66,7 @@ export interface ExtensionApiLike {
 	getActiveTools?: () => RuntimeActiveTool[] | Promise<RuntimeActiveTool[]>;
 	setActiveTools?: (tools: RuntimeActiveTool[]) => void | Promise<void>;
 	sendMessage?: (message: unknown, options?: unknown) => void | Promise<void>;
+	registerMessageRenderer?: (customType: string, renderer: (message: unknown, options: { expanded: boolean }, theme: unknown) => unknown) => void;
 }
 
 export type ExtensionApiEventRegistrar = NonNullable<ExtensionApiLike["on"]>;

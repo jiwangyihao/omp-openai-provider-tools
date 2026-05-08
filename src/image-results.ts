@@ -29,6 +29,16 @@ export interface SavedImageResult {
 	reusedExisting: boolean;
 }
 
+export interface SavedProviderImageResult {
+	result: ProviderImageGenerationResult;
+	saved: SavedImageResult;
+}
+
+export interface FailedProviderImageResult {
+	result: ProviderImageGenerationResult;
+	error: unknown;
+}
+
 export interface ProviderImageMessage {
 	customType: typeof PROVIDER_IMAGE_MESSAGE_TYPE;
 	display: true;
@@ -166,17 +176,20 @@ export function saveImageResultSync(
 }
 
 export function buildImageMessage(result: ProviderImageGenerationResult, saved: SavedImageResult): ProviderImageMessage {
+	return buildImageSummaryMessage([{ result, saved }]);
+}
+
+export function buildImageSummaryMessage(savedResults: SavedProviderImageResult[]): ProviderImageMessage {
+	const images = savedResults.map(({ result, saved }) => imageDetails(result, saved));
 	const lines = [
-		"OpenAI provider image generation saved an image.",
-		`Path: ${saved.path}`,
-		`MIME: ${saved.mimeType}`,
-		`Bytes: ${saved.bytes} bytes`,
+		`OpenAI provider saved ${images.length === 1 ? "1 image_generation result" : `${images.length} image_generation results`}.`,
 	];
-	if (result.outputFormat) lines.push(`Output format: ${result.outputFormat}`);
-	if (result.size) lines.push(`Size: ${result.size}`);
-	if (result.quality) lines.push(`Quality: ${result.quality}`);
-	if (result.revisedPrompt) lines.push(`Revised prompt: ${result.revisedPrompt}`);
-	if (saved.reusedExisting) lines.push("Reused existing file: true");
+	if (images.length === 1) {
+		lines.push(`Image: ${images[0]?.path ?? "unknown"}`);
+	} else {
+		lines.push("Images:");
+		for (const image of images) lines.push(`- ${image.path}`);
+	}
 
 	return {
 		customType: PROVIDER_IMAGE_MESSAGE_TYPE,
@@ -184,36 +197,55 @@ export function buildImageMessage(result: ProviderImageGenerationResult, saved: 
 		attribution: "agent",
 		content: lines.join("\n"),
 		details: withoutUndefined({
-			id: result.id,
-			path: saved.path,
-			bytes: saved.bytes,
-			mimeType: saved.mimeType,
-			outputFormat: result.outputFormat,
-			size: result.size,
-			quality: result.quality,
-			revisedPrompt: result.revisedPrompt,
-			sha256: saved.sha256,
-			reusedExisting: saved.reusedExisting,
+			path: images[0]?.path,
+			mimeType: images[0]?.mimeType,
+			images,
 		}),
 	};
 }
 
 export function buildImageErrorMessage(result: ProviderImageGenerationResult, error: unknown): ProviderImageMessage {
-	const message = error instanceof Error ? error.message : String(error);
-	return {
-		customType: PROVIDER_IMAGE_MESSAGE_TYPE,
-		display: true,
-		attribution: "agent",
-		content: `OpenAI provider image generation returned an image result, but it could not be saved: ${message}`,
-		details: withoutUndefined({
+	return buildImageErrorSummaryMessage([{ result, error }]);
+}
+
+export function buildImageErrorSummaryMessage(failedResults: FailedProviderImageResult[]): ProviderImageMessage {
+	const failures = failedResults.map(({ result, error }) => {
+		const message = error instanceof Error ? error.message : String(error);
+		return withoutUndefined({
 			id: result.id,
 			mimeType: result.mimeType,
 			outputFormat: result.outputFormat,
 			size: result.size,
 			quality: result.quality,
 			error: message,
-		}),
+		});
+	});
+	const lines = [
+		`OpenAI provider returned ${failures.length === 1 ? "an image_generation result" : `${failures.length} image_generation results`}, but ${failures.length === 1 ? "it" : "they"} could not be saved.`,
+	];
+	for (const failure of failures) lines.push(`Error: ${failure.error}`);
+	return {
+		customType: PROVIDER_IMAGE_MESSAGE_TYPE,
+		display: true,
+		attribution: "agent",
+		content: lines.join("\n"),
+		details: { failures },
 	};
+}
+
+function imageDetails(result: ProviderImageGenerationResult, saved: SavedImageResult): Record<string, unknown> {
+	return withoutUndefined({
+		id: result.id,
+		path: saved.path,
+		bytes: saved.bytes,
+		mimeType: saved.mimeType,
+		outputFormat: result.outputFormat,
+		size: result.size,
+		quality: result.quality,
+		revisedPrompt: result.revisedPrompt,
+		sha256: saved.sha256,
+		reusedExisting: saved.reusedExisting,
+	});
 }
 
 function decodeImageResult(result: Pick<ProviderImageGenerationResult, "result" | "mimeType" | "outputFormat">): {

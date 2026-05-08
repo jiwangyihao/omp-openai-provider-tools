@@ -150,14 +150,17 @@ function appendReferences(lines: string[], label: string, references: ProviderUr
 }
 
 export function buildProviderToolResultMessage(result: DisplayableProviderToolResult): ProviderToolResultMessage {
-	const lines = ["OpenAI provider executed web_search."];
-	if (result.id) lines.push(`Call: ${result.id}`);
-	if (result.status) lines.push(`Status: ${result.status}`);
-	if (result.actionType) lines.push(`Action: ${result.actionType}`);
-	if (result.query) lines.push(`Query: ${result.query}`);
-	if (!result.query && result.queries.length > 0) lines.push(`Queries: ${result.queries.join("; ")}`);
-	appendReferences(lines, "Citations", result.citations);
-	appendReferences(lines, "Sources", result.sources);
+	return buildProviderToolResultSummaryMessage([result]);
+}
+
+export function buildProviderToolResultSummaryMessage(results: DisplayableProviderToolResult[]): ProviderToolResultMessage {
+	const queries = uniqueStrings(results.flatMap(result => result.queries.length > 0 ? result.queries : result.query ? [result.query] : []));
+	const citations = uniqueReferences(results.flatMap(result => result.citations));
+	const sources = uniqueReferences(results.flatMap(result => result.sources));
+	const lines = [`OpenAI provider completed web_search (${results.length === 1 ? "1 call" : `${results.length} calls`}).`];
+	if (queries.length > 0) lines.push(`Queries: ${queries.join("; ")}`);
+	appendReferences(lines, "Citations", citations.slice(0, 3));
+	appendReferences(lines, "Sources", sources.slice(0, 3));
 
 	return {
 		customType: PROVIDER_TOOL_RESULT_MESSAGE_TYPE,
@@ -165,16 +168,17 @@ export function buildProviderToolResultMessage(result: DisplayableProviderToolRe
 		attribution: "agent",
 		content: lines.join("\n"),
 		details: withoutUndefined({
-			type: result.type,
-			id: result.id,
-			status: result.status,
-			actionType: result.actionType,
-			query: result.query,
-			queries: result.queries,
-			citations: result.citations,
-			sources: result.sources,
+			type: "web_search",
+			queries,
+			citations,
+			sources,
+			results,
 		}),
 	};
+}
+
+function uniqueStrings(values: string[]): string[] {
+	return [...new Set(values)];
 }
 
 function withoutUndefined(value: Record<string, unknown>): Record<string, unknown> {
