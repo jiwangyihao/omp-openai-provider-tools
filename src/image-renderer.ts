@@ -31,10 +31,25 @@ interface TuiLike {
 	) => ComponentLike;
 }
 
+interface RuntimeImageComponent extends ComponentLike {
+	setToolResultImages?: (toolCallId: string, images: RuntimeImageContent[]) => void;
+}
+
+interface RuntimeImageContent {
+	type: "image";
+	data: string;
+	mimeType: string;
+}
+
+interface RuntimePiLike {
+	VERSION?: string;
+	AssistantMessageComponent?: new (message?: unknown) => RuntimeImageComponent;
+}
+
 interface RendererApiLike {
 	registerMessageRenderer?: (customType: string, renderer: (message: unknown, options: { expanded: boolean }, theme: unknown) => ComponentLike | undefined) => void;
 	logger?: { warn?: (...args: unknown[]) => void };
-	pi?: { VERSION?: string };
+	pi?: RuntimePiLike;
 }
 
 interface ProviderImageDetail {
@@ -57,7 +72,7 @@ export function registerProviderImageRenderer(api: RendererApiLike, tuiOverride?
 	if (!api.registerMessageRenderer) return;
 	if (!tuiOverride) void ensureTuiLoaded(api);
 	api.registerMessageRenderer(PROVIDER_IMAGE_MESSAGE_TYPE, (message, options, theme) =>
-		renderProviderImageMessage(message, options, theme, tuiOverride ?? tuiModule));
+		renderProviderImageMessage(message, options, theme, tuiOverride ?? tuiModule, api.pi));
 }
 
 async function ensureTuiLoaded(api: RendererApiLike): Promise<void> {
@@ -149,18 +164,20 @@ function renderProviderImageMessage(
 	options: { expanded: boolean },
 	theme: unknown,
 	Tui: TuiLike | undefined,
+	runtimePi: RuntimePiLike | undefined,
 ): ComponentLike | undefined {
 	const text = messageContent(message);
 	const images = imageDetails(message);
 	if (!Tui) return undefined;
 
+	const runtimeImagePreview = buildRuntimeImagePreview(runtimePi, images);
 	const box = new Tui.Box(1, 1, value => background(theme, "customMessageBg", value));
 	const label = color(theme, "customMessageLabel", bold(theme, `[${messageCustomType(message)}]`));
 	box.addChild(new Tui.Text(label, 0, 0));
 	box.addChild(new Tui.Spacer(1));
 	box.addChild(new Tui.Text(color(theme, "customMessageText", text || "OpenAI provider image_generation result"), 0, 0));
 
-	if (images.length > 0) {
+	if (images.length > 0 && !runtimeImagePreview) {
 		box.addChild(new Tui.Spacer(1));
 		for (const image of images) addImagePreview(box, Tui, image, theme, options.expanded);
 	}
@@ -173,7 +190,32 @@ function renderProviderImageMessage(
 		}
 	}
 
-	return box;
+	if (!runtimeImagePreview) return box;
+	const container = new Tui.Container();
+	container.addChild(box);
+	container.addChild(runtimeImagePreview);
+	return container;
+}
+
+function buildRuntimeImagePreview(runtimePi: RuntimePiLike | undefined, images: ProviderImageDetail[]): ComponentLike | undefined {
+	const AssistantMessageComponent = runtimePi?.AssistantMessageComponent;
+	if (!AssistantMessageComponent || images.length === 0) return undefined;
+	const imageContents = images.flatMap(image => {
+		try {
+			return [{
+				type: "image" as const,
+				data: fs.readFileSync(image.path).toString("base64"),
+				mimeType: image.mimeType ?? "image/png",
+			}];
+		} catch {
+			return [];
+		}
+	});
+	if (imageContents.length === 0) return undefined;
+	const component = new AssistantMessageComponent({ content: [] });
+	if (typeof component.setToolResultImages !== "function") return undefined;
+	component.setToolResultImages(PROVIDER_IMAGE_MESSAGE_TYPE, imageContents);
+	return component;
 }
 
 function addImagePreview(box: BoxLike, Tui: TuiLike, image: ProviderImageDetail, theme: unknown, expanded: boolean): void {

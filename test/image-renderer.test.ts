@@ -84,6 +84,19 @@ class FakeImage implements FakeComponent {
 	invalidate(): void {}
 }
 
+class FakeRuntimeAssistantMessage implements FakeComponent {
+	private images: Array<{ data: string; mimeType: string }> = [];
+	constructor(private readonly _message?: unknown) {}
+	setToolResultImages(_toolCallId: string, images: Array<{ data: string; mimeType: string }>): void {
+		this.images = images;
+	}
+	render(): string[] {
+		return this.images.map(image => `RUNTIME_IMAGE:${image.mimeType}:${image.data.slice(0, 12)}`);
+	}
+	invalidate(): void {}
+}
+
+
 const fakeTui = {
 	Container: FakeContainer,
 	Box: FakeBox,
@@ -137,13 +150,14 @@ async function makeImageMessage() {
 	};
 }
 
-function renderMessage(expanded: boolean, message: unknown): string {
+function renderMessage(expanded: boolean, message: unknown, apiOverrides: Record<string, unknown> = {}): string {
 	const renderers = new Map<string, Function>();
 	registerProviderImageRenderer({
 		registerMessageRenderer(customType: string, renderer: Function) {
 			renderers.set(customType, renderer);
 		},
 		logger: { warn() {} },
+		...apiOverrides,
 	}, fakeTui);
 	const renderer = renderers.get(PROVIDER_IMAGE_MESSAGE_TYPE);
 	expect(renderer).toBeDefined();
@@ -174,6 +188,20 @@ describe("provider image renderer", () => {
 		expect(expanded).toContain("Bytes: 68");
 		expect(expanded).toContain("SHA-256: abc123");
 		expect(expanded).toContain("Revised prompt: A tiny blue square cat.");
+	});
+
+	it("uses the runtime assistant image renderer when the OMP runtime exports it", async () => {
+		const message = await makeImageMessage();
+
+		const folded = renderMessage(false, message, {
+			pi: {
+				AssistantMessageComponent: FakeRuntimeAssistantMessage,
+			},
+		});
+
+		expect(folded).toContain("BG(customMessageBg:");
+		expect(folded).toContain("RUNTIME_IMAGE:image/png:iVBORw0KGgoA");
+		expect(folded).not.toContain("[Image: provider-result.png [image/png]");
 	});
 
 	it("prefers the runtime-matching pi-tui cache module before stale cached versions", async () => {
