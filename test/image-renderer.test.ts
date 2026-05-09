@@ -84,6 +84,20 @@ class FakeImage implements FakeComponent {
 	invalidate(): void {}
 }
 
+class FakeProtocolImage implements FakeComponent {
+	constructor(
+		private readonly _base64Data: string,
+		private readonly _mimeType: string,
+		private readonly _theme: unknown,
+		private readonly _options?: { filename?: string },
+	) {}
+	render(): string[] {
+		return ["", "", "", "\x1b[2A\x1bPqFAKE_DIRECT_IMAGE"];
+	}
+	invalidate(): void {}
+}
+
+
 class FakeRuntimeAssistantMessage implements FakeComponent {
 	private images: Array<{ data: string; mimeType: string }> = [];
 	constructor(private readonly _message?: unknown) {}
@@ -114,6 +128,12 @@ class FakeRuntimeAssistantMessageWithCursorImage extends FakeRuntimeAssistantMes
 	}
 }
 
+class FakeRuntimeAssistantMessageWithDirtyProtocolRows extends FakeRuntimeAssistantMessage {
+	render(): string[] {
+		return super.render().flatMap(() => ["", "", "", "\x1b[2A\x1bPqFAKE_SIXEL_IMAGE", "   ", "\t"]);
+	}
+}
+
 class FakeRuntimeAssistantMessageWithTwoCursorImages implements FakeComponent {
 	private images: Array<{ data: string; mimeType: string }> = [];
 	constructor(private readonly _message?: unknown) {}
@@ -140,6 +160,14 @@ const fakeTuiWithoutImage = {
 	Box: FakeBox,
 	Text: FakeText,
 	Spacer: FakeSpacer,
+};
+
+const fakeTuiWithProtocolImage = {
+	Container: FakeContainer,
+	Box: FakeBox,
+	Text: FakeText,
+	Spacer: FakeSpacer,
+	Image: FakeProtocolImage,
 };
 
 function testTheme() {
@@ -372,6 +400,81 @@ describe("provider image renderer", () => {
 		expect(lines[secondImageLineIndex - 1]).toContain("BG(customMessageBg:");
 		expect(lines[secondImageLineIndex]).toBe("\x1b[2A\x1bPqFAKE_SIXEL_IMAGE_1");
 		expect(secondImageLineIndex).toBe(lines.length - 1);
+	});
+
+	it("keeps raw protocol lines outside background while background-filling reserved image rows", async () => {
+		const message = await makeImageMessage();
+
+		const folded = renderMessage(false, message, {
+			pi: {
+				AssistantMessageComponent: FakeRuntimeAssistantMessageWithCursorImage,
+			},
+		});
+		const lines = folded.split("\n");
+		const imageLineIndex = lines.findIndex(line => line.includes("FAKE_SIXEL_IMAGE"));
+
+		expect(imageLineIndex).toBeGreaterThan(2);
+		expect(lines[imageLineIndex]).toBe("\x1b[2A\x1bPqFAKE_SIXEL_IMAGE");
+		expect(lines[imageLineIndex]).not.toContain("BG(customMessageBg:");
+		expect(lines[imageLineIndex - 1]).toContain("BG(customMessageBg:");
+		expect(lines[imageLineIndex - 2]).toContain("BG(customMessageBg:");
+		expect(lines[imageLineIndex + 1]).toBeUndefined();
+	});
+
+	it("keeps each multi-image protocol line raw while preserving background gaps", async () => {
+		const message = await makeImageMessage();
+		(message.details as any).images.push({ ...((message.details as any).images[0] as any), id: "ig_456" });
+
+		const folded = renderMessage(false, message, {
+			pi: {
+				AssistantMessageComponent: FakeRuntimeAssistantMessageWithTwoCursorImages,
+			},
+		});
+		const lines = folded.split("\n");
+		const firstImageLineIndex = lines.findIndex(line => line.includes("FAKE_SIXEL_IMAGE_0"));
+		const secondImageLineIndex = lines.findIndex(line => line.includes("FAKE_SIXEL_IMAGE_1"));
+
+		expect(firstImageLineIndex).toBeGreaterThan(2);
+		expect(secondImageLineIndex).toBeGreaterThan(firstImageLineIndex);
+		expect(lines[firstImageLineIndex]).toBe("\x1b[2A\x1bPqFAKE_SIXEL_IMAGE_0");
+		expect(lines[secondImageLineIndex]).toBe("\x1b[2A\x1bPqFAKE_SIXEL_IMAGE_1");
+		expect(lines[firstImageLineIndex]).not.toContain("BG(customMessageBg:");
+		expect(lines[secondImageLineIndex]).not.toContain("BG(customMessageBg:");
+		expect(lines[firstImageLineIndex - 1]).toContain("BG(customMessageBg:");
+		expect(lines[firstImageLineIndex - 2]).toContain("BG(customMessageBg:");
+		expect(lines[secondImageLineIndex - 1]).toContain("BG(customMessageBg:");
+		expect(lines[secondImageLineIndex - 2]).toContain("BG(customMessageBg:");
+	});
+
+	it("removes trailing blank rows after raw protocol output", async () => {
+		const message = await makeImageMessage();
+
+		const folded = renderMessage(false, message, {
+			pi: {
+				AssistantMessageComponent: FakeRuntimeAssistantMessageWithDirtyProtocolRows,
+			},
+		});
+		const lines = folded.split("\n");
+		const imageLineIndex = lines.findIndex(line => line.includes("FAKE_SIXEL_IMAGE"));
+
+		expect(imageLineIndex).toBeGreaterThan(2);
+		expect(lines[imageLineIndex]).toBe("\x1b[2A\x1bPqFAKE_SIXEL_IMAGE");
+		expect(lines[imageLineIndex + 1]).toBeUndefined();
+		expect(lines.some(line => line === "   " || line === "\t")).toBe(false);
+	});
+
+	it("keeps direct Tui.Image protocol output raw while retaining background placeholders", async () => {
+		const message = await makeImageMessage();
+
+		const folded = renderMessage(false, message, {}, fakeTuiWithProtocolImage);
+		const lines = folded.split("\n");
+		const imageLineIndex = lines.findIndex(line => line.includes("FAKE_DIRECT_IMAGE"));
+
+		expect(imageLineIndex).toBeGreaterThan(2);
+		expect(lines[imageLineIndex]).toBe("\x1b[2A\x1bPqFAKE_DIRECT_IMAGE");
+		expect(lines[imageLineIndex]).not.toContain("BG(customMessageBg:");
+		expect(lines[imageLineIndex - 1]).toContain("BG(customMessageBg:");
+		expect(lines[imageLineIndex - 2]).toContain("BG(customMessageBg:");
 	});
 
 	it("prefers the runtime-matching pi-tui cache module before stale cached versions", async () => {

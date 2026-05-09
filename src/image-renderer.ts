@@ -14,13 +14,10 @@ interface ContainerLike extends ComponentLike {
 	addChild(component: ComponentLike): void;
 }
 
-interface BoxLike extends ContainerLike {
-	clear?: () => void;
-}
 
 interface TuiLike {
 	Container: new () => ContainerLike;
-	Box: new (paddingX?: number, paddingY?: number, bgFn?: (text: string) => string) => BoxLike;
+	Box: new (paddingX?: number, paddingY?: number, bgFn?: (text: string) => string) => ContainerLike;
 	Spacer: new (height?: number) => ComponentLike;
 	Text: new (text?: string, paddingX?: number, paddingY?: number, customBgFn?: (text: string) => string) => ComponentLike;
 	Image?: new (
@@ -183,25 +180,15 @@ function renderProviderImageMessage(
 		);
 	}
 
-	const box = new Tui.Box(1, 1, value => background(theme, "customMessageBg", value));
-	const label = color(theme, "customMessageLabel", bold(theme, `[${messageCustomType(message)}]`));
-	box.addChild(new Tui.Text(label, 0, 0));
-	if (!options.expanded && detailLines.length > 0) {
-		box.addChild(new Tui.Text(expandHint(theme), 0, 0));
-	}
-	if (options.expanded) {
-		box.addChild(new Tui.Text(color(theme, "customMessageText", text || "OpenAI provider image_generation result"), 0, 0));
-		if (detailLines.length > 0) {
-			box.addChild(new Tui.Text(color(theme, "customMessageText", detailLines.join("\n")), 0, 0));
-		}
-	}
-
-	if (images.length > 0) {
-		box.addChild(new Tui.Spacer(1));
-		for (const image of images) addImagePreview(box, Tui, image, theme, options.expanded);
-	}
-
-	return box;
+	return directImageBox(
+		theme,
+		messageCustomType(message),
+		text || "OpenAI provider image_generation result",
+		images,
+		detailLines,
+		options.expanded,
+		Tui,
+	);
 }
 
 function runtimeImageBox(
@@ -241,8 +228,58 @@ function runtimeImageBox(
 	};
 }
 
+function directImageBox(
+	theme: unknown,
+	customType: string,
+	text: string,
+	images: ProviderImageDetail[],
+	detailLines: string[],
+	expanded: boolean,
+	Tui: TuiLike,
+): ComponentLike {
+	const imageComponents = images.flatMap(image => {
+		const component = buildImagePreview(Tui, image, theme, expanded);
+		return component ? [component] : [];
+	});
+	return {
+		render(width: number): string[] {
+			const lines: string[] = [];
+			const label = color(theme, "customMessageLabel", bold(theme, `[${customType}]`));
+			lines.push(backgroundLine(theme, "", width));
+			lines.push(backgroundLine(theme, label, width));
+			if (!expanded && detailLines.length > 0) {
+				lines.push(backgroundLine(theme, expandHint(theme), width));
+			}
+			if (expanded) {
+				for (const line of color(theme, "customMessageText", text).split("\n")) {
+					lines.push(backgroundLine(theme, line, width));
+				}
+				if (detailLines.length > 0) {
+					for (const line of color(theme, "customMessageText", detailLines.join("\n")).split("\n")) {
+						lines.push(backgroundLine(theme, line, width));
+					}
+				}
+			}
+			if (imageComponents.length > 0) {
+				lines.push(backgroundLine(theme, "", width));
+				for (const component of imageComponents) {
+					lines.push(...backgroundImageComponentLines(theme, component.render(width), width));
+				}
+			}
+			return lines;
+		},
+		invalidate() {
+			for (const component of imageComponents) component.invalidate();
+		},
+	};
+}
+
 function backgroundRuntimeImageLines(theme: unknown, imageLines: string[], width: number): string[] {
 	return normalizeRuntimeImageLines(imageLines).map(line => isBlankRenderLine(line) ? backgroundLine(theme, "", width) : line);
+}
+
+function backgroundImageComponentLines(theme: unknown, imageLines: string[], width: number): string[] {
+	return normalizeRuntimeImageLines(imageLines).map(line => isImageProtocolLine(line) ? line : backgroundLine(theme, line, width));
 }
 
 function normalizeRuntimeImageLines(imageLines: string[]): string[] {
@@ -309,23 +346,22 @@ function buildRuntimeImagePreview(runtimePi: RuntimePiLike | undefined, images: 
 	return component;
 }
 
-function addImagePreview(box: BoxLike, Tui: TuiLike, image: ProviderImageDetail, theme: unknown, expanded: boolean): void {
-	if (!image.path) return;
+function buildImagePreview(Tui: TuiLike, image: ProviderImageDetail, theme: unknown, expanded: boolean): ComponentLike | undefined {
+	if (!image.path) return undefined;
 	if (!Tui.Image) {
-		box.addChild(new Tui.Text(color(theme, "toolOutput", unavailableImagePreviewText(image.path)), 0, 0));
-		return;
+		return new Tui.Text(color(theme, "toolOutput", unavailableImagePreviewText(image.path)), 0, 0);
 	}
 	try {
 		const base64 = fs.readFileSync(image.path).toString("base64");
-		box.addChild(new Tui.Image(base64, image.mimeType ?? "image/png", {
+		return new Tui.Image(base64, image.mimeType ?? "image/png", {
 			fallbackColor: (value: string) => color(theme, "toolOutput", value),
 		}, {
 			maxWidthCells: expanded ? 96 : 72,
 			maxHeightCells: expanded ? 32 : 20,
 			filename: path.basename(image.path),
-		}));
+		});
 	} catch {
-		box.addChild(new Tui.Text(color(theme, "toolOutput", unavailableImagePreviewText(image.path)), 0, 0));
+		return new Tui.Text(color(theme, "toolOutput", unavailableImagePreviewText(image.path)), 0, 0);
 	}
 }
 
