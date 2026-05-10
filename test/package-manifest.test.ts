@@ -57,7 +57,7 @@ describe("package manifest", () => {
 		expect(existsSync(currentReleaseNotesPath)).toBe(true);
 		const releaseNotes = readFileSync(currentReleaseNotesPath, "utf8");
 		expect(releaseNotes).toContain("- Version: `" + packageJson.version + "`");
-		expect(releaseNotes).toContain("configure-image-agent");
+		expect(releaseNotes).toContain("omp plugin install npm:omp-openai-provider-tools@" + packageJson.version);
 	});
 
 	it("does not document Sys-suffixed route ids in README examples", () => {
@@ -81,6 +81,14 @@ describe("package manifest", () => {
 		expect(readme).toContain("不会在插件安装时自动写入或覆盖用户的 agent 配置");
 		expect(readme).toContain("主动收集项目上下文");
 		expect(readme).toContain("最多主动再生成一次");
+	});
+
+	it("documents provider-native image keepalive behavior", () => {
+		const readme = readFileSync(readmePath, "utf8");
+		expect(readme).toContain("OMP 14.9+");
+		expect(readme).toContain("provider-native image keepalive");
+		expect(readme).toContain("OpenAI responses stream stalled");
+		expect(readme).toContain("does not globally disable runtime timeout protection");
 	});
 
 	it("is discoverable as a Pi package and publishes runtime files", () => {
@@ -109,5 +117,7 @@ describe("package manifest", () => {
 				expect(forbiddenRuntimePackageScopes.some((scope) => packageName.startsWith(scope))).toBe(false);
 			}
 		}
+		const directDependencyNames = new Set(Object.keys((packageJson as any).dependencies ?? {}));
+		expect(directDependencyNames.has("openai")).toBe(false);
 	});
 });

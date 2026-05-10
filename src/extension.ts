@@ -19,7 +19,7 @@ import {
 	providerToolResultKey,
 } from "./provider-results";
 import { registerProviderToolResultRenderer } from "./provider-result-renderer";
-import { installOpenAIResponsesImageInterruption, registerInterruptibleImageGenerationRequest, clearInterruptibleImageGenerationRequests } from "./stream-interruption";
+import { installOpenAIResponsesImageInterruption, registerImageGenerationRequest, clearInterruptibleImageGenerationRequests } from "./stream-interruption";
 import type { ExtensionApiLike, ExtensionContextLike, ProviderToolType, ProviderToolsEntry, RuntimeModelLike } from "./types";
 
 interface ProviderRequestEventLike {
@@ -143,13 +143,26 @@ function modelInterruptsProviderImageGeneration(model: RuntimeModelLike | undefi
 	return isEnabledFlag(experimental?.interruptImageStreamOnResult);
 }
 
+function modelProviderImageGenerationKeepaliveIntervalMs(model: RuntimeModelLike | undefined): number | undefined {
+	const metadata = openAIProviderToolsMetadata(model);
+	const experimental = isRecord(metadata?.experimental) ? metadata.experimental : undefined;
+	const value = metadata?.imageGenerationKeepaliveIntervalMs ?? experimental?.imageGenerationKeepaliveIntervalMs;
+	if (value === undefined) return undefined;
+	const parsed = typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
+	if (!Number.isFinite(parsed)) return undefined;
+	if (parsed <= 0) return 0;
+	return Math.trunc(parsed);
+}
+
 function providerEntryFromModel(model: RuntimeModelLike | undefined): ProviderToolsEntry | undefined {
 	if (!isExplicitOpenAIResponsesModel(model)) return undefined;
 	const metadata = openAIProviderToolsMetadata(model);
-	if (!isOfficialOpenAIResponsesProvider(model) && !isEnabledFlag(metadata?.enabled)) return undefined;
+	if (!isOfficialOpenAIResponsesProvider(model) && !isEnabledFlag(metadata?.enabled) && !modelAllowsProviderImageGeneration(model)) return undefined;
+	const providerEnabled = isEnabledFlag(metadata?.enabled);
+	const officialProvider = isOfficialOpenAIResponsesProvider(model);
 
 	const tools: ProviderToolsEntry["tools"] = {};
-	if (metadata?.webSearch !== false) {
+	if ((officialProvider || providerEnabled || metadata?.webSearch === true) && metadata?.webSearch !== false) {
 		tools.web_search = { enabled: true };
 	}
 	if (modelAllowsProviderImageGeneration(model)) {
@@ -850,8 +863,11 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 			return undefined;
 		}
 
-		if (result.ensured.includes("image_generation") && modelInterruptsProviderImageGeneration(eligibilityModel)) {
-			registerInterruptibleImageGenerationRequest(payload);
+		if (result.ensured.includes("image_generation")) {
+			registerImageGenerationRequest(payload, {
+				interruptOnImageResult: modelInterruptsProviderImageGeneration(eligibilityModel),
+				keepaliveIntervalMs: modelProviderImageGenerationKeepaliveIntervalMs(eligibilityModel),
+			});
 		}
 		expectedByTarget.delete(key);
 		return undefined;

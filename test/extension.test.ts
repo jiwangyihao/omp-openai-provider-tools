@@ -5,6 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import providerToolsExtension from "../src/extension";
+import { tryEnqueueChunk, wrapImageGenerationEventIterable, wrapImageGenerationStream } from "../src/stream-interruption";
 
 type Handler = (event: any, ctx: any) => unknown | Promise<unknown>;
 
@@ -417,6 +418,26 @@ describe("OpenAI provider tools extension", () => {
 		await runBeforeProvider(extension, payload, ctx, { requestModel: providerToolsImageModel });
 
 		expect(payload.tools).toEqual([{ type: "web_search" }, { type: "image_generation" }]);
+	});
+
+	it("injects only image_generation when custom provider model keeps imageGeneration opt-in without provider-level enabled", async () => {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		const extension = registerExtension({ initialActiveTools: ["read"] });
+		const modelLevelImageOnlyModel = {
+			...customProviderModel,
+			compat: {
+				openaiProviderTools: {
+					imageGeneration: true,
+				},
+			},
+		};
+		const ctx = context(cwd, homeDir, { model: modelLevelImageOnlyModel });
+		const payload: Record<string, unknown> = { model: "gpt-5.5-Sys", input: "hello" };
+
+		await runBeforeProvider(extension, payload, ctx, { requestModel: modelLevelImageOnlyModel });
+
+		expect(payload.tools).toEqual([{ type: "image_generation" }]);
 	});
 
 	it("does not inject image_generation for unsupported extraBody image markers", async () => {
@@ -1102,6 +1123,332 @@ describe("OpenAI provider tools extension", () => {
 		expect(sent.details.results).toHaveLength(2);
 	});
 
+
+	it("injects progress keepalives for provider-native image_generation streams before the OMP idle watchdog", async () => {
+		const originalFetch = globalThis.fetch;
+		try {
+			let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+			globalThis.fetch = (async () => new Response(
+				new ReadableStream<Uint8Array>({
+					start(createdController) {
+						controller = createdController;
+					},
+				}),
+				{ headers: { "content-type": "text/event-stream" } },
+			)) as typeof fetch;
+			const cwd = await makeTempDir();
+			const homeDir = await makeTempDir();
+			const extension = registerExtension({ initialActiveTools: ["read"] });
+			const keepaliveImageModel = {
+				...providerToolsImageModel,
+				compat: {
+					openaiProviderTools: {
+						...providerToolsImageModel.compat.openaiProviderTools,
+						imageGenerationKeepaliveIntervalMs: 1,
+					},
+				},
+			};
+			const ctx = context(cwd, homeDir, { model: keepaliveImageModel });
+			const payload: Record<string, unknown> = { model: "gpt-5", input: "hello", stream: true };
+
+			await runBeforeProvider(extension, payload, ctx, { requestModel: keepaliveImageModel });
+			const response = await fetch("https://gateway.example.invalid/v1/responses", {
+				method: "POST",
+				body: JSON.stringify(payload),
+			});
+			const reader = response.body?.getReader();
+			expect(reader).toBeDefined();
+			let timeout: ReturnType<typeof setTimeout> | undefined;
+			const firstRead = await Promise.race([
+				reader!.read().then(result => ({ kind: "read" as const, result })),
+				new Promise<{ kind: "timeout" }>(resolve => {
+					timeout = setTimeout(() => resolve({ kind: "timeout" }), 25);
+				}),
+			]);
+			if (timeout) clearTimeout(timeout);
+			controller?.close();
+			await reader!.cancel().catch(() => undefined);
+
+			expect(firstRead.kind).toBe("read");
+			if (firstRead.kind !== "read") return;
+			expect(firstRead.result.done).toBe(false);
+			const text = new TextDecoder().decode(firstRead.result.value);
+			expect(text).toContain("response.function_call_arguments.delta");
+			expect(text).toContain("openai_provider_tools_keepalive");
+			expect(text).not.toContain("data: [DONE]");
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+	it("emits plugin keepalives even when provider sends only transport keepalives", async () => {
+		let interval: ReturnType<typeof setInterval> | undefined;
+		try {
+			const wrappedBody = wrapImageGenerationStream(
+				new ReadableStream<Uint8Array>({
+					start(controller) {
+						interval = setInterval(() => controller.enqueue(new TextEncoder().encode(":\n\n")), 5);
+					},
+					cancel() {
+						if (interval) clearInterval(interval);
+					},
+				}),
+				{ interruptOnImageResult: false, keepaliveIntervalMs: 20 },
+			);
+			const reader = wrappedBody.getReader();
+			let sawKeepalive = false;
+			const deadline = Date.now() + 90;
+			while (!sawKeepalive && Date.now() < deadline) {
+				let timeout: ReturnType<typeof setTimeout> | undefined;
+				const next = await Promise.race([
+					reader.read().then(result => ({ kind: "read" as const, result })),
+					new Promise<{ kind: "timeout" }>(resolve => {
+						timeout = setTimeout(() => resolve({ kind: "timeout" }), 15);
+					}),
+				]);
+				if (timeout) clearTimeout(timeout);
+				if (next.kind === "read" && !next.result.done) {
+					const text = new TextDecoder().decode(next.result.value);
+					sawKeepalive = text.includes("openai_provider_tools_keepalive");
+				}
+			}
+			await reader.cancel().catch(() => undefined);
+
+			expect(sawKeepalive).toBe(true);
+		} finally {
+			if (interval) clearInterval(interval);
+		}
+	});
+
+	it("treats a closed keepalive stream controller as terminal instead of throwing", () => {
+		let finished = false;
+		const closedController = {
+			enqueue() {
+				throw new TypeError("Invalid state: Controller is already closed");
+			},
+		} as unknown as ReadableStreamDefaultController<Uint8Array>;
+
+		expect(tryEnqueueChunk(closedController, new Uint8Array([1]), () => { finished = true; })).toBe(false);
+		expect(finished).toBe(true);
+	});
+
+	it("clears image_generation keepalive timers when upstream stream reads fail", async () => {
+		const originalSetTimeout = globalThis.setTimeout;
+		const originalClearTimeout = globalThis.clearTimeout;
+		const handles: unknown[] = [];
+		const cleared: unknown[] = [];
+		(globalThis as any).setTimeout = ((handler: TimerHandler, timeout?: number, ...args: unknown[]) => {
+			void handler;
+			void args;
+			const handle = { timeout };
+			handles.push(handle);
+			return handle;
+		}) as typeof setTimeout;
+		(globalThis as any).clearTimeout = ((handle?: unknown) => {
+			cleared.push(handle);
+		}) as typeof clearTimeout;
+		try {
+			const upstreamError = new Error("upstream failed");
+			const body = {
+				getReader() {
+					return {
+						async read() {
+							throw upstreamError;
+						},
+						async cancel() {},
+					};
+				},
+			} as unknown as ReadableStream<Uint8Array>;
+
+			const reader = wrapImageGenerationStream(body, {
+				interruptOnImageResult: false,
+				keepaliveIntervalMs: 60_000,
+			}).getReader();
+
+			await expect(reader.read()).rejects.toThrow("upstream failed");
+			expect(handles).toHaveLength(1);
+			expect(cleared).toEqual(handles);
+		} finally {
+			globalThis.setTimeout = originalSetTimeout;
+			globalThis.clearTimeout = originalClearTimeout;
+		}
+	});
+
+	it("injects progress keepalives into SDK event iterables before OMP idle checks", async () => {
+		async function* stalledEvents() {
+			await new Promise(() => undefined);
+		}
+
+		const stream = wrapImageGenerationEventIterable(stalledEvents(), {
+			interruptOnImageResult: false,
+			keepaliveIntervalMs: 1,
+		});
+		let timeout: ReturnType<typeof setTimeout> | undefined;
+		const first = await Promise.race([
+			stream[Symbol.asyncIterator]().next().then(result => ({ kind: "read" as const, result })),
+			new Promise<{ kind: "timeout" }>(resolve => {
+				timeout = setTimeout(() => resolve({ kind: "timeout" }), 25);
+			}),
+		]);
+		if (timeout) clearTimeout(timeout);
+
+		expect(first.kind).toBe("read");
+		if (first.kind !== "read") return;
+		expect(first.result.done).toBe(false);
+		expect(first.result.value).toMatchObject({
+			type: "response.function_call_arguments.delta",
+			item_id: "openai_provider_tools_keepalive",
+			delta: "",
+		});
+	});
+
+	it("does not hang SDK iterator return after a synthetic keepalive wins the race", async () => {
+		let upstreamReturnCalled = false;
+		const abortController = new AbortController();
+		const source = {
+			[Symbol.asyncIterator]() {
+				return {
+					async next() {
+						return new Promise<IteratorResult<unknown>>(() => undefined);
+					},
+					async return() {
+						upstreamReturnCalled = true;
+						return new Promise<IteratorResult<unknown>>(() => undefined);
+					},
+				};
+			},
+		} satisfies AsyncIterable<unknown>;
+		const iterator = wrapImageGenerationEventIterable(source, {
+			interruptOnImageResult: false,
+			keepaliveIntervalMs: 1,
+		}, abortController)[Symbol.asyncIterator]();
+
+		const first = await iterator.next();
+		expect(first.done).toBe(false);
+		expect(first.value).toMatchObject({ item_id: "openai_provider_tools_keepalive" });
+
+		let timeout: ReturnType<typeof setTimeout> | undefined;
+		const returned = await Promise.race([
+			iterator.return!().then(result => ({ kind: "returned" as const, result })),
+			new Promise<{ kind: "timeout" }>(resolve => {
+				timeout = setTimeout(() => resolve({ kind: "timeout" }), 25);
+			}),
+		]);
+		if (timeout) clearTimeout(timeout);
+
+		expect(returned.kind).toBe("returned");
+		expect(abortController.signal.aborted).toBe(true);
+		expect(upstreamReturnCalled).toBe(true);
+	});
+
+	it("does not emit provider-tool-looking keepalive events into SDK Streams", async () => {
+		async function* stalledEvents() {
+			await new Promise(() => undefined);
+		}
+
+		const stream = wrapImageGenerationEventIterable(stalledEvents(), {
+			interruptOnImageResult: false,
+			keepaliveIntervalMs: 1,
+		});
+		let timeout: ReturnType<typeof setTimeout> | undefined;
+		const first = await Promise.race([
+			stream[Symbol.asyncIterator]().next().then(result => ({ kind: "read" as const, result })),
+			new Promise<{ kind: "timeout" }>(resolve => {
+				timeout = setTimeout(() => resolve({ kind: "timeout" }), 25);
+			}),
+		]);
+		if (timeout) clearTimeout(timeout);
+
+		expect(first.kind).toBe("read");
+		if (first.kind !== "read") return;
+		expect(first.result.value).toMatchObject({
+			type: "response.function_call_arguments.delta",
+			item_id: "openai_provider_tools_keepalive",
+			delta: "",
+		});
+		expect(JSON.stringify(first.result.value)).not.toContain("image_generation_call");
+		expect(JSON.stringify(first.result.value)).not.toContain("web_search_call");
+	});
+
+	it("emits SDK keepalives on schedule even when provider yields non-progress events", async () => {
+		async function* providerKeepalives() {
+			for (;;) {
+				await new Promise(resolve => setTimeout(resolve, 5));
+				yield {
+					type: "response.image_generation_call.generating",
+					item_id: "ig-1",
+				};
+			}
+		}
+
+		const stream = wrapImageGenerationEventIterable(providerKeepalives(), {
+			interruptOnImageResult: false,
+			keepaliveIntervalMs: 20,
+		});
+		const iterator = stream[Symbol.asyncIterator]();
+		let sawKeepalive = false;
+		const deadline = Date.now() + 90;
+		while (!sawKeepalive && Date.now() < deadline) {
+			let timeout: ReturnType<typeof setTimeout> | undefined;
+			const next = await Promise.race([
+				iterator.next().then(result => ({ kind: "read" as const, result })),
+				new Promise<{ kind: "timeout" }>(resolve => {
+					timeout = setTimeout(() => resolve({ kind: "timeout" }), 15);
+				}),
+			]);
+			if (timeout) clearTimeout(timeout);
+			if (next.kind === "read" && !next.result.done) {
+				sawKeepalive = next.result.value !== null && typeof next.result.value === "object" && !Array.isArray(next.result.value) && (next.result.value as Record<string, unknown>).item_id === "openai_provider_tools_keepalive";
+			}
+		}
+		await iterator.return?.();
+
+		expect(sawKeepalive).toBe(true);
+	});
+
+
+	it("does not throw when image_generation keepalive races with downstream cancellation", async () => {
+		const originalFetch = globalThis.fetch;
+		const uncaughtErrors: unknown[] = [];
+		const onUncaught = (error: unknown) => {
+			uncaughtErrors.push(error);
+		};
+		process.on("uncaughtException", onUncaught);
+		try {
+			globalThis.fetch = (async () => new Response(
+				new ReadableStream<Uint8Array>(),
+				{ headers: { "content-type": "text/event-stream" } },
+			)) as typeof fetch;
+			const cwd = await makeTempDir();
+			const homeDir = await makeTempDir();
+			const extension = registerExtension({ initialActiveTools: ["read"] });
+			const keepaliveImageModel = {
+				...providerToolsImageModel,
+				compat: {
+					openaiProviderTools: {
+						...providerToolsImageModel.compat.openaiProviderTools,
+						imageGenerationKeepaliveIntervalMs: 1,
+					},
+				},
+			};
+			const ctx = context(cwd, homeDir, { model: keepaliveImageModel });
+			const payload: Record<string, unknown> = { model: "gpt-5", input: "hello", stream: true };
+
+			await runBeforeProvider(extension, payload, ctx, { requestModel: keepaliveImageModel });
+			const response = await fetch("https://gateway.example.invalid/v1/responses", {
+				method: "POST",
+				body: JSON.stringify(payload),
+			});
+			const reader = response.body!.getReader();
+			await new Promise(resolve => setTimeout(resolve, 5));
+			await reader.cancel().catch(() => undefined);
+			await new Promise(resolve => setTimeout(resolve, 5));
+
+			expect(uncaughtErrors).toEqual([]);
+		} finally {
+			process.off("uncaughtException", onUncaught);
+			globalThis.fetch = originalFetch;
+		}
+	});
 	it("interrupts opt-in OpenAI Responses streams after an image_generation result event", async () => {
 		const originalFetch = globalThis.fetch;
 		try {

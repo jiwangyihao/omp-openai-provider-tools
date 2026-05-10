@@ -4,12 +4,12 @@
 [![npm downloads](https://img.shields.io/npm/dw/omp-openai-provider-tools.svg)](https://www.npmjs.com/package/omp-openai-provider-tools)
 [![License: MPL-2.0](https://img.shields.io/badge/License-MPL--2.0-blue.svg)](./LICENSE)
 
-> **Latest in v0.1.2 | v0.1.2 最近更新**
+> **Latest in v0.1.3 | v0.1.3 最近更新**
 >
-> - Adds an explicit `configure-image-agent` CLI for generating a recommended image subagent template | 新增显式 `configure-image-agent` CLI，用于生成推荐图像子代理模板
-> - Requires installers to pass the actual image-capable model via `--model` | 要求安装 Agent 通过 `--model` 填写用户实际图像能力模型
-> - Keeps plugin installation side-effect free: no automatic user agent config writes | 保持插件安装无副作用：不会自动写入用户 agent 配置
-> - The generated subagent template gathers read-only project context, self-checks output, and retries at most once | 生成的子代理模板会只读收集项目上下文、自检结果，并最多主动重试一次
+> - Fixes long-running provider-native `image_generation` streams on OMP 14.9+ | 修复 OMP 14.9+ 中 provider-native `image_generation` 长时间生成的流式空闲误判
+> - Adds request-scoped semantic keepalives without disabling global runtime timeout protection | 增加请求级语义 keepalive，不全局关闭运行时 timeout 保护
+> - Keeps OpenAI SDK stream patching lazy so the extension loads without a direct `openai` runtime dependency | 保持 OpenAI SDK stream patch 惰性加载，扩展不需要直接运行时依赖 `openai`
+> - Limits image-only custom provider opt-in to `image_generation`, avoiding accidental `web_search` injection | 自定义 provider 仅开启图像能力时只注入 `image_generation`，避免误注入 `web_search`
 
 [中文](#中文) | [English](#english)
 
@@ -92,6 +92,7 @@ OpenAI provider-executed tools 通常不会把原始工具输出暴露给宿主�
   - 将生成图像保存到临时目录、session artifact 目录或配置的输出目录。
   - 在终端中直接展示生成图像。
   - 展开详情时显示完整生图参数、文件信息和 revised prompt。
+  - 对 provider-native `image_generation` 流，插件会在空闲等待期间注入请求级 Responses keepalive，避免 OMP 14.9+ 的 120 秒流式 idle watchdog 把长时间生图误判为卡死；该处理只作用于本插件已注入 `image_generation` 的 provider 请求，不会全局关闭 OMP 超时保护。
   - 将图片作为 image attachment 放入后续上下文，让 Agent 能基于生成结果继续编辑或判断是否需要再次生成。
 
 ---
@@ -114,7 +115,7 @@ OpenAI provider-executed tools 通常不会把原始工具输出暴露给宿主�
 当前版本：
 
 ```bash
-omp plugin install npm:omp-openai-provider-tools@0.1.2
+omp plugin install npm:omp-openai-provider-tools@0.1.3
 ```
 
 本地开发时可以链接 checkout：
@@ -141,7 +142,7 @@ omp plugin link <path-to-this-repo>
 2. 提取其中带明确版本号的安装命令。当前版本示例：
 
    ```bash
-   omp plugin install npm:omp-openai-provider-tools@0.1.2
+   omp plugin install npm:omp-openai-provider-tools@0.1.3
    ```
 
 3. 安装后不要停在插件安装本身。继续帮助用户配置 OpenAI 官方 provider 或用户自己的 OpenAI-compatible 中转站：确认当前模型使用 `openai-responses`，把能力声明写入模型或 provider 元数据的 `compat.openaiProviderTools`，不要新建插件专用配置文件。
@@ -321,6 +322,7 @@ OpenAI provider completed web_search (1 call).
 - provider-native `web_search` 的隐藏原始结果只在当次 provider 请求内部可用；下一轮如果需要同一批原始资料，可能需要重新搜索或显式读取网页原文。
 - provider-native `image_generation` 会消耗对应 provider/model 的图像生成额度。
 - `image_generation` 结果会作为 image attachment 进入后续上下文；如果会话被压缩、裁剪或删除，对应上下文和 artifact 可用性也会变化。
+- 对真正卡死且 provider 不再返回任何事件的生图请求，插件 keepalive 会避免 OMP idle watchdog 过早中断；用户仍可手动取消该轮请求。
 - 自定义中转站不会自动启用 provider tools，必须通过 `compat.openaiProviderTools.enabled: true` 明确声明。
 - 运行时兼容性取决于 OMP/Pi 是否暴露 request hook、active-tool 控制、custom message、artifact 目录和 terminal image 渲染能力。详见 [runtime compatibility notes](./docs/runtime-compatibility.md)。
 
@@ -333,6 +335,7 @@ OpenAI provider completed web_search (1 call).
 | 本地 `web_search` / `generate_image` 仍在 | 插件只有在能安全注入 provider-native tool 时才移除本地工具；查看 OMP warning。 |
 | 生成图没有显示 | 确认终端支持 OMP 的图片渲染；如果同一会话里 `read` 能显示图片，而本插件不能，请报告 bug。 |
 | 生成图没有保存 | 确认 provider 返回了 OpenAI Responses native image history，并检查输出目录或 session artifact 目录是否可写。 |
+| 生图约 2 分钟后报 `OpenAI responses stream stalled...` | 升级到包含 provider-native image keepalive 的插件版本；它会仅对已注入 `image_generation` 的 Responses 流补请求级进展事件。 |
 | Web 搜索回显太少 | provider 不暴露原始输出；插件只能展示 OpenAI Responses history 中保留下来的 query、citation 和 source。 |
 
 ---
@@ -376,13 +379,14 @@ Provider-executed `web_search` lets the main Agent use provider-side search resu
 - Emits visible UI-only summaries for provider-native `web_search` calls.
 - Saves provider-native image results, renders them inline in the terminal, and exposes expanded generation metadata.
 - Adds generated images as image attachments for later editing context.
+- Injects request-scoped Responses keepalives while provider-native `image_generation` is waiting, so OMP 14.9+ does not mistake long image generation for a stalled stream. This is scoped only to requests where this plugin injected `image_generation`; it does not globally disable runtime timeout protection.
 
 ## Installation
 
 For OMP:
 
 ```bash
-omp plugin install npm:omp-openai-provider-tools@0.1.2
+omp plugin install npm:omp-openai-provider-tools@0.1.3
 ```
 
 For local development:
@@ -394,8 +398,8 @@ omp plugin link <path-to-this-repo>
 For Pi-family runtimes:
 
 ```bash
-pi install npm:omp-openai-provider-tools@0.1.2
-pi -e npm:omp-openai-provider-tools@0.1.2
+pi install npm:omp-openai-provider-tools@0.1.3
+pi -e npm:omp-openai-provider-tools@0.1.3
 ```
 
 Verify:
@@ -447,3 +451,4 @@ The installing Agent must fill `--model` from the user's actual provider/model r
 - Provider-native `web_search` raw results are only available inside the provider request that produced them.
 - Provider-native `image_generation` may consume provider image-generation quota.
 - Runtime compatibility depends on OMP/Pi extension APIs. See [runtime compatibility notes](./docs/runtime-compatibility.md).
+- For truly stuck image-generation requests where the provider never completes, the plugin keepalive prevents premature idle-watchdog aborts; users can still manually cancel the turn.
