@@ -291,6 +291,10 @@ export function createProviderToolLiveStatusManager(
 			const eventType = typeof typedEvent.type === "string" ? typedEvent.type : undefined;
 
 			if (eventType === "response.completed") {
+				if (!this.hasRenderableStatuses()) {
+					this.disable();
+					return;
+				}
 				this.markIncompleteStatuses("completed");
 				this.renderNow();
 				this.scheduleAutoClose();
@@ -307,12 +311,14 @@ export function createProviderToolLiveStatusManager(
 				const item = typedEvent.item as ItemRecord;
 				if (item.type !== "web_search_call") return;
 				this.upsertStatus(item, typedEvent, eventType === "response.output_item.done" ? "completed" : undefined);
+				const status = this.statuses.get(getStatusId(item, typedEvent));
 				if (eventType === "response.output_item.done") {
+					if (!statusHasRenderableDetails(status)) return;
 					this.renderNow();
 					this.scheduleAutoCloseIfComplete();
 				} else {
 					this.cancelPendingAutoClose();
-					this.scheduleRender();
+					if (statusHasRenderableDetails(status)) this.scheduleRender();
 				}
 				return;
 			}
@@ -321,7 +327,7 @@ export function createProviderToolLiveStatusManager(
 				const item = isRecord(typedEvent.item) ? (typedEvent.item as ItemRecord) : undefined;
 				if (item && item.type !== undefined && item.type !== "web_search_call") return;
 				this.upsertStatus(item, typedEvent, "searching");
-				this.scheduleRender();
+				if (statusHasRenderableDetails(this.statuses.get(getStatusId(item, typedEvent)))) this.scheduleRender();
 			}
 		}
 
@@ -361,6 +367,13 @@ export function createProviderToolLiveStatusManager(
 					status.updatedAt = timestamp;
 				}
 			}
+		}
+
+		private hasRenderableStatuses(): boolean {
+			for (const status of this.statuses.values()) {
+				if (statusHasRenderableDetails(status)) return true;
+			}
+			return false;
 		}
 
 		private scheduleAutoCloseIfComplete(): void {
@@ -448,12 +461,11 @@ export function createProviderToolLiveStatusManager(
 						disableAfterOverlayFailure(error);
 					}
 					this.overlay = undefined;
-					if (!this.ended) {
-						this.ended = true;
-						this.cancelPendingRender();
-						this.cancelPendingAutoClose();
-						activeTrackers.delete(this);
-					}
+					this.openingOverlay = false;
+					this.ended = true;
+					this.cancelPendingRender();
+					this.cancelPendingAutoClose();
+					activeTrackers.delete(this);
 				};
 
 				const component: OverlayComponentLike = {
@@ -580,6 +592,11 @@ function extractSourceCount(item: ItemRecord | undefined): number | undefined {
 	if (Array.isArray(action?.sources)) return action.sources.length;
 	if (Array.isArray(item?.results)) return item.results.length;
 	return undefined;
+}
+
+function statusHasRenderableDetails(status: LiveToolStatus | undefined): boolean {
+	if (!status) return false;
+	return status.queries.length > 0 || typeof status.sourceCount === "number" || Boolean(status.error) || status.phase === "failed";
 }
 
 function describeError(error: unknown): string {

@@ -13,11 +13,15 @@ describe("live status documentation", () => {
 		expect(readme).toContain("does not fall back to the old short status widget");
 		expect(readme).toContain("完成状态会短暂保留");
 		expect(readme).toContain("回显出现时会立即关闭 overlay");
+		expect(readme).toContain("非触发式 next-turn 可见消息");
+		expect(readme).toContain("避免在本地工具执行期间作为 steer 消息中断后续工具");
 		expect(readme).toContain("`image_generation` 不显示实时 overlay");
 		expect(compatibility).toContain("Live status overlay UI");
 		expect(compatibility).toContain("ctx.ui.custom");
 		expect(compatibility).toContain("no-op");
 		expect(compatibility).toContain("Completed status auto-closes after a short delay");
+		expect(compatibility).toContain("non-triggering `deliverAs: \"nextTurn\"`");
+		expect(compatibility).toContain("Do not open overlay for queryless placeholder events");
 		expect(compatibility).toContain("final result echo/lifecycle cleanup closes any active overlay immediately");
 		expect(compatibility).toContain("Do not create live overlay status for provider-native `image_generation`");
 		expect(readme).not.toContain("短状态行");

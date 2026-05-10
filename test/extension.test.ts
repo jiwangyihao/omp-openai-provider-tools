@@ -177,6 +177,12 @@ function getHandler(extension: ReturnType<typeof registerExtension>, name: strin
 	return handler;
 }
 
+function getHandlerFromMap(handlers: Map<string, Handler[]>, name: string): Handler {
+	const handler = handlers.get(name)?.[0];
+	if (!handler) throw new Error(`${name} handler missing`);
+	return handler;
+}
+
 function context(cwd: string, homeDir: string, overrides: Record<string, unknown> = {}) {
 	return { cwd, homeDir, model: targetModel, ...overrides };
 }
@@ -920,7 +926,7 @@ describe("OpenAI provider tools extension", () => {
 		expect(extension.activeTools()).toEqual(["read", "web_search", "generate_image"]);
 	});
 
-	it("echoes provider-native web_search results as a visible custom message", async () => {
+	it("echoes provider-native web_search results as a visible custom message without steering", async () => {
 		const cwd = await makeTempDir();
 		const homeDir = await makeTempDir();
 		const extension = registerExtension();
@@ -933,7 +939,7 @@ describe("OpenAI provider tools extension", () => {
 		await runAgentEnd(extension, { message: webSearchMessage() }, ctx);
 
 		expect(extension.sentMessages).toHaveLength(1);
-		expect(extension.sentMessages[0]?.options).toBeUndefined();
+		expect(extension.sentMessages[0]?.options).toEqual({ deliverAs: "nextTurn" });
 		const message = extension.sentMessages[0]?.message as any;
 		expect(message.display).toBe(true);
 		expect(message.customType).toBe("openai-provider-tool-result");
@@ -941,6 +947,40 @@ describe("OpenAI provider tools extension", () => {
 		expect(message.details.queries).toContain("latest OMP provider tools");
 		expect(JSON.stringify(message.details)).toContain("https://example.invalid/omp-provider-tools");
 		expect(JSON.stringify(message.details)).not.toContain("OMP provider tools are available.");
+	});
+
+	it("logs provider-native web_search summary delivery failures without throwing", async () => {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		const ctx = context(cwd, homeDir, {
+			sessionManager: {
+				getSessionId: () => "session-1",
+			},
+		});
+
+		// registerExtension does not expose api; exercise failure through a local extension instance.
+		const handlers = new Map<string, Handler[]>();
+		const warnings: unknown[][] = [];
+		const failingApi: any = {
+			logger: { debug() {}, warn: (...args: unknown[]) => warnings.push(args), error() {} },
+			runtime: { name: "omp" },
+			on(event: string, handler: Handler) {
+				const existing = handlers.get(event) ?? [];
+				existing.push(handler);
+				handlers.set(event, existing);
+			},
+			setLabel() {},
+			getActiveTools() { return ["read", "web_search", "generate_image"]; },
+			async setActiveTools() {},
+			sendMessage() { return Promise.reject(new Error("send failed")); },
+			registerMessageRenderer() {},
+		};
+		providerToolsExtension(failingApi);
+
+		expect(() => getHandlerFromMap(handlers, "agent_end")({ message: webSearchMessage() }, ctx)).not.toThrow();
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(warnings.join("\n")).toContain("OpenAI provider tool result message delivery failed");
 	});
 
 	it("echoes provider-native web_search at message_end before agent_end and deduplicates later", async () => {
@@ -957,7 +997,7 @@ describe("OpenAI provider tools extension", () => {
 		getHandler(extension, "message_end")({ type: "message_end", message }, ctx);
 
 		expect(extension.sentMessages).toHaveLength(1);
-		expect(extension.sentMessages[0]?.options).toBeUndefined();
+		expect(extension.sentMessages[0]?.options).toEqual({ deliverAs: "nextTurn" });
 		expect((extension.sentMessages[0]?.message as any).content).toBe("");
 		await runAgentEnd(extension, { message }, ctx);
 
@@ -1473,7 +1513,7 @@ describe("OpenAI provider tools extension", () => {
 		await runAgentEnd(extension, { message }, ctx);
 
 		expect(extension.sentMessages).toHaveLength(1);
-		expect(extension.sentMessages[0]?.options).toBeUndefined();
+		expect(extension.sentMessages[0]?.options).toEqual({ deliverAs: "nextTurn" });
 		const sent = extension.sentMessages[0]?.message as any;
 		expect(sent.content).toBe("");
 		expect(sent.details.queries).toEqual(["provider native image_generation", "latest OMP provider tools"]);

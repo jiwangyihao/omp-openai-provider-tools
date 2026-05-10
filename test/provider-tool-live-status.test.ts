@@ -89,6 +89,61 @@ function createScheduler() {
 }
 
 describe("provider tool live status", () => {
+	it("ignores response.completed before any web_search_call instead of creating placeholder overlay state", () => {
+		const scheduler = createScheduler();
+		const recorder = createUiRecorder({ hasUI: true });
+		const manager = createProviderToolLiveStatusManager({ throttleMs: 0, scheduler: scheduler.scheduler });
+		const tracker = manager.createTracker({ enabledTools: ["web_search"], ui: recorder.ui });
+
+		tracker?.onEvent({ type: "response.completed", response: { id: "resp-unknown" } });
+		scheduler.runActiveTimers();
+
+		expect(recorder.customCalls).toEqual([]);
+		expect(recorder.doneResults).toEqual([]);
+	});
+
+	it("keeps queryless placeholder calls hidden until provider supplies a query or source", () => {
+		const recorder = createUiRecorder({ hasUI: true });
+		const manager = createProviderToolLiveStatusManager({ throttleMs: 0 });
+		const tracker = manager.createTracker({ enabledTools: ["web_search"], ui: recorder.ui });
+
+		tracker?.onEvent({ type: "response.output_item.added", item: { type: "web_search_call", id: "ws-placeholder", status: "searching" } });
+		expect(recorder.customCalls).toEqual([]);
+
+		tracker?.onEvent({ type: "response.output_item.done", item: { type: "web_search_call", id: "ws-placeholder", status: "completed", action: { query: "real provider query" } } });
+
+		expect(recorder.customCalls).toHaveLength(1);
+		expect(recorder.customCalls[0]!.component.render(100).join("\n")).toContain("real provider query");
+		expect(recorder.customCalls[0]!.component.render(100).join("\n")).not.toContain("waiting for provider query");
+	});
+
+	it("keeps queryless done and completed placeholders hidden", () => {
+		const scheduler = createScheduler();
+		const recorder = createUiRecorder({ hasUI: true });
+		const manager = createProviderToolLiveStatusManager({ throttleMs: 0, scheduler: scheduler.scheduler });
+		const tracker = manager.createTracker({ enabledTools: ["web_search"], ui: recorder.ui });
+
+		tracker?.onEvent({ type: "response.output_item.done", item: { type: "web_search_call", id: "ws-placeholder", status: "completed" } });
+		tracker?.onEvent({ type: "response.completed", response: { id: "resp-placeholder" } });
+		scheduler.runActiveTimers();
+
+		expect(recorder.customCalls).toEqual([]);
+		expect(recorder.doneResults).toEqual([]);
+	});
+
+	it("does not reopen overlay when queryless added placeholder is followed by response.completed", () => {
+		const scheduler = createScheduler();
+		const recorder = createUiRecorder({ hasUI: true });
+		const manager = createProviderToolLiveStatusManager({ throttleMs: 0, scheduler: scheduler.scheduler });
+		const tracker = manager.createTracker({ enabledTools: ["web_search"], ui: recorder.ui });
+
+		tracker?.onEvent({ type: "response.output_item.added", item: { type: "web_search_call", id: "ws-placeholder", status: "searching" } });
+		tracker?.onEvent({ type: "response.completed", response: { id: "resp-placeholder" } });
+		scheduler.runActiveTimers();
+
+		expect(recorder.customCalls).toEqual([]);
+		expect(recorder.doneResults).toEqual([]);
+	});
 	it("opens an automatic dashboard overlay for web_search progress instead of a short widget", () => {
 		const recorder = createUiRecorder({ hasUI: true });
 		const manager = createProviderToolLiveStatusManager({ throttleMs: 0 });
@@ -165,7 +220,7 @@ describe("provider tool live status", () => {
 		const manager = createProviderToolLiveStatusManager({ throttleMs: 250, scheduler: scheduler.scheduler });
 		const tracker = manager.createTracker({ enabledTools: ["web_search"], ui: recorder.ui });
 
-		tracker?.onEvent({ type: "response.output_item.added", item: { type: "web_search_call", id: "ws-1" } });
+		tracker?.onEvent({ type: "response.output_item.added", item: { type: "web_search_call", id: "ws-1", action: { query: "throttled" } } });
 		expect(scheduler.scheduled).toHaveLength(1);
 		expect(recorder.customCalls).toEqual([]);
 
@@ -331,12 +386,12 @@ describe("provider tool live status", () => {
 		const tracker = manager.createTracker({ enabledTools: ["web_search"], ui: throwing.ui });
 
 		expect(() => {
-			tracker?.onEvent({ type: "response.output_item.added", item: { type: "web_search_call", id: "ws-1" } });
+			tracker?.onEvent({ type: "response.output_item.added", item: { type: "web_search_call", id: "ws-1", action: { query: "throws" } } });
 		}).not.toThrow();
 		expect(warnings.length).toBeGreaterThan(0);
 
 		const laterTracker = manager.createTracker({ enabledTools: ["web_search"], ui: later.ui });
-		laterTracker?.onEvent({ type: "response.output_item.added", item: { type: "web_search_call", id: "ws-2" } });
+		laterTracker?.onEvent({ type: "response.output_item.added", item: { type: "web_search_call", id: "ws-2", action: { query: "disabled" } } });
 		manager.clearAll();
 		expect(later.customCalls).toEqual([]);
 		expect(later.widgetCalls).toEqual([]);

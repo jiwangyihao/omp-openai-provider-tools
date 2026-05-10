@@ -135,7 +135,25 @@ describe("OpenAI Responses stream observer", () => {
 		expect(text).toBe(raw);
 	});
 
-	it("keeps tracker alive for response.completed so completed overlay can auto-close", async () => {
+	it("keeps tracker alive for response.completed after observing a web_search event", async () => {
+		const recorder = trackerRecorder();
+		const webEvent = sseEvent({ type: "response.output_item.added", item: { type: "web_search_call", id: "ws-1", action: { query: "observed" } } });
+		const completedEvent = sseEvent({ type: "response.completed", response: { id: "resp-1" } });
+
+		const text = await responseText(wrapOpenAIResponsesStream(
+			new Response(webEvent + completedEvent).body!,
+			{ interruptOnImageResult: false, keepaliveIntervalMs: undefined, liveTracker: recorder.tracker },
+		));
+
+		expect(text).toBe(webEvent + completedEvent);
+		expect(recorder.events).toEqual([
+			{ type: "response.output_item.added", item: { type: "web_search_call", id: "ws-1", action: { query: "observed" } } },
+			{ type: "response.completed", response: { id: "resp-1" } },
+		]);
+		expect(recorder.calls).toEqual([]);
+	});
+
+	it("does not forward response.completed to a tracker before any web_search event was observed", async () => {
 		const recorder = trackerRecorder();
 		const raw = sseEvent({ type: "response.completed", response: { id: "resp-1" } });
 
@@ -145,7 +163,7 @@ describe("OpenAI Responses stream observer", () => {
 		));
 
 		expect(text).toBe(raw);
-		expect(recorder.events).toEqual([{ type: "response.completed", response: { id: "resp-1" } }]);
+		expect(recorder.events).toEqual([]);
 		expect(recorder.calls).toEqual([]);
 	});
 

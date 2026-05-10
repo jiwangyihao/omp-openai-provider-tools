@@ -480,7 +480,7 @@ function handleMessageEndImageResults({
 }
 
 async function sendVisibleProviderToolResultMessage(api: ExtensionApiLike, message: unknown): Promise<void> {
-	await api.sendMessage?.(message);
+	await api.sendMessage?.(message, { deliverAs: "nextTurn" });
 }
 
 function handleProviderToolResults({

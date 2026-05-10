@@ -51,6 +51,7 @@ export function wrapOpenAIResponsesStream(body: ReadableStream<Uint8Array>, poli
 	let finished = false;
 	let keepaliveTimer: ReturnType<typeof setTimeout> | undefined;
 	let keepaliveController: ReadableStreamDefaultController<Uint8Array> | undefined;
+	let sawLiveWebSearchEvent = false;
 	let lastSyntheticKeepaliveAt = Date.now();
 
 	const clearKeepalive = () => {
@@ -104,7 +105,7 @@ export function wrapOpenAIResponsesStream(body: ReadableStream<Uint8Array>, poli
 						const rawEvent = buffer.slice(0, delimiter.index);
 						buffer = buffer.slice(delimiter.index + delimiter.length);
 						const event = parseSseEvent(rawEvent);
-						observeEvent(policy, event, true);
+						sawLiveWebSearchEvent = observeEvent(policy, event, true, sawLiveWebSearchEvent);
 						if (!tryEnqueueChunk(controller, encoder.encode(`${rawEvent}\n\n`), finish)) return;
 						emitted = true;
 						if (policy.interruptOnImageResult && isImageGenerationResultDoneEvent(rawEvent)) {
@@ -140,6 +141,7 @@ export function wrapOpenAIResponsesEventIterable<T>(source: AsyncIterable<T>, po
 			let upstreamNext: Promise<IteratorResult<T>> | undefined;
 			let keepaliveTimer: ReturnType<typeof setTimeout> | undefined;
 			let lastSyntheticKeepaliveAt = Date.now();
+			let sawLiveWebSearchEvent = false;
 			const imageKeepaliveEnabled = policy.enabledTools === undefined || policy.enabledTools.includes("image_generation");
 
 			const abort = () => {
@@ -197,7 +199,7 @@ export function wrapOpenAIResponsesEventIterable<T>(source: AsyncIterable<T>, po
 						finishAndClear();
 						return result;
 					}
-						if (outcome.source === "upstream" && policy.observeLiveEventsInIterable !== false) observeEvent(policy, result.value, true);
+						if (outcome.source === "upstream" && policy.observeLiveEventsInIterable !== false) sawLiveWebSearchEvent = observeEvent(policy, result.value, true, sawLiveWebSearchEvent);
 						if (policy.interruptOnImageResult && isImageGenerationResultDoneObject(result.value)) {
 							finishAndClear();
 							abort();
@@ -222,18 +224,21 @@ export function wrapOpenAIResponsesEventIterable<T>(source: AsyncIterable<T>, po
 	};
 }
 
-function observeEvent(policy: RequestObservationPolicy, event: unknown, shouldCallOnEvent: boolean): void {
-	if (!isRecord(event)) return;
-	if (shouldCallOnEvent && shouldObserveLiveEvent(event)) {
+function observeEvent(policy: RequestObservationPolicy, event: unknown, shouldCallOnEvent: boolean, sawLiveWebSearchEvent = false): boolean {
+	if (!isRecord(event)) return sawLiveWebSearchEvent;
+	const observesLiveEvent = shouldObserveLiveEvent(event);
+	const shouldForward = observesLiveEvent && (event.type !== "response.completed" || sawLiveWebSearchEvent);
+	if (shouldCallOnEvent && shouldForward) {
 		callTrackerOnEvent(policy.liveTracker, event);
 	}
 	const type = event.type;
 	if (type === "response.completed") {
-		return;
+		return sawLiveWebSearchEvent;
 	} else if (type === "response.failed" || type === "error") {
 		failTracker(policy.liveTracker, event.error ?? event);
 		clearTracker(policy.liveTracker);
 	}
+	return sawLiveWebSearchEvent || isWebSearchLifecycleEvent(event);
 }
 
 function shouldObserveLiveEvent(event: JsonRecord): boolean {
@@ -241,6 +246,13 @@ function shouldObserveLiveEvent(event: JsonRecord): boolean {
 	if (type === "response.completed" || type === "response.failed" || type === "error") return true;
 	if (type === "response.web_search_call.searching") return true;
 	if (type !== "response.output_item.added" && type !== "response.output_item.done") return false;
+	const item = event.item;
+	return isRecord(item) && item.type === "web_search_call";
+}
+
+function isWebSearchLifecycleEvent(event: JsonRecord): boolean {
+	if (event.type === "response.web_search_call.searching") return true;
+	if (event.type !== "response.output_item.added" && event.type !== "response.output_item.done") return false;
 	const item = event.item;
 	return isRecord(item) && item.type === "web_search_call";
 }
