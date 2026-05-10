@@ -87,6 +87,12 @@ OpenAI provider-executed tools 通常不会把原始工具输出暴露给宿主�
   - 回显用于提示用户「provider 侧发生了搜索」，不会把 query/citation/source 再塞回 Agent 上下文。
   - `web_search` 的原始 provider-side 检索结果仍只在当次 provider 请求内部可用。
 
+- **实时展示 provider-native `web_search` 状态**
+  - 在支持 `ctx.ui.custom(..., { overlay: true })` 的 OMP/Pi 交互 runtime 中，provider-native `web_search_call` 流式事件到达时，插件会自动弹出一块临时 dashboard-style overlay，提示正在搜索的 query、状态和 source 计数。
+  - 这个实时 overlay 是 UI-only、非持久状态，不写入 session message，不进入 Agent 上下文；完成状态会短暂保留，随后自动关闭；最终 `web_search` summary 仍由 `message_end` / `agent_end` 回显路径负责，回显出现时会立即关闭 overlay。
+  - headless / print / RPC / 旧 runtime 缺少交互 overlay 能力时自动降级为 no-op；插件不会回退显示旧的短状态 widget。
+  - `image_generation` 不显示实时 overlay；它继续使用现有 keepalive、可选中断、图片保存和最终回显路径。
+
 - **保存并展示 provider-native `image_generation` 结果**
   - 自动从 OpenAI Responses history 中提取 `image_generation` 结果。
   - 将生成图像保存到临时目录、session artifact 目录或配置的输出目录。
@@ -291,6 +297,8 @@ OpenAI provider completed web_search (1 call).
 
 展开后可看到检索词、引用和 sources（如果 provider history 中保留了这些信息）。这些 UI 回显不会进入 Agent 上下文。
 
+如果 runtime 支持 `ctx.ui.custom(..., { overlay: true })`，provider-native `web_search_call` 流式事件到达时还会自动弹出一块临时 dashboard-style overlay，实时提示 query、状态和 source 计数。这个 overlay 是 UI-only，不持久化、不进入 Agent 上下文，也不会替代请求结束后的 summary 回显；完成状态会短暂保留后自动关闭，且 summary 回显出现时会立即关闭 overlay。headless / print / RPC / 旧 runtime 缺少交互 overlay 能力时自动降级为 no-op，且不会回退显示旧的短状态 widget。`image_generation` 不显示实时 overlay。
+
 ### provider-native `image_generation`
 
 为模型变体启用 `imageGeneration: true` 后，模型可以在同一次 OpenAI Responses 请求中调用：
@@ -377,6 +385,9 @@ Provider-executed `web_search` lets the main Agent use provider-side search resu
 - Never sets `tool_choice`.
 - Installing the plugin does not globally disable host-side tools; host-side conflict handling happens at runtime for the currently selected provider/model, immediately before the agent run and provider request.
 - Emits visible UI-only summaries for provider-native `web_search` calls.
+- Automatically opens a temporary UI-only dashboard-style overlay for provider-native `web_search` stream events on interactive runtimes that expose `ctx.ui.custom(..., { overlay: true })`.
+- The live overlay is not persisted, is not sent as a session message, and is not visible to the Agent. Completed status stays visible briefly and then auto-closes; final `web_search` summaries still come from `message_end` / `agent_end` and close the overlay immediately when echoed. Headless, print, RPC, or older runtimes without interactive overlay support degrade to no-op and the plugin does not fall back to the old short status widget.
+- Provider-native `image_generation` does not use a live overlay; it keeps the existing keepalive, optional interruption, save, and final echo paths.
 - Saves provider-native image results, renders them inline in the terminal, and exposes expanded generation metadata.
 - Adds generated images as image attachments for later editing context.
 - Injects request-scoped Responses keepalives while provider-native `image_generation` is waiting, so OMP 14.9+ does not mistake long image generation for a stalled stream. This is scoped only to requests where this plugin injected `image_generation`; it does not globally disable runtime timeout protection.
@@ -442,7 +453,7 @@ Optional image subagent template:
 npx omp-openai-provider-tools configure-image-agent --model <image-capable-model-alias> --dry-run
 ```
 
-The installing Agent must fill `--model` from the user's actual provider/model registry. Plugin installation does not automatically create or overwrite user agent files. The generated template grants only read-only context tools plus `yield`, asks the image subagent to gather task-relevant project context, self-check the generated image, and retry at most once when hard requirements are clearly missed.
+The installing Agent must fill `--model` from the user's actual provider/model registry. Plugin installation does not automatically create or overwrite user agent files. The generated template grants only read-only context tools plus `yield`, requires the image subagent to call provider-native `image_generation` / `image_gen.imagegen` when visible instead of returning text-only prompts, asks it to gather task-relevant project context, self-check the generated image, and retry at most once when hard requirements are clearly missed.
 
 ## Notes
 

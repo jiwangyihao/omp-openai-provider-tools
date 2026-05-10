@@ -49,8 +49,18 @@ export interface ExtensionContextLike {
 		getArtifactsDir?: () => string | undefined | Promise<string | undefined>;
 		getSessionId?: () => string | undefined | Promise<string | undefined>;
 	};
+	hasUI?: boolean;
 	ui?: {
 		notify?: (message: unknown) => void | Promise<void>;
+		setWidget?: (
+			key: string,
+			content: string[] | undefined,
+			options?: { placement?: "aboveEditor" | "belowEditor" },
+		) => void;
+		custom?: (
+			factory: (...args: unknown[]) => { render(width: number): string[]; handleInput?(data: string): void; dispose?(): void } | Promise<{ render(width: number): string[]; handleInput?(data: string): void; dispose?(): void }>,
+			options?: { overlay?: boolean },
+		) => Promise<undefined> | undefined;
 	};
 	abort?: (reason?: string) => void | Promise<void>;
 }

@@ -235,7 +235,91 @@ async function responseText(response: Response): Promise<string> {
 	return await response.text();
 }
 
-function webSearchMessage() {
+type TestOverlayComponent = { render(width: number): string[]; handleInput?(data: string): void; dispose?(): void };
+
+function uiRecorder() {
+	const widgetCalls: Array<{ key: string; content: string[] | undefined; options?: unknown }> = [];
+	const customCalls: Array<{ args: unknown[]; options?: unknown; component?: TestOverlayComponent; doneResults: unknown[]; requestRenderCalls: number }> = [];
+	const theme = { fg(_token: string, value: string) { return value; } };
+	return {
+		widgetCalls,
+		customCalls,
+		ctxUi: {
+			notify() {},
+			setWidget(key: string, content: string[] | undefined, options?: unknown) {
+				widgetCalls.push({ key, content, options });
+			},
+			custom(factory: Function, options?: unknown) {
+				const call = { args: [factory, options], options, component: undefined as TestOverlayComponent | undefined, doneResults: [] as unknown[], requestRenderCalls: 0 };
+				const component = factory({ requestRender() { call.requestRenderCalls++; } }, theme, {}, (result: unknown) => call.doneResults.push(result));
+				call.component = component as TestOverlayComponent;
+				customCalls.push(call);
+				return Promise.resolve(undefined);
+			},
+		},
+	};
+}
+
+async function runMessageEnd(extension: ReturnType<typeof registerExtension>, event: unknown, ctx: any) {
+	return getHandler(extension, "message_end")(event, ctx);
+}
+
+async function runSessionLifecycle(extension: ReturnType<typeof registerExtension>, hook: string, ctx: any) {
+	return getHandler(extension, hook)({ type: hook }, ctx);
+}
+
+function liveWebSearchEvent(query: string, eventType = "response.output_item.done"): string {
+	return sseEvent({
+		type: eventType,
+		item: {
+			type: "web_search_call",
+			id: "ws-1",
+			status: eventType === "response.output_item.done" ? "completed" : "searching",
+			action: { type: "search", query },
+		},
+	});
+}
+
+function installMockResponsesFetch(bodyFactory: () => BodyInit | ReadableStream<Uint8Array>) {
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = (async () => new Response(bodyFactory(), {
+		headers: { "content-type": "text/event-stream" },
+	})) as typeof fetch;
+	return () => {
+		globalThis.fetch = originalFetch;
+	};
+}
+
+async function createActiveLiveTracker(
+	extension: ReturnType<typeof registerExtension>,
+	ctx: any,
+	query = "latest OMP provider tools",
+	requestModel: any = targetModel,
+) {
+	const payload: Record<string, unknown> = { model: requestModel.id ?? "gpt-5", input: `search ${query}`, stream: true };
+	await runBeforeProvider(extension, payload, ctx, { requestModel });
+	const response = await fetch("https://api.openai.com/v1/responses", {
+		method: "POST",
+		body: JSON.stringify(payload),
+	});
+	await responseText(response);
+	return payload;
+}
+
+async function readChunkWithTimeout(reader: ReadableStreamDefaultReader<Uint8Array>, timeoutMs: number) {
+	let timeout: ReturnType<typeof setTimeout> | undefined;
+	const result = await Promise.race([
+		reader.read().then(read => ({ kind: "read" as const, read })),
+		new Promise<{ kind: "timeout" }>(resolve => {
+			timeout = setTimeout(() => resolve({ kind: "timeout" }), timeoutMs);
+		}),
+	]);
+	if (timeout) clearTimeout(timeout);
+	return result;
+}
+
+
+function webSearchMessage(query = "latest OMP provider tools") {
 	return {
 		providerPayload: {
 			type: "openaiResponsesHistory",
@@ -244,7 +328,7 @@ function webSearchMessage() {
 					type: "web_search_call",
 					id: "ws-1",
 					status: "completed",
-					action: { type: "search", query: "latest OMP provider tools" },
+					action: { type: "search", query },
 				},
 				{
 					type: "message",
@@ -287,6 +371,281 @@ describe("OpenAI provider tools extension", () => {
 		const source = await fs.readFile(path.join(import.meta.dir, "../src/extension.ts"), "utf8");
 		expect(source).not.toContain("@oh-my-pi/");
 		expect(source).not.toContain("@mariozechner/");
+	});
+
+	it("opens provider-native web_search live overlay without realtime messages", async () => {
+		const restoreFetch = installMockResponsesFetch(() => liveWebSearchEvent("latest OMP provider tools"));
+		try {
+			const cwd = await makeTempDir();
+			const homeDir = await makeTempDir();
+			const extension = registerExtension({ initialActiveTools: ["read", "generate_image"] });
+			const recorder = uiRecorder();
+			const ctx = context(cwd, homeDir, { hasUI: true, ui: recorder.ctxUi });
+			const payload: Record<string, unknown> = { model: "gpt-5", input: "hello", stream: true };
+
+			await runBeforeProvider(extension, payload, ctx, { requestModel: targetModel });
+			await responseText(await fetch("https://api.openai.com/v1/responses", {
+				method: "POST",
+				body: JSON.stringify(payload),
+			}));
+
+			expect(payload.tools).toEqual([{ type: "web_search" }]);
+			expect(recorder.customCalls).toHaveLength(1);
+			expect(recorder.customCalls[0]?.options).toEqual({ overlay: true });
+			expect(recorder.customCalls[0]?.component?.render(100).join("\n")).toContain("latest OMP provider tools");
+			expect(recorder.widgetCalls).toEqual([]);
+			expect(extension.sentMessages).toHaveLength(0);
+		} finally {
+			restoreFetch();
+		}
+	});
+
+	it("does not create a live overlay for image_generation only requests", async () => {
+		const restoreFetch = installMockResponsesFetch(() => sseEvent({
+			type: "response.output_item.done",
+			item: { type: "image_generation_call", id: "ig-1", result: ONE_BY_ONE_PNG, output_format: "png" },
+		}));
+		try {
+			const cwd = await makeTempDir();
+			const homeDir = await makeTempDir();
+			const extension = registerExtension({ initialActiveTools: ["read"] });
+			const recorder = uiRecorder();
+			const imageOnlyModel = {
+				...customProviderModel,
+				compat: { openaiProviderTools: { imageGeneration: true } },
+			};
+			const ctx = context(cwd, homeDir, { model: imageOnlyModel, hasUI: true, ui: recorder.ctxUi });
+			const payload: Record<string, unknown> = { model: "gpt-5.5-Sys", input: "hello", stream: true };
+
+			await runBeforeProvider(extension, payload, ctx, { requestModel: imageOnlyModel });
+			await responseText(await fetch("https://gateway.example.invalid/v1/responses", {
+				method: "POST",
+				body: JSON.stringify(payload),
+			}));
+
+			expect(payload.tools).toEqual([{ type: "image_generation" }]);
+			expect(recorder.customCalls).toEqual([]);
+			expect(recorder.widgetCalls).toEqual([]);
+		} finally {
+			restoreFetch();
+		}
+	});
+
+	it("clears active live overlay on message_end after final echo handling", async () => {
+		const restoreFetch = installMockResponsesFetch(() => liveWebSearchEvent("message end cleanup"));
+		try {
+			const cwd = await makeTempDir();
+			const homeDir = await makeTempDir();
+			const extension = registerExtension({ initialActiveTools: ["read", "generate_image"] });
+			const recorder = uiRecorder();
+			const ctx = context(cwd, homeDir, { hasUI: true, ui: recorder.ctxUi, sessionManager: { getSessionId: () => "session-1" } });
+			await createActiveLiveTracker(extension, ctx, "message end cleanup");
+			const beforeMessages = extension.sentMessages.length;
+
+			await runMessageEnd(extension, { type: "message_end", message: webSearchMessage() }, ctx);
+
+			expect(extension.sentMessages.length).toBe(beforeMessages + 1);
+			expect(recorder.customCalls.at(-1)?.doneResults).toEqual([undefined]);
+			expect(recorder.widgetCalls).toEqual([]);
+		} finally {
+			restoreFetch();
+		}
+	});
+
+	it("keeps completed live overlay visible until provider result echo closes it", async () => {
+		const restoreFetch = installMockResponsesFetch(() => liveWebSearchEvent("echo closes overlay"));
+		try {
+			const cwd = await makeTempDir();
+			const homeDir = await makeTempDir();
+			const extension = registerExtension({ initialActiveTools: ["read", "generate_image"] });
+			const recorder = uiRecorder();
+			const ctx = context(cwd, homeDir, { hasUI: true, ui: recorder.ctxUi, sessionManager: { getSessionId: () => "session-1" } });
+			await createActiveLiveTracker(extension, ctx, "echo closes overlay");
+
+			expect(recorder.customCalls).toHaveLength(1);
+			expect(recorder.customCalls[0]?.component?.render(100).join("\n")).toContain("completed");
+			expect(recorder.customCalls[0]?.doneResults).toEqual([]);
+
+			await runMessageEnd(extension, { type: "message_end", message: webSearchMessage("echo closes overlay") }, ctx);
+
+			expect(extension.sentMessages).toHaveLength(1);
+			expect(recorder.customCalls[0]?.doneResults).toEqual([undefined]);
+			expect(recorder.widgetCalls).toEqual([]);
+		} finally {
+			restoreFetch();
+		}
+	});
+
+	it("clears active live overlay on agent_end after final echo handling", async () => {
+		const restoreFetch = installMockResponsesFetch(() => liveWebSearchEvent("agent end cleanup"));
+		try {
+			const cwd = await makeTempDir();
+			const homeDir = await makeTempDir();
+			const extension = registerExtension({ initialActiveTools: ["read", "generate_image"] });
+			const recorder = uiRecorder();
+			const ctx = context(cwd, homeDir, { hasUI: true, ui: recorder.ctxUi, sessionManager: { getSessionId: () => "session-1" } });
+			await createActiveLiveTracker(extension, ctx, "agent end cleanup");
+
+			await runAgentEnd(extension, { message: webSearchMessage() }, ctx);
+
+			expect(extension.sentMessages).toHaveLength(1);
+			expect(recorder.customCalls.at(-1)?.doneResults).toEqual([undefined]);
+			expect(recorder.widgetCalls).toEqual([]);
+		} finally {
+			restoreFetch();
+		}
+	});
+
+	it("clears active live overlay on session lifecycle hooks", async () => {
+		for (const hook of ["session_before_switch", "session_switch", "session_branch", "session_shutdown"]) {
+			const restoreFetch = installMockResponsesFetch(() => liveWebSearchEvent(`${hook} cleanup`));
+			try {
+				const cwd = await makeTempDir();
+				const homeDir = await makeTempDir();
+				const extension = registerExtension({ initialActiveTools: ["read", "generate_image"] });
+				const recorder = uiRecorder();
+				const ctx = context(cwd, homeDir, { hasUI: true, ui: recorder.ctxUi });
+				await createActiveLiveTracker(extension, ctx, `${hook} cleanup`);
+
+				await runSessionLifecycle(extension, hook, ctx);
+
+				expect(recorder.customCalls.at(-1)?.doneResults).toEqual([undefined]);
+				expect(recorder.widgetCalls).toEqual([]);
+			} finally {
+				restoreFetch();
+			}
+		}
+	});
+
+	it("clears active live overlay on session_start while preserving image state cleanup", async () => {
+		const restoreFetch = installMockResponsesFetch(() => liveWebSearchEvent("session start cleanup"));
+		try {
+			const cwd = await makeTempDir();
+			const homeDir = await makeTempDir();
+			const artifactsDir = path.join(cwd, "artifacts");
+			const extension = registerExtension({ initialActiveTools: ["read", "generate_image"] });
+			const recorder = uiRecorder();
+			const ctx = context(cwd, homeDir, {
+				hasUI: true,
+				ui: recorder.ctxUi,
+				sessionManager: { getArtifactsDir: () => artifactsDir },
+			});
+			await runAgentEnd(extension, { message: imageGenerationMessage("img-1") }, ctx);
+			await createActiveLiveTracker(extension, ctx, "session start cleanup");
+
+			await runSessionStart(extension, ctx);
+			await runAgentEnd(extension, { message: imageGenerationMessage("img-1") }, ctx);
+
+			expect(recorder.customCalls.at(-1)?.doneResults).toEqual([undefined]);
+			expect(recorder.widgetCalls).toEqual([]);
+			expect(extension.sentMessages).toHaveLength(2);
+		} finally {
+			restoreFetch();
+		}
+	});
+
+	it("does not open live overlay when only setWidget exists", async () => {
+		const restoreFetch = installMockResponsesFetch(() => liveWebSearchEvent("rpc capability probing"));
+		try {
+			const cwd = await makeTempDir();
+			const homeDir = await makeTempDir();
+			const extension = registerExtension({ initialActiveTools: ["read", "generate_image"] });
+			const recorder = uiRecorder();
+			const ctx = context(cwd, homeDir, { hasUI: false, ui: { notify() {}, setWidget: recorder.ctxUi.setWidget } });
+
+			await createActiveLiveTracker(extension, ctx, "rpc capability probing");
+
+			expect(recorder.customCalls).toEqual([]);
+			expect(recorder.widgetCalls).toEqual([]);
+			expect(extension.sentMessages).toHaveLength(0);
+		} finally {
+			restoreFetch();
+		}
+	});
+
+	it("no-ops live overlay when custom is unavailable", async () => {
+		const restoreFetch = installMockResponsesFetch(() => liveWebSearchEvent("missing overlay capability"));
+		try {
+			const cwd = await makeTempDir();
+			const homeDir = await makeTempDir();
+			const extension = registerExtension({ initialActiveTools: ["read", "generate_image"] });
+			const ctx = context(cwd, homeDir, {
+				hasUI: true,
+				ui: { notify() {} },
+			});
+
+			await expect(createActiveLiveTracker(extension, ctx, "missing overlay capability")).resolves.toBeDefined();
+
+			expect(extension.sentMessages).toHaveLength(0);
+		} finally {
+			restoreFetch();
+		}
+	});
+
+	it("does not register image keepalive for web_search only live status streams", async () => {
+		const originalFetch = globalThis.fetch;
+		try {
+			let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+			globalThis.fetch = (async () => new Response(
+				new ReadableStream<Uint8Array>({
+					start(createdController) {
+						controller = createdController;
+					},
+				}),
+				{ headers: { "content-type": "text/event-stream" } },
+			)) as typeof fetch;
+			const cwd = await makeTempDir();
+			const homeDir = await makeTempDir();
+			const extension = registerExtension({ initialActiveTools: ["read", "generate_image"] });
+			const recorder = uiRecorder();
+			const ctx = context(cwd, homeDir, { hasUI: true, ui: recorder.ctxUi });
+			const payload: Record<string, unknown> = { model: "gpt-5", input: "hello", stream: true };
+
+			await runBeforeProvider(extension, payload, ctx, { requestModel: targetModel });
+			const response = await fetch("https://api.openai.com/v1/responses", {
+				method: "POST",
+				body: JSON.stringify(payload),
+			});
+			const reader = response.body?.getReader();
+			expect(reader).toBeDefined();
+			const firstRead = await readChunkWithTimeout(reader!, 25);
+			controller?.close();
+			await reader!.cancel().catch(() => undefined);
+
+			expect(firstRead.kind).toBe("timeout");
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	it("keeps live overlay and image interruption working for combined web_search and image_generation streams", async () => {
+		const restoreFetch = installMockResponsesFetch(() =>
+			liveWebSearchEvent("combined live image interruption") +
+			sseEvent({ type: "response.output_item.done", item: { type: "image_generation_call", id: "ig-1", result: ONE_BY_ONE_PNG, output_format: "png" } }) +
+			sseEvent({ type: "response.output_text.delta", delta: "SHOULD_NOT_PASS" }),
+		);
+		try {
+			const cwd = await makeTempDir();
+			const homeDir = await makeTempDir();
+			const extension = registerExtension({ initialActiveTools: ["read"] });
+			const recorder = uiRecorder();
+			const ctx = context(cwd, homeDir, { model: providerToolsInterruptImageModel, hasUI: true, ui: recorder.ctxUi });
+			const payload: Record<string, unknown> = { model: "gpt-5", input: "hello", stream: true };
+
+			await runBeforeProvider(extension, payload, ctx, { requestModel: providerToolsInterruptImageModel });
+			const text = await responseText(await fetch("https://gateway.example.invalid/v1/responses", {
+				method: "POST",
+				body: JSON.stringify(payload),
+			}));
+
+			expect(payload.tools).toEqual([{ type: "web_search" }, { type: "image_generation" }]);
+			expect(recorder.customCalls[0]?.component?.render(100).join("\n")).toContain("combined live image interruption");
+			expect(recorder.widgetCalls).toEqual([]);
+			expect(text).toContain("data: [DONE]");
+			expect(text).not.toContain("SHOULD_NOT_PASS");
+		} finally {
+			restoreFetch();
+		}
 	});
 
 	it("does not inject or remove active tools for custom providers without config or opt-in", async () => {

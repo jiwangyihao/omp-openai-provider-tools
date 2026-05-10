@@ -19,7 +19,8 @@ import {
 	providerToolResultKey,
 } from "./provider-results";
 import { registerProviderToolResultRenderer } from "./provider-result-renderer";
-import { installOpenAIResponsesImageInterruption, registerImageGenerationRequest, clearInterruptibleImageGenerationRequests } from "./stream-interruption";
+import { createProviderToolLiveStatusManager } from "./provider-tool-live-status";
+import { installOpenAIResponsesImageInterruption, registerProviderToolRequest, clearInterruptibleImageGenerationRequests } from "./stream-interruption";
 import type { ExtensionApiLike, ExtensionContextLike, ProviderToolType, ProviderToolsEntry, RuntimeModelLike } from "./types";
 
 interface ProviderRequestEventLike {
@@ -628,6 +629,11 @@ function requestPayload(event: unknown): unknown {
 	return (event as ProviderRequestEventLike | undefined)?.payload;
 }
 
+
+function providerToolLiveUiFromContext(ctx: ExtensionContextLike) {
+	return { hasUI: ctx.hasUI, setWidget: ctx.ui?.setWidget, custom: ctx.ui?.custom };
+}
+
 export default function openAIProviderToolsExtension(api: ExtensionApiLike): void {
 	api.setLabel?.("OpenAI Provider Tools");
 	registerProviderImageRenderer(api);
@@ -640,7 +646,21 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 	const seenImageResults = new Set<string>();
 	const seenProviderToolResults = new Set<string>();
 
+	const liveStatusManager = createProviderToolLiveStatusManager({ logger: api.logger });
+	const clearLiveStatus = () => {
+		try {
+			liveStatusManager.clearAll();
+		} catch (error) {
+			try {
+				api.logger?.warn?.(`OpenAI provider live status clear failed: ${error instanceof Error ? error.message : String(error)}`, error);
+			} catch {
+				// Live status cleanup must not break provider final echo handling.
+			}
+		}
+	};
+
 	api.on?.("session_start", async (_event, ctx) => {
+		clearLiveStatus();
 		expectedByTarget.clear();
 		incompatibleTargets.clear();
 		seenImageResults.clear();
@@ -652,6 +672,12 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 		clearInterruptibleImageGenerationRequests();
 		await preloadImageRuntimeState(imageResultState, ctx);
 	});
+
+	for (const eventName of ["session_before_switch", "session_switch", "session_branch", "session_shutdown"]) {
+		api.on?.(eventName, () => {
+			clearLiveStatus();
+		});
+	}
 
 	api.on?.("before_agent_start", async (_event, ctx) => {
 		const syntheticPayload = modelPayloadForBeforeAgent(ctx.model);
@@ -863,35 +889,47 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 			return undefined;
 		}
 
-		if (result.ensured.includes("image_generation")) {
-			registerImageGenerationRequest(payload, {
-				interruptOnImageResult: modelInterruptsProviderImageGeneration(eligibilityModel),
-				keepaliveIntervalMs: modelProviderImageGenerationKeepaliveIntervalMs(eligibilityModel),
-			});
-		}
+		registerProviderToolRequest(payload, {
+			enabledTools: result.ensured,
+			interruptOnImageResult: result.ensured.includes("image_generation") && modelInterruptsProviderImageGeneration(eligibilityModel),
+			keepaliveIntervalMs: result.ensured.includes("image_generation")
+				? modelProviderImageGenerationKeepaliveIntervalMs(eligibilityModel)
+				: undefined,
+			liveTracker: result.ensured.includes("web_search")
+				? liveStatusManager.createTracker({ enabledTools: result.ensured, ui: providerToolLiveUiFromContext(ctx) })
+				: undefined,
+		});
 		expectedByTarget.delete(key);
 		return undefined;
 	});
 
 	api.on?.("message_end", (event, ctx) => {
-		handleMessageEndImageResults({ api, ctx, event, state: imageResultState, seen: seenImageResults });
-		handleMessageEndProviderToolResults({ api, ctx, event, state: imageResultState, seen: seenProviderToolResults });
+		try {
+			handleMessageEndImageResults({ api, ctx, event, state: imageResultState, seen: seenImageResults });
+			handleMessageEndProviderToolResults({ api, ctx, event, state: imageResultState, seen: seenProviderToolResults });
+		} finally {
+			clearLiveStatus();
+		}
 	});
 
 	api.on?.("agent_end", async (event, ctx) => {
-		const pending = [...expectedByTarget.entries()].filter(([, state]) => state.removed);
-		for (const [key, state] of pending) {
-			await failAfterRemoval({
-				api,
-				ctx,
-				reason: "provider request was not observed after host-side tool removal",
-				state,
-				incompatibleTargets,
-				key,
-			});
-			expectedByTarget.delete(key);
+		try {
+			const pending = [...expectedByTarget.entries()].filter(([, state]) => state.removed);
+			for (const [key, state] of pending) {
+				await failAfterRemoval({
+					api,
+					ctx,
+					reason: "provider request was not observed after host-side tool removal",
+					state,
+					incompatibleTargets,
+					key,
+				});
+				expectedByTarget.delete(key);
+			}
+			handleAgentEndImageResults({ api, ctx, event, state: imageResultState, seen: seenImageResults });
+			handleAgentEndProviderToolResults({ api, ctx, event, state: imageResultState, seen: seenProviderToolResults });
+		} finally {
+			clearLiveStatus();
 		}
-		handleAgentEndImageResults({ api, ctx, event, state: imageResultState, seen: seenImageResults });
-		handleAgentEndProviderToolResults({ api, ctx, event, state: imageResultState, seen: seenProviderToolResults });
 	});
 }

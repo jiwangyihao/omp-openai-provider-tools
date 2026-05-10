@@ -48,6 +48,9 @@ describe("image agent CLI", () => {
 		expect(template).toContain("  - yield");
 		expect(template).toContain("主动收集上下文");
 		expect(template).toContain("最多主动再生成一次");
+		expect(template).toContain("必须调用 provider-native `image_generation` 工具作为最终产物");
+		expect(template).toContain("禁止只返回提示词");
+		expect(template).toContain("如果你能看到 image_generation 或 image_gen.imagegen，必须调用它");
 		expect(template).not.toContain("-Sys");
 	});
 
