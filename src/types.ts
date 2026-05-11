@@ -51,8 +51,7 @@ export interface ExtensionContextLike {
 	};
 	hasUI?: boolean;
 	ui?: {
-		notify?: (message: unknown, type?: "info" | "warning" | "error") => void | Promise<void>;
-		setStatus?: (key: string, text: string | undefined) => void;
+		notify?: (message: unknown) => void | Promise<void>;
 		setWidget?: (
 			key: string,
 			content: string[] | undefined,

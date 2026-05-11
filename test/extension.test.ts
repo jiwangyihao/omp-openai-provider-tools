@@ -184,8 +184,7 @@ function getHandlerFromMap(handlers: Map<string, Handler[]>, name: string): Hand
 }
 
 function context(cwd: string, homeDir: string, overrides: Record<string, unknown> = {}) {
-	const notifications: Array<{ message: unknown; type?: unknown }> = [];
-	return { cwd, homeDir, model: targetModel, __notifications: notifications, ui: { notify(message: unknown, type?: unknown) { notifications.push({ message, type }); } }, ...overrides };
+	return { cwd, homeDir, model: targetModel, ...overrides };
 }
 
 async function runBeforeAgent(extension: ReturnType<typeof registerExtension>, ctx: any) {
@@ -247,14 +246,12 @@ type TestOverlayComponent = { render(width: number): string[]; handleInput?(data
 function uiRecorder() {
 	const widgetCalls: Array<{ key: string; content: string[] | undefined; options?: unknown }> = [];
 	const customCalls: Array<{ args: unknown[]; options?: unknown; component?: TestOverlayComponent; doneResults: unknown[]; requestRenderCalls: number }> = [];
-	const notifications: Array<{ message: unknown; type?: unknown }> = [];
 	const theme = { fg(_token: string, value: string) { return value; } };
 	return {
 		widgetCalls,
-		notifications,
 		customCalls,
 		ctxUi: {
-			notify(message: unknown, type?: unknown) { notifications.push({ message, type }); },
+			notify() {},
 			setWidget(key: string, content: string[] | undefined, options?: unknown) {
 				widgetCalls.push({ key, content, options });
 			},
@@ -267,10 +264,6 @@ function uiRecorder() {
 			},
 		},
 	};
-}
-
-function ctxNotifications(ctx: any): Array<{ message: unknown; type?: unknown }> {
-	return Array.isArray(ctx.__notifications) ? ctx.__notifications : [];
 }
 
 async function runMessageEnd(extension: ReturnType<typeof registerExtension>, event: unknown, ctx: any) {
@@ -457,7 +450,7 @@ describe("OpenAI provider tools extension", () => {
 
 			await runMessageEnd(extension, { type: "message_end", message: webSearchMessage() }, ctx);
 
-			expect(recorder.notifications).toHaveLength(1);
+			expect(extension.sentMessages.length).toBe(beforeMessages + 1);
 			expect(recorder.customCalls.at(-1)?.doneResults).toEqual([undefined]);
 			expect(recorder.widgetCalls).toEqual([]);
 		} finally {
@@ -481,7 +474,7 @@ describe("OpenAI provider tools extension", () => {
 
 			await runMessageEnd(extension, { type: "message_end", message: webSearchMessage("echo closes overlay") }, ctx);
 
-			expect(recorder.notifications).toHaveLength(1);
+			expect(extension.sentMessages).toHaveLength(1);
 			expect(recorder.customCalls[0]?.doneResults).toEqual([undefined]);
 			expect(recorder.widgetCalls).toEqual([]);
 		} finally {
@@ -501,7 +494,7 @@ describe("OpenAI provider tools extension", () => {
 
 			await runAgentEnd(extension, { message: webSearchMessage() }, ctx);
 
-			expect(recorder.notifications).toHaveLength(1);
+			expect(extension.sentMessages).toHaveLength(1);
 			expect(recorder.customCalls.at(-1)?.doneResults).toEqual([undefined]);
 			expect(recorder.widgetCalls).toEqual([]);
 		} finally {
@@ -702,7 +695,7 @@ describe("OpenAI provider tools extension", () => {
 
 		expect(payload.tools).toBeUndefined();
 		expect(extension.warnings.join("\n")).toContain("active host-side tools remain");
-		expect(ctxNotifications(ctx).some(({ message }) => String((message as any).message ?? message).includes("active host-side tools remain"))).toBe(true);
+		expect(extension.sentMessages.some(({ message }) => String((message as any).content ?? message).includes("active host-side tools remain"))).toBe(true);
 	});
 
 	it("injects web_search for official OpenAI Responses from model metadata", async () => {
@@ -880,7 +873,7 @@ describe("OpenAI provider tools extension", () => {
 
 		expect(payload.tools).toBeUndefined();
 		expect(extension.warnings.join("\n")).toContain("active tool control API is unavailable");
-		expect(ctxNotifications(ctx).some(({ message }) => String((message as any).message ?? message).includes("active tool control API is unavailable"))).toBe(true);
+		expect(extension.sentMessages.some(({ message }) => String((message as any).content ?? message).includes("active tool control API is unavailable"))).toBe(true);
 	});
 
 	it("restores active tools and aborts when payload.tools is non-array after host-side removal", async () => {
@@ -910,7 +903,7 @@ describe("OpenAI provider tools extension", () => {
 
 		expect(extension.activeTools()).toEqual(["read", "web_search", "generate_image"]);
 		expect(extension.warnings.join("\n")).toContain("provider request was not observed after host-side tool removal");
-		expect(ctxNotifications(ctx).some(({ message }) => String((message as any).message ?? message).includes("provider request was not observed after host-side tool removal"))).toBe(true);
+		expect(extension.sentMessages.some(({ message }) => String((message as any).content ?? message).includes("provider request was not observed after host-side tool removal"))).toBe(true);
 	});
 
 	it("restores and aborts when a different request target follows host-side removal", async () => {
@@ -933,13 +926,11 @@ describe("OpenAI provider tools extension", () => {
 		expect(extension.activeTools()).toEqual(["read", "web_search", "generate_image"]);
 	});
 
-	it("echoes provider-native web_search results through ctx.ui.notify without steering", async () => {
+	it("echoes provider-native web_search results as a visible custom message without steering", async () => {
 		const cwd = await makeTempDir();
 		const homeDir = await makeTempDir();
 		const extension = registerExtension();
-		const recorder = uiRecorder();
 		const ctx = context(cwd, homeDir, {
-			ui: recorder.ctxUi,
 			sessionManager: {
 				getSessionId: () => "session-1",
 			},
@@ -947,14 +938,15 @@ describe("OpenAI provider tools extension", () => {
 
 		await runAgentEnd(extension, { message: webSearchMessage() }, ctx);
 
-		expect(extension.sentMessages).toHaveLength(0);
-		expect(recorder.notifications).toHaveLength(1);
-		expect(recorder.notifications[0]?.type).toBe("info");
-		const message = String(recorder.notifications[0]?.message ?? "");
-		expect(message).toContain("OpenAI provider completed web_search (1 call).");
-		expect(message).toContain("latest OMP provider tools");
-		expect(message).toContain("1 citation");
-		expect(message).not.toContain("OMP provider tools are available.");
+		expect(extension.sentMessages).toHaveLength(1);
+		expect(extension.sentMessages[0]?.options).toEqual({ deliverAs: "nextTurn" });
+		const message = extension.sentMessages[0]?.message as any;
+		expect(message.display).toBe(true);
+		expect(message.customType).toBe("openai-provider-tool-result");
+		expect(message.content).toBe("");
+		expect(message.details.queries).toContain("latest OMP provider tools");
+		expect(JSON.stringify(message.details)).toContain("https://example.invalid/omp-provider-tools");
+		expect(JSON.stringify(message.details)).not.toContain("OMP provider tools are available.");
 	});
 
 	it("logs provider-native web_search summary delivery failures without throwing", async () => {
@@ -965,7 +957,6 @@ describe("OpenAI provider tools extension", () => {
 				getSessionId: () => "session-1",
 			},
 		});
-		(ctx as any).ui = {};
 
 		// registerExtension does not expose api; exercise failure through a local extension instance.
 		const handlers = new Map<string, Handler[]>();
@@ -989,7 +980,7 @@ describe("OpenAI provider tools extension", () => {
 		expect(() => getHandlerFromMap(handlers, "agent_end")({ message: webSearchMessage() }, ctx)).not.toThrow();
 		await Promise.resolve();
 		await Promise.resolve();
-		expect(warnings.join("\n")).toContain("OpenAI provider tool result notification delivery failed");
+		expect(warnings.join("\n")).toContain("OpenAI provider tool result message delivery failed");
 	});
 
 	it("echoes provider-native web_search at message_end before agent_end and deduplicates later", async () => {
@@ -1005,17 +996,15 @@ describe("OpenAI provider tools extension", () => {
 
 		getHandler(extension, "message_end")({ type: "message_end", message }, ctx);
 
-		expect(extension.sentMessages).toHaveLength(0);
-		expect(ctxNotifications(ctx)).toHaveLength(1);
-		expect(String(ctxNotifications(ctx)[0]?.message ?? "")).toContain("latest OMP provider tools");
+		expect(extension.sentMessages).toHaveLength(1);
+		expect(extension.sentMessages[0]?.options).toEqual({ deliverAs: "nextTurn" });
+		expect((extension.sentMessages[0]?.message as any).content).toBe("");
 		await runAgentEnd(extension, { message }, ctx);
 
-		expect(extension.sentMessages).toHaveLength(0);
-		expect(ctxNotifications(ctx)).toHaveLength(1);
+		expect(extension.sentMessages).toHaveLength(1);
 		await runAgentEnd(extension, { message }, ctx);
 
-		expect(extension.sentMessages).toHaveLength(0);
-		expect(ctxNotifications(ctx)).toHaveLength(1);
+		expect(extension.sentMessages).toHaveLength(1);
 	});
 
 	it("does not let incomplete message_end web_search echoes suppress final agent_end details", async () => {
@@ -1036,9 +1025,8 @@ describe("OpenAI provider tools extension", () => {
 
 		await runAgentEnd(extension, { message: completed }, ctx);
 
-		expect(extension.sentMessages).toHaveLength(0);
-		expect(ctxNotifications(ctx)).toHaveLength(1);
-		expect(String(ctxNotifications(ctx)[0]?.message ?? "")).toContain("latest OMP provider tools");
+		expect(extension.sentMessages).toHaveLength(1);
+		expect(JSON.stringify((extension.sentMessages[0]?.message as any).details)).toContain("https://example.invalid/omp-provider-tools");
 	});
 
 	it("saves an image_generation_call result and sends a visible message without base64", async () => {
@@ -1524,14 +1512,14 @@ describe("OpenAI provider tools extension", () => {
 
 		await runAgentEnd(extension, { message }, ctx);
 
-		expect(extension.sentMessages).toHaveLength(0);
-		expect(ctxNotifications(ctx)).toHaveLength(1);
-		const sent = ctxNotifications(ctx)[0]!;
-		expect(String(sent.message)).toContain("OpenAI provider completed web_search (2 calls).");
-		expect(String(sent.message)).toContain("provider native image_generation");
-		expect(String(sent.message)).toContain("latest OMP provider tools");
-		expect(String(sent.message)).not.toContain("Call:");
-		expect(String(sent.message)).not.toContain("Status:");
+		expect(extension.sentMessages).toHaveLength(1);
+		expect(extension.sentMessages[0]?.options).toEqual({ deliverAs: "nextTurn" });
+		const sent = extension.sentMessages[0]?.message as any;
+		expect(sent.content).toBe("");
+		expect(sent.details.queries).toEqual(["provider native image_generation", "latest OMP provider tools"]);
+		expect(JSON.stringify(sent.details)).not.toContain("Call:");
+		expect(JSON.stringify(sent.details)).not.toContain("Status:");
+		expect(sent.details.results).toHaveLength(2);
 	});
 
 

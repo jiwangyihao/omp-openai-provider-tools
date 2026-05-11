@@ -479,33 +479,8 @@ function handleMessageEndImageResults({
 	normalizeProviderImageGenerationReplayItemsFromEvent(event);
 }
 
-async function sendVisibleProviderToolResultMessage(api: ExtensionApiLike, ctx: ExtensionContextLike, message: unknown): Promise<void> {
-	const rendered = providerToolResultNotificationText(message);
-	if (ctx.ui?.notify) {
-		await ctx.ui.notify(rendered, "info");
-		return;
-	}
-	if (api.sendMessage) {
-		await api.sendMessage({ ...asRecord(message), content: rendered, display: true }, { deliverAs: "nextTurn" });
-	}
-}
-
-function asRecord(value: unknown): Record<string, unknown> {
-	return isRecord(value) ? value : {};
-}
-
-function providerToolResultNotificationText(message: unknown): string {
-	const details = isRecord(message) && isRecord(message.details) ? message.details : {};
-	const lines: string[] = [];
-	const summary = typeof details.summary === "string" ? details.summary : "OpenAI provider completed web_search.";
-	lines.push(summary);
-	const queries = Array.isArray(details.queries) ? details.queries.flatMap(entry => typeof entry === "string" && entry.trim() ? [entry.trim()] : []) : [];
-	if (queries.length > 0) lines.push(`Queries: ${queries.join("; ")}`);
-	const citationCount = Array.isArray(details.citations) ? details.citations.length : 0;
-	const sourceCount = Array.isArray(details.sources) ? details.sources.length : 0;
-	const counts = [citationCount > 0 ? `${citationCount} citation${citationCount === 1 ? "" : "s"}` : undefined, sourceCount > 0 ? `${sourceCount} source${sourceCount === 1 ? "" : "s"}` : undefined].filter(Boolean);
-	if (counts.length > 0) lines.push(counts.join(", "));
-	return lines.join("\n");
+async function sendVisibleProviderToolResultMessage(api: ExtensionApiLike, message: unknown): Promise<void> {
+	await api.sendMessage?.(message, { deliverAs: "nextTurn" });
 }
 
 function handleProviderToolResults({
@@ -531,7 +506,7 @@ function handleProviderToolResults({
 		newResults.push(result);
 	}
 	if (newResults.length > 0) {
-		consumePromiseLater(api, ctx, sendVisibleProviderToolResultMessage(api, ctx, buildProviderToolResultSummaryMessage(newResults)), "OpenAI provider tool result notification delivery failed");
+		consumePromiseLater(api, ctx, sendVisibleProviderToolResultMessage(api, buildProviderToolResultSummaryMessage(newResults)), "OpenAI provider tool result message delivery failed");
 	}
 }
 
@@ -579,9 +554,9 @@ function handleMessageEndProviderToolResults({
 		return;
 	}
 	// Provider-native web_search summaries are UI-only and invisible to the agent
-	// when delivered through ctx.ui.notify. Emitting at message_end surfaces the
-	// provider result before agent_end, while dedupe keeps the agent_end fallback
-	// from showing it twice.
+	// (`content` is intentionally empty). Emitting at message_end surfaces the
+	// provider result before any subsequent local tool execution, while dedupe
+	// keeps the agent_end fallback from showing it twice.
 	handleProviderToolResults({ api, ctx, results, state, seen });
 }
 async function notifyWarning(api: ExtensionApiLike, ctx: ExtensionContextLike, message: string): Promise<void> {
