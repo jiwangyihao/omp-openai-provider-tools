@@ -84,7 +84,7 @@ OpenAI provider-executed tools 通常不会把原始工具输出暴露给宿主�
 
 - **展示 provider-native `web_search` 回显**
   - 每轮请求中如果 provider 调用了 `web_search`，插件会聚合展示调用次数和检索词。
-  - 回显用于提示用户「provider 侧发生了搜索」，会以非触发式 next-turn 可见消息追加，避免在 streaming / 本地工具执行期间作为 steer 消息中断后续工具；也不会把 query/citation/source 再塞回 Agent 上下文。
+  - 回显用于提示用户「provider 侧发生了搜索」，优先通过 `ctx.ui.notify` 立即插入当前交互 UI 的消息列表；这是 UI-only 通道，不会写入 Agent message、不会进入 LLM 上下文，也不会在 streaming / 本地工具执行期间作为 steer 消息中断后续工具。缺少 `ctx.ui.notify` 的 runtime 才退回到非触发式 next-turn 可见消息。
   - `web_search` 的原始 provider-side 检索结果仍只在当次 provider 请求内部可用。
 
 - **实时展示 provider-native `web_search` 状态**
@@ -291,11 +291,12 @@ npx omp-openai-provider-tools configure-image-agent --model <image-capable-model
 注入 OpenAI Responses 请求。provider 如果在这轮请求里执行了搜索，OMP 终端会出现类似回显：
 
 ```text
-[openai-provider-tool-result]
 OpenAI provider completed web_search (1 call).
+Queries: latest OMP provider tools
+1 citation
 ```
 
-展开后可看到检索词、引用和 sources（如果 provider history 中保留了这些信息）。这些 UI 回显以非触发式 next-turn 可见消息追加，避免在本地工具执行期间作为 steer 消息中断后续工具；也不会进入 Agent 上下文。
+在支持 `ctx.ui.notify` 的交互 runtime 中，这条 UI-only 回显会立即插入当前消息列表，只显示 summary、检索词以及 citation/source 计数；它不会进入 Agent 上下文，也不会作为 steer 消息中断后续工具。缺少 `ctx.ui.notify` 的 runtime 才退回到非触发式 next-turn 可见消息，legacy fallback 中仍可通过自定义消息 renderer 展开查看 provider history 保留的引用和 sources。
 
 如果 runtime 支持 `ctx.ui.custom(..., { overlay: true })`，provider-native `web_search_call` 流式事件到达且 provider 暴露了 query/source/error 等可展示细节时，还会自动弹出一块临时 dashboard-style overlay，实时提示 query、状态和 source 计数。这个 overlay 是 UI-only，不持久化、不进入 Agent 上下文，也不会替代请求结束后的 summary 回显；完成状态会短暂保留后自动关闭，且 summary 回显出现时会立即关闭 overlay。headless / print / RPC / 旧 runtime 缺少交互 overlay 能力时自动降级为 no-op，且不会回退显示旧的短状态 widget。`image_generation` 不显示实时 overlay。
 
@@ -384,7 +385,7 @@ Provider-executed `web_search` lets the main Agent use provider-side search resu
 - Safely removes conflicting host-side `web_search` / `generate_image` tools only when provider-native injection is ensured.
 - Never sets `tool_choice`.
 - Installing the plugin does not globally disable host-side tools; host-side conflict handling happens at runtime for the currently selected provider/model, immediately before the agent run and provider request.
-- Emits visible UI-only summaries for provider-native `web_search` calls as non-triggering `nextTurn` messages, so the summary does not steer the current run or interrupt later local tools.
+- Emits visible UI-only summaries for provider-native `web_search` calls through `ctx.ui.notify` when available, so the summary appears promptly in the interactive message list without entering Agent context, steering the current run, or interrupting later local tools. Runtimes without `ctx.ui.notify` fall back to non-triggering `nextTurn` messages.
 - Automatically opens a temporary UI-only dashboard-style overlay for provider-native `web_search` stream events on interactive runtimes that expose `ctx.ui.custom(..., { overlay: true })` once provider events include displayable query/source/error details.
 - The live overlay is not persisted, is not sent as a session message, and is not visible to the Agent. Completed status stays visible briefly and then auto-closes; final `web_search` summaries still come from `message_end` / `agent_end` and close the overlay immediately when echoed. Headless, print, RPC, or older runtimes without interactive overlay support degrade to no-op and the plugin does not fall back to the old short status widget.
 - Provider-native `image_generation` does not use a live overlay; it keeps the existing keepalive, optional interruption, save, and final echo paths.
