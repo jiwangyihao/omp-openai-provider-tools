@@ -98,6 +98,41 @@ describe("OpenAI Responses stream observer", () => {
 		expect(recorder.calls).toEqual([]);
 	});
 
+	it("preserves provider request policies registered after fetch starts", async () => {
+		const originalFetch = globalThis.fetch;
+		try {
+			const recorder = trackerRecorder();
+			const payload = { model: "gpt-5", input: "hello", stream: true };
+			let releaseFetch!: () => void;
+			const fetchStarted = new Promise<void>(resolve => {
+				globalThis.fetch = (async () => {
+					resolve();
+					await new Promise<void>(release => { releaseFetch = release; });
+					return new Response(sseEvent({ type: "response.output_item.added", item: { type: "web_search_call", id: "ws-late" } }), {
+						headers: { "content-type": "text/event-stream" },
+					});
+				}) as typeof fetch;
+			});
+			installOpenAIResponsesImageInterruption();
+
+			const responsePromise = fetch("https://gateway.example.invalid/v1/responses", { method: "POST", body: JSON.stringify(payload) });
+			await fetchStarted;
+			registerProviderToolRequest(payload, {
+				enabledTools: ["web_search"],
+				interruptOnImageResult: false,
+				liveTracker: recorder.tracker,
+			});
+			releaseFetch();
+
+			const response = await responsePromise;
+			await responseText(response.body!);
+
+			expect(recorder.events).toEqual([{ type: "response.output_item.added", item: { type: "web_search_call", id: "ws-late" } }]);
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
 	it("does not send image_generation_call to live tracker but preserves image interruption", async () => {
 		const recorder = trackerRecorder();
 		const imageEvent = sseEvent({ type: "response.output_item.done", item: { type: "image_generation_call", id: "ig-1", result: "abc" } });
@@ -112,6 +147,21 @@ describe("OpenAI Responses stream observer", () => {
 		expect(text).not.toContain("SHOULD_NOT_PASS");
 		expect(recorder.events).toEqual([]);
 		expect(recorder.calls).toEqual(["clear"]);
+	});
+
+	it("does not forward raw image_generation_call add or done events to live tracker", async () => {
+		const recorder = trackerRecorder();
+		const imageAdded = sseEvent({ type: "response.output_item.added", item: { type: "image_generation_call", id: "ig-1" } });
+		const imageDone = sseEvent({ type: "response.output_item.done", item: { type: "image_generation_call", id: "ig-1" } });
+
+		const text = await responseText(wrapOpenAIResponsesStream(
+			new Response(imageAdded + imageDone).body!,
+			{ interruptOnImageResult: false, keepaliveIntervalMs: undefined, liveTracker: recorder.tracker },
+		));
+
+		expect(text).toBe(imageAdded + imageDone);
+		expect(recorder.events).toEqual([]);
+		expect(recorder.calls).toEqual([]);
 	});
 
 	it("isolates live tracker onEvent errors from raw SSE forwarding", async () => {
@@ -149,6 +199,70 @@ describe("OpenAI Responses stream observer", () => {
 		expect(recorder.events).toEqual([
 			{ type: "response.output_item.added", item: { type: "web_search_call", id: "ws-1", action: { query: "observed" } } },
 			{ type: "response.completed", response: { id: "resp-1" } },
+		]);
+		expect(recorder.calls).toEqual([]);
+	});
+
+	it("forwards raw web_search in_progress and completed lifecycle events with item_id while preserving SSE", async () => {
+		const recorder = trackerRecorder();
+		const inProgressEvent = { type: "response.web_search_call.in_progress", item_id: "ws-1", output_index: 0, sequence_number: 10 };
+		const completedLifecycleEvent = { type: "response.web_search_call.completed", item_id: "ws-1", output_index: 0, sequence_number: 11 };
+		const responseCompletedEvent = { type: "response.completed", response: { id: "resp-1" } };
+		const raw = sseEvent(inProgressEvent) + sseEvent(completedLifecycleEvent) + sseEvent(responseCompletedEvent);
+
+		const text = await responseText(wrapOpenAIResponsesStream(
+			new Response(raw).body!,
+			{ interruptOnImageResult: false, keepaliveIntervalMs: undefined, liveTracker: recorder.tracker },
+		));
+
+		expect(text).toBe(raw);
+		expect(recorder.events).toEqual([
+			inProgressEvent,
+			completedLifecycleEvent,
+			responseCompletedEvent,
+		]);
+		expect(recorder.calls).toEqual([]);
+	});
+
+	it("forwards raw web_search searching lifecycle with only item_id and then response.completed", async () => {
+		const recorder = trackerRecorder();
+		const searchingEvent = { type: "response.web_search_call.searching", item_id: "ws-2" };
+		const responseCompletedEvent = { type: "response.completed", response: { id: "resp-2" } };
+		const raw = sseEvent(searchingEvent) + sseEvent(responseCompletedEvent);
+
+		const text = await responseText(wrapOpenAIResponsesStream(
+			new Response(raw).body!,
+			{ interruptOnImageResult: false, keepaliveIntervalMs: undefined, liveTracker: recorder.tracker },
+		));
+
+		expect(text).toBe(raw);
+		expect(recorder.events).toEqual([
+			searchingEvent,
+			responseCompletedEvent,
+		]);
+		expect(recorder.calls).toEqual([]);
+	});
+
+	it("forwards SDK iterable web_search lifecycle events without altering yielded values", async () => {
+		const recorder = trackerRecorder();
+		const inProgressEvent = { type: "response.web_search_call.in_progress", item_id: "ws-3", output_index: 0, sequence_number: 1 };
+		const responseCompletedEvent = { type: "response.completed", response: { id: "resp-3" } };
+		const source = (async function* () {
+			yield inProgressEvent;
+			yield responseCompletedEvent;
+		})();
+
+		const iterator = wrapOpenAIResponsesEventIterable(
+			source,
+			{ interruptOnImageResult: false, keepaliveIntervalMs: undefined, liveTracker: recorder.tracker },
+		)[Symbol.asyncIterator]();
+
+		await expect(iterator.next()).resolves.toEqual({ value: inProgressEvent, done: false });
+		await expect(iterator.next()).resolves.toEqual({ value: responseCompletedEvent, done: false });
+		await expect(iterator.next()).resolves.toEqual({ value: undefined, done: true });
+		expect(recorder.events).toEqual([
+			inProgressEvent,
+			responseCompletedEvent,
 		]);
 		expect(recorder.calls).toEqual([]);
 	});
@@ -239,6 +353,27 @@ describe("OpenAI Responses stream observer", () => {
 			{ interruptOnImageResult: false, keepaliveIntervalMs: undefined, liveTracker: recorder.tracker },
 		)[Symbol.asyncIterator]().next()).rejects.toBe(upstreamError);
 		expect(recorder.calls).toEqual(["fail", "clear"]);
+	});
+
+	it("keeps SDK iterable tracker alive after normal response.completed", async () => {
+		const recorder = trackerRecorder();
+		const webEvent = { type: "response.output_item.added", item: { type: "web_search_call", id: "ws-1", action: { query: "sdk observed" } } };
+		const completedEvent = { type: "response.completed", response: { id: "resp-1" } };
+		const source = (async function* () {
+			yield webEvent;
+			yield completedEvent;
+		})();
+
+		const iterator = wrapOpenAIResponsesEventIterable(
+			source,
+			{ interruptOnImageResult: false, keepaliveIntervalMs: undefined, liveTracker: recorder.tracker },
+		)[Symbol.asyncIterator]();
+
+		await expect(iterator.next()).resolves.toEqual({ value: webEvent, done: false });
+		await expect(iterator.next()).resolves.toEqual({ value: completedEvent, done: false });
+		await expect(iterator.next()).resolves.toEqual({ value: undefined, done: true });
+		expect(recorder.events).toEqual([webEvent, completedEvent]);
+		expect(recorder.calls).toEqual([]);
 	});
 
 	it("clears SDK iterable tracker and aborts on return", async () => {
@@ -334,6 +469,29 @@ describe("OpenAI Responses stream observer", () => {
 		)[Symbol.asyncIterator]();
 
 		await expect(iterator.next()).resolves.toEqual({ value: event, done: false });
+		expect(recorder.events).toEqual([]);
+		expect(recorder.calls).toEqual([]);
+	});
+
+	it("does not clear SDK iterable tracker on normal completion when live observation is disabled", async () => {
+		const recorder = trackerRecorder();
+		const event = { type: "response.completed", response: { id: "resp-1" } };
+		const source = (async function* () {
+			yield event;
+		})();
+
+		const iterator = wrapOpenAIResponsesEventIterable(
+			source,
+			{
+				interruptOnImageResult: false,
+				keepaliveIntervalMs: undefined,
+				liveTracker: recorder.tracker,
+				observeLiveEventsInIterable: false,
+			},
+		)[Symbol.asyncIterator]();
+
+		await expect(iterator.next()).resolves.toEqual({ value: event, done: false });
+		await expect(iterator.next()).resolves.toEqual({ value: undefined, done: true });
 		expect(recorder.events).toEqual([]);
 		expect(recorder.calls).toEqual([]);
 	});

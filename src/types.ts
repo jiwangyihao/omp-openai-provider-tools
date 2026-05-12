@@ -48,6 +48,7 @@ export interface ExtensionContextLike {
 	sessionManager?: {
 		getArtifactsDir?: () => string | undefined | Promise<string | undefined>;
 		getSessionId?: () => string | undefined | Promise<string | undefined>;
+		getBranch?: () => unknown;
 	};
 	hasUI?: boolean;
 	ui?: {
@@ -63,6 +64,7 @@ export interface ExtensionContextLike {
 		) => Promise<undefined> | undefined;
 	};
 	abort?: (reason?: string) => void | Promise<void>;
+	isIdle?: () => boolean;
 }
 
 export interface ExtensionApiLike {
@@ -76,6 +78,7 @@ export interface ExtensionApiLike {
 	getActiveTools?: () => RuntimeActiveTool[] | Promise<RuntimeActiveTool[]>;
 	setActiveTools?: (tools: RuntimeActiveTool[]) => void | Promise<void>;
 	sendMessage?: (message: unknown, options?: unknown) => void | Promise<void>;
+	appendEntry?: (customType: string, data: unknown) => void | Promise<void>;
 	registerMessageRenderer?: (customType: string, renderer: (message: unknown, options: { expanded: boolean }, theme: unknown) => unknown) => void;
 }
 

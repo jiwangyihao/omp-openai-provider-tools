@@ -2,28 +2,59 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
-describe("live status documentation", () => {
-	it("documents provider web_search live status and image_generation exclusion", async () => {
+describe("runtime documentation", () => {
+	it("documents idle-gated UI-only web_search final card semantics", async () => {
 		const readme = await fs.readFile(path.join(import.meta.dir, "../README.md"), "utf8");
 		const compatibility = await fs.readFile(path.join(import.meta.dir, "../docs/runtime-compatibility.md"), "utf8");
+		const combined = `${readme}\n${compatibility}`;
 
-		expect(readme).toContain("实时展示 provider-native `web_search` 状态");
-		expect(readme).toContain("dashboard-style overlay");
-		expect(readme).toContain("`message_end` / `agent_end`");
-		expect(readme).toContain("does not fall back to the old short status widget");
-		expect(readme).toContain("完成状态会短暂保留");
-		expect(readme).toContain("回显出现时会立即关闭 overlay");
-		expect(readme).toContain("非触发式 next-turn 可见消息");
-		expect(readme).toContain("避免在本地工具执行期间作为 steer 消息中断后续工具");
-		expect(readme).toContain("`image_generation` 不显示实时 overlay");
-		expect(compatibility).toContain("Live status overlay UI");
-		expect(compatibility).toContain("ctx.ui.custom");
-		expect(compatibility).toContain("no-op");
-		expect(compatibility).toContain("Completed status auto-closes after a short delay");
-		expect(compatibility).toContain("non-triggering `deliverAs: \"nextTurn\"`");
-		expect(compatibility).toContain("Do not open overlay for queryless placeholder events");
-		expect(compatibility).toContain("final result echo/lifecycle cleanup closes any active overlay immediately");
-		expect(compatibility).toContain("Do not create live overlay status for provider-native `image_generation`");
+		const requiredSnippets = [
+			"idle-gated display custom message",
+			"context hook filtering",
+			"UI-only custom entry replay",
+			"after the runtime reports idle",
+			"filtered from LLM context",
+			"persisted and replayed through UI-only custom entries",
+			"does not use non-overlay `ctx.ui.custom(..., { overlay: false })`",
+			"editor replacement semantics",
+			"does not use `{ deliverAs: \"nextTurn\" }` as the interactive primary path",
+			"degrades without breaking the editor",
+		];
+
+		for (const snippet of requiredSnippets) {
+			expect(combined).toContain(snippet);
+		}
+
+		const forbiddenSnippets = [
+			"非 overlay final `web_search` custom card 保留在 editor 区域",
+			"non-overlay final `web_search` custom card remains editor-resident",
+			"Use this as the preferred UI-only final result card",
+			"Prefer non-overlay `ctx.ui.custom(..., { overlay: false })` for provider-native `web_search` final result cards",
+		];
+
+		for (const snippet of forbiddenSnippets) {
+			expect(combined).not.toContain(snippet);
+		}
+	});
+
+	it("documents web_search live overlay lifecycle, timing defaults, and image_generation exclusion", async () => {
+		const readme = await fs.readFile(path.join(import.meta.dir, "../README.md"), "utf8");
+		const compatibility = await fs.readFile(path.join(import.meta.dir, "../docs/runtime-compatibility.md"), "utf8");
+		const combined = `${readme}\n${compatibility}`;
+
+		const requiredSnippets = [
+			"counts `response.web_search_call.in_progress`, `response.web_search_call.searching`, and `response.web_search_call.completed`",
+			"tracks `response.output_item.added` and `response.output_item.done`",
+			"hides temporary provider IDs such as `res_...`, `resp_...`, or `unknown`",
+			"collapse 3000 ms, hide 8000 ms, and auto-close 10000 ms",
+			"final card delivery closes the active overlay only after the idle display send starts",
+			"Provider-native `image_generation` does not use a live overlay and remains provider-native",
+		];
+
+		for (const snippet of requiredSnippets) {
+			expect(combined).toContain(snippet);
+		}
+
 		expect(readme).not.toContain("短状态行");
 		expect(readme).not.toContain("RPC mode 如果提供 `string[]` `setWidget`");
 	});

@@ -1,11 +1,13 @@
 import type { LoggerLike, ProviderToolType } from "./types";
+import { displayProviderWebSearchQuery, normalizeProviderWebSearchQueryForIdentity } from "./provider-results";
 
 export const LIVE_STATUS_WIDGET_KEY = "openai-provider-tools-live";
 
 const DEFAULT_THROTTLE_MS = 250;
 const MAX_QUERIES = 3;
-const MAX_QUERY_CHARS = 140;
-const DEFAULT_COMPLETED_AUTO_CLOSE_MS = 3_000;
+const DEFAULT_COMPLETED_AUTO_CLOSE_MS = 10_000;
+const DEFAULT_COMPLETED_COLLAPSE_MS = 3_000;
+const DEFAULT_COMPLETED_HIDE_MS = 8_000;
 const DEFAULT_OVERLAY_WIDTH = 80;
 
 type Placement = "aboveEditor" | "belowEditor";
@@ -18,8 +20,10 @@ export interface LiveOverlayCallSnapshot {
 	phase: Phase;
 	queries: string[];
 	sourceCount?: number;
+	actionDetails?: string[];
 	error?: string;
 	updatedAt: number;
+	collapsed?: boolean;
 }
 
 export interface LiveOverlaySnapshot {
@@ -71,20 +75,33 @@ export interface ProviderToolLiveStatusManager {
 	clearAll(): void;
 }
 
+type LiveStatusTimer = number | ReturnType<typeof setTimeout>;
+
 interface SchedulerLike {
-	setTimeout(handler: () => void, timeout: number): ReturnType<typeof setTimeout>;
-	clearTimeout(handle: ReturnType<typeof setTimeout>): void;
+	setTimeout(handler: () => void, timeout: number): LiveStatusTimer;
+	clearTimeout(handle: LiveStatusTimer): void;
 }
 
 interface LiveToolStatus {
 	id: string;
+	displayId: string;
+	finalProviderItemId?: string;
+	providerItemIds: Set<string>;
+	ordinal: number;
+	requestLocalKey?: string;
 	phase: Phase;
+	visibility: "full" | "collapsed" | "hidden";
+	completionGeneration: number;
 	startedAt: number;
 	updatedAt: number;
+	normalizedQueries: string[];
 	queries: string[];
 	status?: string;
 	sourceCount?: number;
+	actionDetails: string[];
 	error?: string;
+	collapseTimer?: LiveStatusTimer;
+	hideTimer?: LiveStatusTimer;
 }
 
 interface EventRecord {
@@ -104,6 +121,18 @@ interface ItemRecord {
 	sources?: unknown;
 	results?: unknown;
 	[key: string]: unknown;
+}
+
+interface StatusPatch {
+	providerItemId?: string;
+	providerItemIdIsFinal: boolean;
+	requestLocalKey?: string;
+	normalizedQueries: string[];
+	displayQueries: string[];
+	sourceCount?: number;
+	actionDetails: string[];
+	phase: Phase;
+	itemStatus?: string;
 }
 
 export function renderProviderToolLiveOverlay(
@@ -130,10 +159,10 @@ export function renderProviderToolLiveOverlay(
 	lines.push(truncateToWidth(color(theme, "borderMuted", "-".repeat(normalizedWidth)), normalizedWidth));
 
 	const calls = snapshot.calls.slice(0, maxCalls);
-	if (calls.length === 0) {
+	if (calls.length === 0 && snapshot.phase !== "completed") {
 		lines.push(truncateToWidth("┌ web_search_call pending  searching", normalizedWidth));
 		lines.push(truncateToWidth("└ updated now", normalizedWidth));
-	} else {
+	} else if (calls.length > 0) {
 		for (const call of calls) {
 			const callPhaseToken = call.phase === "failed" ? "error" : call.phase === "completed" ? "success" : "warning";
 			const sourceText = typeof call.sourceCount === "number" ? `  sources ${call.sourceCount}` : "";
@@ -141,11 +170,21 @@ export function renderProviderToolLiveOverlay(
 				`┌ web_search_call ${shortId(call.id)}  ${color(theme, callPhaseToken, call.phase)}${sourceText}`,
 				normalizedWidth,
 			));
-			const queries = call.queries.length > 0 ? call.queries : ["waiting for provider query"];
+			if (call.collapsed) {
+				const summary = call.queries.length > 0 ? `  ${call.queries.slice(0, MAX_QUERIES).join("; ")}` : "";
+				lines.push(truncateToWidth(`└ updated ${formatAge(now, call.updatedAt)}${summary}`, normalizedWidth));
+				continue;
+			}
+			const queries = call.queries.length > 0 ? call.queries : call.actionDetails && call.actionDetails.length > 0 ? [] : ["waiting for provider query"];
 			queries.slice(0, MAX_QUERIES).forEach((query, index) => {
 				const labelText = queries.length > 1 ? `query ${index + 1}/${Math.min(queries.length, MAX_QUERIES)}` : "query";
 				lines.push(truncateToWidth(`│ ${labelText}  "${query}"`, normalizedWidth));
 			});
+			if (call.actionDetails && call.actionDetails.length > 0) {
+				for (const detail of call.actionDetails.slice(0, MAX_QUERIES)) {
+					lines.push(truncateToWidth(`│ action  ${detail}`, normalizedWidth));
+				}
+			}
 			if (call.error) {
 				lines.push(truncateToWidth(`│ error  ${call.error}`, normalizedWidth));
 			}
@@ -167,6 +206,8 @@ export function createProviderToolLiveStatusManager(
 		throttleMs?: number;
 		placement?: Placement;
 		completedAutoCloseMs?: number;
+		completedCollapseMs?: number;
+		completedHideMs?: number;
 	} = {},
 ): ProviderToolLiveStatusManager {
 	const logger = options.logger;
@@ -176,8 +217,9 @@ export function createProviderToolLiveStatusManager(
 	const throttleMs = options.throttleMs ?? DEFAULT_THROTTLE_MS;
 	void options.placement;
 	const completedAutoCloseMs = options.completedAutoCloseMs ?? DEFAULT_COMPLETED_AUTO_CLOSE_MS;
+	const completedCollapseMs = options.completedCollapseMs ?? DEFAULT_COMPLETED_COLLAPSE_MS;
+	const completedHideMs = options.completedHideMs ?? DEFAULT_COMPLETED_HIDE_MS;
 	const activeTrackers = new Set<LiveTracker>();
-	let disabled = false;
 
 	function warn(message: string, error: unknown): void {
 		try {
@@ -195,21 +237,23 @@ export function createProviderToolLiveStatusManager(
 		}
 	}
 
-	function disableAfterOverlayFailure(error: unknown): void {
-		disabled = true;
-		warn("OpenAI provider live overlay update failed; disabling live status UI", error);
-		for (const tracker of [...activeTrackers]) {
-			tracker.disable();
-		}
+	function handleOverlayFailure(tracker: LiveTracker, error: unknown): void {
+		warn("OpenAI provider live overlay update failed; disabling current live status UI", error);
+		tracker.disable();
 	}
 
 	class LiveTracker implements ProviderToolLiveTracker {
 		private readonly statuses = new Map<string, LiveToolStatus>();
-		private pendingRender: ReturnType<typeof setTimeout> | undefined;
-		private pendingAutoClose: ReturnType<typeof setTimeout> | undefined;
+		private readonly itemIdToStableKey = new Map<string, string>();
+		private readonly requestLocalKeyToStableKey = new Map<string, string>();
+		private readonly queryToStableKeys = new Map<string, Set<string>>();
+		private nextOrdinal = 1;
+		private pendingRender: LiveStatusTimer | undefined;
+		private pendingAutoClose: LiveStatusTimer | undefined;
 		private ended = false;
 		private openingOverlay = false;
 		private overlay: { requestRender?: () => void; close?: () => void; open: boolean } | undefined;
+		private requestCompleted = false;
 		private readonly startedAt = now();
 
 		constructor(private readonly ui: ProviderToolLiveUiSink | undefined) {}
@@ -227,9 +271,12 @@ export function createProviderToolLiveStatusManager(
 			if (this.ended) return;
 			this.cancelPendingRender();
 			this.cancelPendingAutoClose();
+			this.cancelAllCompletedTimers();
 			const timestamp = now();
 			const status = this.firstStatus() ?? this.createStatus("failure", timestamp);
 			status.phase = "failed";
+			status.visibility = "full";
+			status.completionGeneration += 1;
 			status.updatedAt = timestamp;
 			status.error = describeError(error);
 			this.statuses.set(status.id, status);
@@ -242,6 +289,7 @@ export function createProviderToolLiveStatusManager(
 		clear(): void {
 			this.cancelPendingRender();
 			this.cancelPendingAutoClose();
+			this.cancelAllCompletedTimers();
 			if (!this.ended) {
 				this.ended = true;
 				this.closeOverlay();
@@ -279,9 +327,13 @@ export function createProviderToolLiveStatusManager(
 		disable(): void {
 			this.cancelPendingRender();
 			this.cancelPendingAutoClose();
+			this.cancelAllCompletedTimers();
+			if (!this.ended) {
+				this.ended = true;
+				this.closeOverlay();
+			}
 			this.overlay = undefined;
 			this.openingOverlay = false;
-			this.ended = true;
 			activeTrackers.delete(this);
 		}
 
@@ -291,13 +343,14 @@ export function createProviderToolLiveStatusManager(
 			const eventType = typeof typedEvent.type === "string" ? typedEvent.type : undefined;
 
 			if (eventType === "response.completed") {
-				if (!this.hasRenderableStatuses()) {
-					this.disable();
+				this.requestCompleted = true;
+				if (!this.hasVisibleStatuses()) {
+					this.clear();
 					return;
 				}
 				this.markIncompleteStatuses("completed");
 				this.renderNow();
-				this.scheduleAutoClose();
+				this.scheduleAutoCloseIfComplete();
 				return;
 			}
 
@@ -310,76 +363,280 @@ export function createProviderToolLiveStatusManager(
 				if (!isRecord(typedEvent.item)) return;
 				const item = typedEvent.item as ItemRecord;
 				if (item.type !== "web_search_call") return;
-				this.upsertStatus(item, typedEvent, eventType === "response.output_item.done" ? "completed" : undefined);
-				const status = this.statuses.get(getStatusId(item, typedEvent));
+				const status = this.upsertStatus(item, typedEvent, eventType === "response.output_item.done" ? "completed" : undefined);
 				if (eventType === "response.output_item.done") {
-					if (!statusHasRenderableDetails(status)) return;
+					if (!statusHasVisibleDetails(status)) return;
+					this.cancelPendingAutoClose();
 					this.renderNow();
+					this.scheduleCompletedTimers(status);
 					this.scheduleAutoCloseIfComplete();
 				} else {
-					this.cancelPendingAutoClose();
-					if (statusHasRenderableDetails(status)) this.scheduleRender();
+					if (statusHasVisibleDetails(status)) {
+						this.cancelPendingAutoClose();
+						this.scheduleRender();
+					} else {
+						this.scheduleAutoCloseIfComplete();
+					}
 				}
 				return;
 			}
 
-			if (eventType === "response.web_search_call.searching") {
-				const item = isRecord(typedEvent.item) ? (typedEvent.item as ItemRecord) : undefined;
+			if (
+				eventType === "response.web_search_call.in_progress"
+				|| eventType === "response.web_search_call.searching"
+				|| eventType === "response.web_search_call.completed"
+			) {
+				const item = this.lifecycleItem(typedEvent);
 				if (item && item.type !== undefined && item.type !== "web_search_call") return;
-				this.upsertStatus(item, typedEvent, "searching");
-				if (statusHasRenderableDetails(this.statuses.get(getStatusId(item, typedEvent)))) this.scheduleRender();
+				const phase = eventType === "response.web_search_call.completed" ? "completed" : "searching";
+				const status = this.upsertStatus(item, typedEvent, phase);
+				if (statusHasVisibleDetails(status)) {
+					if (status.phase === "completed") this.scheduleCompletedTimers(status);
+					this.cancelPendingAutoClose();
+					this.scheduleRender();
+					this.scheduleAutoCloseIfComplete();
+				}
 			}
 		}
 
-		private upsertStatus(item: ItemRecord | undefined, event: EventRecord, explicitPhase?: Phase): void {
+		private lifecycleItem(event: EventRecord): ItemRecord {
+			const item = isRecord(event.item) ? { ...(event.item as ItemRecord) } : {} as ItemRecord;
+			if (item.type === undefined) item.type = "web_search_call";
+			if (item.id === undefined && typeof event.item_id === "string" && event.item_id.length > 0) {
+				item.id = event.item_id;
+			}
+			if (item.status === undefined && typeof event.type === "string") {
+				item.status = event.type.slice("response.web_search_call.".length);
+			}
+			if (item.sources === undefined && Array.isArray(event.sources)) {
+				item.sources = event.sources;
+			}
+			if (item.results === undefined && Array.isArray(event.results)) {
+				item.results = event.results;
+			}
+			return item;
+		}
+
+		private upsertStatus(item: ItemRecord | undefined, event: EventRecord, explicitPhase?: Phase): LiveToolStatus {
 			const timestamp = now();
-			const id = getStatusId(item, event);
-			const status = this.statuses.get(id) ?? this.createStatus(id, timestamp);
-			const queries = extractQueries(item, event);
-			const sourceCount = extractSourceCount(item);
+			const patch = createStatusPatch(item, event, explicitPhase);
+			const status = this.statuses.get(this.findMergeTarget(patch)) ?? this.createStatus(this.createStableKey(patch), timestamp);
 			status.updatedAt = timestamp;
-			status.phase = explicitPhase ?? inferPhase(item, queries);
-			status.status = typeof item?.status === "string" ? item.status : status.status;
-			if (queries.length > 0) {
-				status.queries = queries;
+			status.phase = patch.phase;
+			status.status = patch.itemStatus ?? status.status;
+			if (patch.requestLocalKey) {
+				status.requestLocalKey = patch.requestLocalKey;
+				this.requestLocalKeyToStableKey.set(patch.requestLocalKey, status.id);
 			}
-			if (sourceCount !== undefined) {
-				status.sourceCount = sourceCount;
+			if (patch.providerItemId) {
+				status.providerItemIds.add(patch.providerItemId);
+				this.itemIdToStableKey.set(patch.providerItemId, status.id);
+				if (patch.providerItemIdIsFinal) {
+					status.finalProviderItemId = patch.providerItemId;
+					status.displayId = patch.providerItemId;
+				}
 			}
-			this.statuses.set(id, status);
+			if (patch.displayQueries.length > 0) {
+				this.setQueries(status, patch.normalizedQueries, patch.displayQueries);
+			}
+			if (patch.sourceCount !== undefined) {
+				status.sourceCount = patch.sourceCount;
+			}
+			if (patch.actionDetails.length > 0) {
+				status.actionDetails = patch.actionDetails;
+			}
+			if (status.phase === "searching" || status.phase === "failed") {
+				status.visibility = "full";
+				status.completionGeneration += 1;
+				this.cancelCompletedTimers(status);
+			}
+			this.statuses.set(status.id, status);
+			return status;
+		}
+
+		private findMergeTarget(patch: StatusPatch): string {
+			if (patch.providerItemId) {
+				const mapped = this.itemIdToStableKey.get(patch.providerItemId);
+				if (mapped) return mapped;
+			}
+			if (patch.requestLocalKey) {
+				const mapped = this.requestLocalKeyToStableKey.get(patch.requestLocalKey);
+				if (mapped) return mapped;
+			}
+			if (patch.providerItemIdIsFinal && patch.providerItemId) {
+				const target = this.uniqueUnfinalizedQueryCandidate(patch.normalizedQueries, patch.providerItemId);
+				if (target) return target.id;
+			}
+			if (!patch.providerItemIdIsFinal) {
+				const target = this.uniquePendingQueryCandidate(patch.normalizedQueries);
+				if (target) return target.id;
+			}
+			return this.createStableKey(patch);
+		}
+
+		private uniqueUnfinalizedQueryCandidate(queries: string[], finalId: string): LiveToolStatus | undefined {
+			const candidates = this.queryCandidates(queries);
+			let match: LiveToolStatus | undefined;
+			for (const candidate of candidates) {
+				if (candidate.finalProviderItemId && candidate.finalProviderItemId !== finalId) continue;
+				if (match && match !== candidate) return undefined;
+				match = candidate;
+			}
+			return match;
+		}
+
+
+		private uniquePendingQueryCandidate(queries: string[]): LiveToolStatus | undefined {
+			const candidates = this.queryCandidates(queries);
+			let match: LiveToolStatus | undefined;
+			for (const candidate of candidates) {
+				if (candidate.finalProviderItemId || candidate.phase === "completed" || candidate.visibility !== "full") continue;
+				if (match && match !== candidate) return undefined;
+				match = candidate;
+			}
+			return match;
+		}
+
+		private queryCandidates(queries: string[]): Set<LiveToolStatus> {
+			const candidates = new Set<LiveToolStatus>();
+			for (const query of queries) {
+				const keys = this.queryToStableKeys.get(query);
+				if (!keys) continue;
+				for (const key of keys) {
+					const status = this.statuses.get(key);
+					if (status) candidates.add(status);
+				}
+			}
+			return candidates;
+		}
+
+		private createStableKey(patch: StatusPatch): string {
+			if (patch.providerItemId && patch.providerItemIdIsFinal) return `final:${patch.providerItemId}`;
+			if (patch.providerItemId) return `provider:${patch.providerItemId}`;
+			if (patch.requestLocalKey) return `request:${patch.requestLocalKey}`;
+			const firstQuery = patch.normalizedQueries[0];
+			if (firstQuery) return `content:${firstQuery}:${this.nextOrdinal}`;
+			return `placeholder:${this.nextOrdinal}`;
 		}
 
 		private createStatus(id: string, timestamp: number): LiveToolStatus {
+			const ordinal = this.nextOrdinal++;
 			return {
 				id,
+				displayId: `search #${ordinal}`,
+				providerItemIds: new Set<string>(),
+				ordinal,
 				phase: "queued",
+				visibility: "full",
+				completionGeneration: 0,
 				startedAt: timestamp,
 				updatedAt: timestamp,
+				normalizedQueries: [],
 				queries: [],
+				actionDetails: [],
 			};
+		}
+
+		private setQueries(status: LiveToolStatus, normalizedQueries: string[], displayQueries: string[]): void {
+			for (const query of status.normalizedQueries) {
+				const keys = this.queryToStableKeys.get(query);
+				if (!keys) continue;
+				keys.delete(status.id);
+				if (keys.size === 0) this.queryToStableKeys.delete(query);
+			}
+			status.normalizedQueries = normalizedQueries;
+			status.queries = displayQueries;
+			for (const query of normalizedQueries) {
+				let keys = this.queryToStableKeys.get(query);
+				if (!keys) {
+					keys = new Set<string>();
+					this.queryToStableKeys.set(query, keys);
+				}
+				keys.add(status.id);
+			}
 		}
 
 		private markIncompleteStatuses(phase: Phase): void {
 			const timestamp = now();
 			for (const status of this.statuses.values()) {
-				if (status.phase !== "failed") {
+				if (status.phase !== "failed" && status.visibility !== "hidden" && statusHasVisibleDetails(status)) {
 					status.phase = phase;
 					status.updatedAt = timestamp;
+					this.scheduleCompletedTimers(status);
 				}
 			}
 		}
 
-		private hasRenderableStatuses(): boolean {
+		private hasVisibleStatuses(): boolean {
 			for (const status of this.statuses.values()) {
-				if (statusHasRenderableDetails(status)) return true;
+				if (status.visibility !== "hidden" && statusHasVisibleDetails(status)) return true;
 			}
 			return false;
 		}
 
 		private scheduleAutoCloseIfComplete(): void {
-			const calls = [...this.statuses.values()];
-			if (calls.length > 0 && calls.every((status) => status.phase === "completed")) {
-				this.scheduleAutoClose();
+			if (!this.requestCompleted) return;
+			const calls = [...this.statuses.values()].filter(status => status.visibility !== "hidden" && statusHasVisibleDetails(status));
+			if (calls.length === 0) this.scheduleAutoClose();
+		}
+
+		private scheduleCompletedTimers(status: LiveToolStatus): void {
+			if (this.ended || status.phase !== "completed" || !statusHasVisibleDetails(status)) return;
+			this.cancelCompletedTimers(status);
+			status.completionGeneration += 1;
+			status.visibility = "full";
+			const generation = status.completionGeneration;
+			if (completedCollapseMs > 0) {
+				try {
+					status.collapseTimer = scheduler.setTimeout(() => {
+						status.collapseTimer = undefined;
+						if (this.ended || status.phase !== "completed" || status.visibility !== "full" || status.completionGeneration !== generation) return;
+						status.visibility = "collapsed";
+						status.updatedAt = now();
+						this.renderNow();
+					}, completedCollapseMs);
+				} catch (error) {
+					handleOverlayFailure(this, error);
+				}
+			}
+			if (completedHideMs > 0) {
+				try {
+					status.hideTimer = scheduler.setTimeout(() => {
+						status.hideTimer = undefined;
+						if (this.ended || status.phase !== "completed" || status.visibility === "hidden" || status.completionGeneration !== generation) return;
+						status.visibility = "hidden";
+						status.updatedAt = now();
+						this.scheduleAutoCloseIfComplete();
+						this.renderNow();
+					}, completedHideMs);
+				} catch (error) {
+					handleOverlayFailure(this, error);
+				}
+			}
+		}
+
+		private cancelCompletedTimers(status: LiveToolStatus): void {
+			if (status.collapseTimer !== undefined) {
+				try {
+					scheduler.clearTimeout(status.collapseTimer);
+				} catch (error) {
+					warn("OpenAI provider live overlay collapse timer cleanup failed", error);
+				}
+				status.collapseTimer = undefined;
+			}
+			if (status.hideTimer !== undefined) {
+				try {
+					scheduler.clearTimeout(status.hideTimer);
+				} catch (error) {
+					warn("OpenAI provider live overlay hide timer cleanup failed", error);
+				}
+				status.hideTimer = undefined;
+			}
+		}
+
+		private cancelAllCompletedTimers(): void {
+			for (const status of this.statuses.values()) {
+				this.cancelCompletedTimers(status);
 			}
 		}
 
@@ -392,12 +649,12 @@ export function createProviderToolLiveStatusManager(
 					this.clear();
 				}, completedAutoCloseMs);
 			} catch (error) {
-				disableAfterOverlayFailure(error);
+				handleOverlayFailure(this, error);
 			}
 		}
 
 		private scheduleRender(): void {
-			if (this.ended || disabled || !this.ui?.custom) return;
+			if (this.ended || typeof this.ui?.custom !== "function") return;
 			if (throttleMs <= 0) {
 				this.renderNow();
 				return;
@@ -409,13 +666,13 @@ export function createProviderToolLiveStatusManager(
 					this.renderNow();
 				}, throttleMs);
 			} catch (error) {
-				disableAfterOverlayFailure(error);
+				handleOverlayFailure(this, error);
 			}
 		}
 
 		private renderNow(): void {
 			this.cancelPendingRender();
-			if (this.ended || disabled || !this.ui?.custom) return;
+			if (this.ended || typeof this.ui?.custom !== "function") return;
 			this.showOrRenderOverlay();
 		}
 
@@ -424,7 +681,7 @@ export function createProviderToolLiveStatusManager(
 				try {
 					this.overlay.requestRender?.();
 				} catch (error) {
-					disableAfterOverlayFailure(error);
+					handleOverlayFailure(this, error);
 				}
 				return;
 			}
@@ -434,13 +691,13 @@ export function createProviderToolLiveStatusManager(
 			try {
 				const result = this.ui!.custom!(this.createOverlayFactory(), { overlay: true });
 				void Promise.resolve(result).catch((error) => {
-					disableAfterOverlayFailure(error);
+					handleOverlayFailure(this, error);
 				}).finally(() => {
 					this.openingOverlay = false;
 				});
 			} catch (error) {
 				this.openingOverlay = false;
-				disableAfterOverlayFailure(error);
+				handleOverlayFailure(this, error);
 			}
 		}
 
@@ -458,13 +715,14 @@ export function createProviderToolLiveStatusManager(
 					try {
 						done?.(undefined);
 					} catch (error) {
-						disableAfterOverlayFailure(error);
+						handleOverlayFailure(this, error);
 					}
 					this.overlay = undefined;
 					this.openingOverlay = false;
 					this.ended = true;
 					this.cancelPendingRender();
 					this.cancelPendingAutoClose();
+					this.cancelAllCompletedTimers();
 					activeTrackers.delete(this);
 				};
 
@@ -494,25 +752,29 @@ export function createProviderToolLiveStatusManager(
 				try {
 					close();
 				} catch (error) {
-					disableAfterOverlayFailure(error);
+					handleOverlayFailure(this, error);
 				}
 			}
 		}
 
 		private snapshot(): LiveOverlaySnapshot {
-			const calls = [...this.statuses.values()]
+			const visibleStatuses = [...this.statuses.values()].filter(status => status.visibility !== "hidden" && statusHasVisibleDetails(status));
+			const calls = visibleStatuses
 				.sort((left, right) => right.updatedAt - left.updatedAt)
 				.map((status): LiveOverlayCallSnapshot => ({
-					id: status.id,
+					id: status.displayId,
 					phase: status.phase,
 					queries: status.queries,
 					sourceCount: status.sourceCount,
+					actionDetails: status.actionDetails,
 					error: status.error,
 					updatedAt: status.updatedAt,
+					collapsed: status.visibility === "collapsed",
 				}));
-			const hasFailure = calls.some((call) => call.phase === "failed");
-			const allCompleted = calls.length > 0 && calls.every((call) => call.phase === "completed");
-			const updatedAt = calls.reduce((max, call) => Math.max(max, call.updatedAt), this.startedAt);
+			const allStatuses = [...this.statuses.values()].filter(statusHasVisibleDetails);
+			const hasFailure = allStatuses.some((status) => status.phase === "failed");
+			const allCompleted = allStatuses.length > 0 && allStatuses.every((status) => status.phase === "completed");
+			const updatedAt = allStatuses.reduce((max, status) => Math.max(max, status.updatedAt), this.startedAt);
 			return {
 				phase: hasFailure ? "failed" : allCompleted ? "completed" : "searching",
 				calls,
@@ -545,11 +807,32 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null;
 }
 
-function getStatusId(item: ItemRecord | undefined, event: EventRecord): string {
-	if (typeof item?.id === "string" && item.id.length > 0) return item.id;
-	const eventType = typeof event.type === "string" ? event.type : "web_search_call";
-	const query = extractQueries(item, event)[0] ?? "unknown";
-	return `${eventType}:${query}`;
+function createStatusPatch(item: ItemRecord | undefined, event: EventRecord, explicitPhase?: Phase): StatusPatch {
+	const normalizedQueries = extractNormalizedQueries(item, event);
+	const providerItemId = typeof item?.id === "string" && item.id.length > 0 ? item.id : undefined;
+	return {
+		providerItemId,
+		providerItemIdIsFinal: isFinalProviderItemId(providerItemId),
+		requestLocalKey: createRequestLocalKey(event),
+		normalizedQueries,
+		displayQueries: normalizedQueries.map(displayProviderWebSearchQuery),
+		sourceCount: extractSourceCount(item),
+		actionDetails: extractActionDetails(item),
+		phase: explicitPhase ?? inferPhase(item, normalizedQueries),
+		itemStatus: typeof item?.status === "string" ? item.status : undefined,
+	};
+}
+
+function createRequestLocalKey(event: EventRecord): string | undefined {
+	const outputIndex = stableIntegerToken(event.output_index);
+	if (outputIndex !== undefined) return `output:${outputIndex}`;
+	const sequenceNumber = stableIntegerToken(event.sequence_number);
+	if (sequenceNumber !== undefined) return `sequence:${sequenceNumber}`;
+	return undefined;
+}
+
+function stableIntegerToken(value: unknown): string | undefined {
+	return typeof value === "number" && Number.isInteger(value) && value >= 0 ? String(value) : undefined;
 }
 
 function inferPhase(item: ItemRecord | undefined, queries: string[]): Phase {
@@ -557,12 +840,12 @@ function inferPhase(item: ItemRecord | undefined, queries: string[]): Phase {
 		const normalized = item.status.toLowerCase();
 		if (normalized === "completed") return "completed";
 		if (normalized === "failed") return "failed";
-		if (normalized === "searching" || normalized === "in_progress") return "searching";
+		if (normalized === "searching" || normalized === "in_progress" || normalized === "in-progress") return "searching";
 	}
 	return queries.length > 0 ? "searching" : "queued";
 }
 
-function extractQueries(item: ItemRecord | undefined, event: EventRecord): string[] {
+function extractNormalizedQueries(item: ItemRecord | undefined, event: EventRecord): string[] {
 	const action = isRecord(item?.action) ? (item.action as Record<string, unknown>) : undefined;
 	const candidates: unknown[] = [];
 	if (typeof action?.query === "string") candidates.push(action.query);
@@ -571,19 +854,17 @@ function extractQueries(item: ItemRecord | undefined, event: EventRecord): strin
 	if (typeof event.query === "string") candidates.push(event.query);
 	const queries: string[] = [];
 	for (const candidate of candidates) {
-		if (typeof candidate !== "string" || candidate.trim().length === 0) continue;
-		const formatted = formatQuery(candidate);
-		if (!queries.includes(formatted)) queries.push(formatted);
+		const normalized = normalizeProviderWebSearchQueryForIdentity(candidate);
+		if (!normalized || queries.includes(normalized)) continue;
+		queries.push(normalized);
 		if (queries.length >= MAX_QUERIES) break;
 	}
 	return queries;
 }
 
-function formatQuery(query: string): string {
-	const singleLine = query.replace(/[\r\n\t]+/g, " ").replace(/\s+/g, " ").trim();
-	const chars = [...singleLine];
-	if (chars.length <= MAX_QUERY_CHARS) return singleLine;
-	return `${chars.slice(0, MAX_QUERY_CHARS).join("")}…`;
+function isFinalProviderItemId(id: string | undefined): boolean {
+	if (!id) return false;
+	return !(id.startsWith("res_") || id.startsWith("resp_") || id === "unknown");
 }
 
 function extractSourceCount(item: ItemRecord | undefined): number | undefined {
@@ -594,15 +875,33 @@ function extractSourceCount(item: ItemRecord | undefined): number | undefined {
 	return undefined;
 }
 
+function extractActionDetails(item: ItemRecord | undefined): string[] {
+	const action = isRecord(item?.action) ? (item.action as Record<string, unknown>) : undefined;
+	if (!action) return [];
+	const actionType = typeof action.type === "string" ? action.type : undefined;
+	if (actionType === "open_page" && typeof action.url === "string" && action.url.trim().length > 0) {
+		return [`open_page url: ${displayProviderWebSearchQuery(action.url)}`];
+	}
+	if (actionType === "find_in_page" && typeof action.pattern === "string" && action.pattern.trim().length > 0) {
+		return [`find_in_page pattern: ${displayProviderWebSearchQuery(action.pattern)}`];
+	}
+	return [];
+}
+
 function statusHasRenderableDetails(status: LiveToolStatus | undefined): boolean {
 	if (!status) return false;
-	return status.queries.length > 0 || typeof status.sourceCount === "number" || Boolean(status.error) || status.phase === "failed";
+	return status.queries.length > 0 || status.actionDetails.length > 0 || typeof status.sourceCount === "number" || Boolean(status.error) || status.phase === "failed" || status.phase === "completed";
+}
+
+function statusHasVisibleDetails(status: LiveToolStatus | undefined): boolean {
+	if (!status) return false;
+	return statusHasRenderableDetails(status) || status.phase === "searching" || status.phase === "queued";
 }
 
 function describeError(error: unknown): string {
-	if (error instanceof Error && error.message) return formatQuery(error.message);
-	if (typeof error === "string") return formatQuery(error);
-	if (isRecord(error) && typeof error.message === "string") return formatQuery(error.message);
+	if (error instanceof Error && error.message) return displayProviderWebSearchQuery(error.message);
+	if (typeof error === "string") return displayProviderWebSearchQuery(error);
+	if (isRecord(error) && typeof error.message === "string") return displayProviderWebSearchQuery(error.message);
 	return "stream error";
 }
 

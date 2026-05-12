@@ -7,6 +7,12 @@ interface ProviderUrlReference {
 	title?: string;
 }
 
+export interface ProviderWebSearchActionDetail {
+	type: "search" | "open_page" | "find_in_page" | string;
+	label: string;
+	value: string;
+}
+
 export interface ProviderWebSearchResult {
 	type: "web_search";
 	id?: string;
@@ -16,6 +22,7 @@ export interface ProviderWebSearchResult {
 	queries: string[];
 	citations: ProviderUrlReference[];
 	sources: ProviderUrlReference[];
+	actionDetails: ProviderWebSearchActionDetail[];
 }
 
 export type DisplayableProviderToolResult = ProviderWebSearchResult;
@@ -38,6 +45,21 @@ function cleanString(value: unknown): string | undefined {
 	if (typeof value !== "string") return undefined;
 	const normalized = value.replace(/\s+/g, " ").trim();
 	return normalized.length > 0 ? normalized : undefined;
+}
+
+const MAX_QUERY_DISPLAY_CHARS = 140;
+
+export function normalizeProviderWebSearchQueryForIdentity(value: unknown): string | undefined {
+	if (typeof value !== "string") return undefined;
+	const normalized = value.replace(/[\r\n\t]+/g, " ").replace(/\s+/g, " ").trim();
+	return normalized.length > 0 ? normalized : undefined;
+}
+
+export function displayProviderWebSearchQuery(value: string): string {
+	const normalized = normalizeProviderWebSearchQueryForIdentity(value) ?? "";
+	const chars = [...normalized];
+	if (chars.length <= MAX_QUERY_DISPLAY_CHARS) return normalized;
+	return `${chars.slice(0, MAX_QUERY_DISPLAY_CHARS).join("")}…`;
 }
 
 function uniqueReferences(references: ProviderUrlReference[]): ProviderUrlReference[] {
@@ -86,21 +108,53 @@ function collectSources(item: UnknownRecord): ProviderUrlReference[] {
 	}));
 }
 
-function collectQueries(action: unknown): { query?: string; queries: string[]; actionType?: string } {
-	if (!isRecord(action)) return { queries: [] };
-	const query = cleanString(action.query);
+function collectActionDetails(action: unknown): { query?: string; queries: string[]; actionType?: string; actionDetails: ProviderWebSearchActionDetail[] } {
+	if (!isRecord(action)) return { queries: [], actionDetails: [] };
+	const actionType = cleanString(action.type);
+	const query = normalizeProviderWebSearchQueryForIdentity(action.query);
 	const queries = Array.isArray(action.queries)
 		? action.queries.flatMap(entry => {
-				const value = cleanString(entry);
+				const value = normalizeProviderWebSearchQueryForIdentity(entry);
 				return value ? [value] : [];
 			})
 		: [];
 	if (query && !queries.includes(query)) queries.unshift(query);
+
+	const actionDetails: ProviderWebSearchActionDetail[] = [];
+	if (actionType === "open_page") {
+		const url = cleanString(action.url);
+		if (url) actionDetails.push({ type: actionType, label: "url", value: url });
+	} else if (actionType === "find_in_page") {
+		const pattern = cleanString(action.pattern);
+		if (pattern) actionDetails.push({ type: actionType, label: "pattern", value: pattern });
+	}
+
 	return {
 		query,
 		queries,
-		actionType: cleanString(action.type),
+		actionType,
+		actionDetails,
 	};
+}
+
+function isSuccessfulFinalStatus(status: string | undefined): boolean {
+	return status === "completed" || status === "complete" || status === "succeeded" || status === "success";
+}
+
+function isKnownNonFinalStatus(status: string | undefined): boolean {
+	return status === "in_progress" || status === "searching" || status === "failed" || status === "incomplete";
+}
+
+function isDisplayableStatuslessResult(result: ProviderWebSearchResult): boolean {
+	return Boolean(
+		result.id ||
+		result.query ||
+		result.queries.length > 0 ||
+		result.citations.length > 0 ||
+		result.sources.length > 0 ||
+		result.actionType ||
+		result.actionDetails.length > 0,
+	);
 }
 
 export function extractDisplayableProviderToolResults(message: unknown): DisplayableProviderToolResult[] {
@@ -114,8 +168,8 @@ export function extractDisplayableProviderToolResults(message: unknown): Display
 	const results: DisplayableProviderToolResult[] = [];
 	for (const item of providerPayload.items) {
 		if (!isRecord(item) || item.type !== "web_search_call") continue;
-		const action = collectQueries(item.action);
-		results.push({
+		const action = collectActionDetails(item.action);
+		const result: ProviderWebSearchResult = {
 			type: "web_search",
 			id: cleanString(item.id),
 			status: cleanString(item.status),
@@ -124,7 +178,11 @@ export function extractDisplayableProviderToolResults(message: unknown): Display
 			queries: action.queries,
 			citations,
 			sources: collectSources(item),
-		});
+			actionDetails: action.actionDetails,
+		};
+		if (isKnownNonFinalStatus(result.status)) continue;
+		if (!isSuccessfulFinalStatus(result.status) && !isDisplayableStatuslessResult(result)) continue;
+		results.push(result);
 	}
 	return results;
 }
@@ -133,7 +191,7 @@ export function providerToolResultKey(runtimeSessionId: string, result: Displaya
 	if (result.id) return `${runtimeSessionId}:${result.type}:${result.id}`;
 	const fingerprint = crypto
 		.createHash("sha256")
-		.update(JSON.stringify({ type: result.type, actionType: result.actionType, queries: result.queries, citations: result.citations, sources: result.sources }))
+		.update(JSON.stringify({ type: result.type, actionType: result.actionType, queries: result.queries, citations: result.citations, sources: result.sources, actionDetails: result.actionDetails }))
 		.digest("hex");
 	return `${runtimeSessionId}:${result.type}:${fingerprint}`;
 }
@@ -157,6 +215,7 @@ export function buildProviderToolResultSummaryMessage(results: DisplayableProvid
 	const queries = uniqueStrings(results.flatMap(result => result.queries.length > 0 ? result.queries : result.query ? [result.query] : []));
 	const citations = uniqueReferences(results.flatMap(result => result.citations));
 	const sources = uniqueReferences(results.flatMap(result => result.sources));
+	const actionDetails = results.flatMap(result => result.actionDetails);
 	const summary = `OpenAI provider completed web_search (${results.length === 1 ? "1 call" : `${results.length} calls`}).`;
 
 	return {
@@ -170,6 +229,7 @@ export function buildProviderToolResultSummaryMessage(results: DisplayableProvid
 			queries,
 			citations,
 			sources,
+			actionDetails,
 			results,
 		}),
 	};

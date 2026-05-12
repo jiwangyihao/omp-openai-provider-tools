@@ -8,6 +8,11 @@ export const DEFAULT_IMAGE_GENERATION_KEEPALIVE_INTERVAL_MS = 60_000;
 const KEEPALIVE_EVENT_TYPE = "response.function_call_arguments.delta";
 const KEEPALIVE_ITEM_ID = "openai_provider_tools_keepalive";
 
+const WEB_SEARCH_LIFECYCLE_EVENTS = new Set([
+	"response.web_search_call.in_progress",
+	"response.web_search_call.searching",
+	"response.web_search_call.completed",
+]);
 export interface RequestObservationPolicy {
 	enabledTools?: readonly ProviderToolType[];
 	interruptOnImageResult: boolean;
@@ -196,7 +201,8 @@ export function wrapOpenAIResponsesEventIterable<T>(source: AsyncIterable<T>, po
 					if (outcome.source === "upstream") upstreamNext = undefined;
 					const result = outcome.result;
 					if (result.done) {
-						finishAndClear();
+						finish();
+						if (policy.observeLiveEventsInIterable !== false && !sawLiveWebSearchEvent) clearTracker(policy.liveTracker);
 						return result;
 					}
 						if (outcome.source === "upstream" && policy.observeLiveEventsInIterable !== false) sawLiveWebSearchEvent = observeEvent(policy, result.value, true, sawLiveWebSearchEvent);
@@ -244,15 +250,16 @@ function observeEvent(policy: RequestObservationPolicy, event: unknown, shouldCa
 function shouldObserveLiveEvent(event: JsonRecord): boolean {
 	const type = event.type;
 	if (type === "response.completed" || type === "response.failed" || type === "error") return true;
-	if (type === "response.web_search_call.searching") return true;
+	if (isWebSearchLifecycleEvent(event)) return true;
 	if (type !== "response.output_item.added" && type !== "response.output_item.done") return false;
 	const item = event.item;
 	return isRecord(item) && item.type === "web_search_call";
 }
 
 function isWebSearchLifecycleEvent(event: JsonRecord): boolean {
-	if (event.type === "response.web_search_call.searching") return true;
-	if (event.type !== "response.output_item.added" && event.type !== "response.output_item.done") return false;
+	const type = event.type;
+	if (typeof type === "string" && WEB_SEARCH_LIFECYCLE_EVENTS.has(type)) return true;
+	if (type !== "response.output_item.added" && type !== "response.output_item.done") return false;
 	const item = event.item;
 	return isRecord(item) && item.type === "web_search_call";
 }

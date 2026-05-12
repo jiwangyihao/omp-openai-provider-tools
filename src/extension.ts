@@ -14,12 +14,15 @@ import {
 } from "./image-results";
 import { registerProviderImageRenderer } from "./image-renderer";
 import {
+	PROVIDER_TOOL_RESULT_MESSAGE_TYPE,
 	buildProviderToolResultSummaryMessage,
 	extractDisplayableProviderToolResults,
 	providerToolResultKey,
+	type DisplayableProviderToolResult,
+	type ProviderToolResultMessage,
 } from "./provider-results";
 import { registerProviderToolResultRenderer } from "./provider-result-renderer";
-import { createProviderToolLiveStatusManager } from "./provider-tool-live-status";
+import { createProviderToolLiveStatusManager, type ProviderToolLiveUiSink } from "./provider-tool-live-status";
 import { installOpenAIResponsesImageInterruption, registerProviderToolRequest, clearInterruptibleImageGenerationRequests } from "./stream-interruption";
 import type { ExtensionApiLike, ExtensionContextLike, ProviderToolType, ProviderToolsEntry, RuntimeModelLike } from "./types";
 
@@ -43,7 +46,33 @@ interface ExpectedToolsState {
 	snapshot: string[];
 	removed: boolean;
 }
+const PROVIDER_TOOL_RESULT_ENTRY_TYPE = "openai-provider-tool-result-ui";
+const PROVIDER_TOOL_RESULT_SOURCE = "omp-openai-provider-tools";
+const MAX_PROVIDER_TOOL_RESULT_DELIVERY_RETRIES = 3;
 
+interface PendingProviderToolResultCard {
+	resultKey: string;
+	resultKeys: string[];
+	sessionId: string;
+	message: ProviderToolResultMessage;
+	replay: boolean;
+	deliveryFailures?: number;
+}
+
+interface ProviderToolResultState {
+	pending: PendingProviderToolResultCard[];
+	queuedKeys: Set<string>;
+	insertedKeys: Set<string>;
+	replayedKeys: Set<string>;
+	replayScopeKey?: string;
+	generation: number;
+	retryScheduled: boolean;
+	retryHandle?: unknown;
+	flushInProgress: boolean;
+}
+
+
+type ProviderToolResultDelivery = "none" | "started" | "failed";
 
 interface ImageResultState {
 	outputDirectory?: string;
@@ -244,7 +273,8 @@ function imageResultsFromAgentEndEvent(event: unknown) {
 
 function eventMessages(event: unknown): unknown[] {
 	const candidate = event as AgentEndEventLike | MessageEndEventLike | undefined;
-	if (Array.isArray((candidate as AgentEndEventLike | undefined)?.messages)) return (candidate as AgentEndEventLike).messages ?? [];
+	const messages = (candidate as AgentEndEventLike | undefined)?.messages;
+	if (Array.isArray(messages)) return messages;
 	return [(candidate as MessageEndEventLike | undefined)?.message ?? event];
 }
 
@@ -261,11 +291,12 @@ function normalizeProviderImageGenerationReplayItems(message: unknown): void {
 	if (providerPayload.type !== "openaiResponsesHistory") return;
 	if (!Array.isArray(providerPayload.items)) return;
 
-	const safeItems = providerPayload.items.flatMap((item) => {
+	const items = providerPayload.items;
+	const safeItems = items.flatMap((item) => {
 		const normalized = normalizedProviderImageGenerationReplayItem(item);
 		return normalized === undefined ? [] : [normalized];
 	});
-	if (safeItems.length === providerPayload.items.length && safeItems.every((item, index) => item === providerPayload.items[index])) return;
+	if (safeItems.length === items.length && safeItems.every((item, index) => item === items[index])) return;
 	if (safeItems.length === 0) {
 		delete message.providerPayload;
 		return;
@@ -304,11 +335,13 @@ function providerToolResultsFromMessageEndEvent(event: unknown) {
 	return extractDisplayableProviderToolResults(candidate?.message ?? event);
 }
 
-function completeProviderToolResultsForMessageEnd(results: ReturnType<typeof extractDisplayableProviderToolResults>) {
+function completeProviderToolResultsForFinalEcho(results: ReturnType<typeof extractDisplayableProviderToolResults>) {
 	return results.filter((result) => {
 		if (result.type !== "web_search") return true;
 		const status = result.status?.toLowerCase();
-		if (!status) return result.citations.length > 0 || result.sources.length > 0;
+		if (!status) {
+			return Boolean(result.id || result.query || result.queries.length > 0 || result.citations.length > 0 || result.sources.length > 0 || result.actionDetails.length > 0);
+		}
 		return status === "completed" || status === "complete" || status === "succeeded" || status === "success";
 	});
 }
@@ -479,34 +512,179 @@ function handleMessageEndImageResults({
 	normalizeProviderImageGenerationReplayItemsFromEvent(event);
 }
 
-async function sendVisibleProviderToolResultMessage(api: ExtensionApiLike, message: unknown): Promise<void> {
-	await api.sendMessage?.(message, { deliverAs: "nextTurn" });
+function providerToolResultState(): ProviderToolResultState {
+	return {
+		pending: [],
+		queuedKeys: new Set(),
+		insertedKeys: new Set(),
+		replayedKeys: new Set(),
+		generation: 0,
+		replayScopeKey: undefined,
+		retryScheduled: false,
+		flushInProgress: false,
+	};
 }
 
-function handleProviderToolResults({
+function providerToolResultDisplayMessage(card: PendingProviderToolResultCard) {
+	return {
+		role: "custom",
+		customType: PROVIDER_TOOL_RESULT_MESSAGE_TYPE,
+		content: "OpenAI provider web_search result",
+		display: true,
+		attribution: "agent",
+		details: {
+			uiOnly: true,
+			source: PROVIDER_TOOL_RESULT_SOURCE,
+			resultKey: card.resultKey,
+			message: card.message,
+		},
+	};
+}
+
+function persistProviderToolResultCard(api: ExtensionApiLike, ctx: ExtensionContextLike, card: PendingProviderToolResultCard): void {
+	if (card.replay || !api.appendEntry) return;
+	try {
+		const persisted = api.appendEntry(PROVIDER_TOOL_RESULT_ENTRY_TYPE, {
+			resultKey: card.resultKey,
+			sessionId: card.sessionId,
+			insertedAt: Date.now(),
+			message: card.message,
+		});
+		if (isPromiseLike(persisted)) {
+			consumePromiseLater(api, ctx, persisted, "OpenAI provider tool result UI persistence failed");
+		}
+	} catch (error) {
+		logAsyncFailure(api, ctx, "OpenAI provider tool result UI persistence failed", error);
+	}
+}
+
+function isRuntimeIdle(ctx: ExtensionContextLike): boolean {
+	const checker = (ctx as { isIdle?: unknown }).isIdle;
+	if (typeof checker !== "function") return true;
+	try {
+		return checker.call(ctx) === true;
+	} catch {
+		return false;
+	}
+}
+
+async function sendProviderToolResultDisplayMessage(
+	api: ExtensionApiLike,
+	ctx: ExtensionContextLike,
+	card: PendingProviderToolResultCard,
+): Promise<ProviderToolResultDelivery> {
+	if (!api.sendMessage) return "none";
+	try {
+		await api.sendMessage(providerToolResultDisplayMessage(card), { triggerTurn: false });
+		persistProviderToolResultCard(api, ctx, card);
+		card.deliveryFailures = 0;
+		return "started";
+	} catch (error) {
+		card.deliveryFailures = (card.deliveryFailures ?? 0) + 1;
+		logAsyncFailure(api, ctx, "OpenAI provider tool result message delivery failed", error);
+		return "failed";
+	}
+}
+
+function enqueueProviderToolResultCards({
 	api,
 	ctx,
 	results,
-	state,
-	seen,
+	imageState,
+	providerState,
 }: {
 	api: ExtensionApiLike;
 	ctx: ExtensionContextLike;
-	results: ReturnType<typeof extractDisplayableProviderToolResults>;
-	state: ImageResultState;
-	seen: Set<string>;
-}): void {
-	if (results.length === 0) return;
-	const sessionId = runtimeSessionId(ctx, api, state);
-	const newResults: ReturnType<typeof extractDisplayableProviderToolResults> = [];
+	results: DisplayableProviderToolResult[];
+	imageState: ImageResultState;
+	providerState: ProviderToolResultState;
+}): boolean {
+	if (results.length === 0) return false;
+	const sessionId = runtimeSessionId(ctx, api, imageState);
+	const newResults: DisplayableProviderToolResult[] = [];
+	let resultKey: string | undefined;
 	for (const result of results) {
 		const key = providerToolResultKey(sessionId, result);
-		if (seen.has(key)) continue;
-		seen.add(key);
+		if (providerState.queuedKeys.has(key) || providerState.insertedKeys.has(key) || providerState.replayedKeys.has(key)) continue;
+		if (!resultKey) resultKey = key;
 		newResults.push(result);
 	}
-	if (newResults.length > 0) {
-		consumePromiseLater(api, ctx, sendVisibleProviderToolResultMessage(api, buildProviderToolResultSummaryMessage(newResults)), "OpenAI provider tool result message delivery failed");
+	if (!resultKey || newResults.length === 0) return false;
+	const resultKeys: string[] = [];
+	for (const result of newResults) {
+		resultKeys.push(providerToolResultKey(sessionId, result));
+	}
+	for (const key of resultKeys) providerState.queuedKeys.add(key);
+	providerState.pending.push({
+		resultKey,
+		resultKeys,
+		sessionId,
+		message: buildProviderToolResultSummaryMessage(newResults),
+		replay: false,
+	});
+	return true;
+}
+
+function scheduleProviderToolResultFlush(
+	api: ExtensionApiLike,
+	ctx: ExtensionContextLike,
+	state: ProviderToolResultState,
+	clearLiveStatusOnSuccess: () => void,
+): void {
+	if (state.retryScheduled || state.pending.length === 0) return;
+	const generation = state.generation;
+	state.retryScheduled = true;
+	state.retryHandle = setTimeout(() => {
+		state.retryScheduled = false;
+		state.retryHandle = undefined;
+		if (state.generation !== generation) return;
+		void flushProviderToolResultCards(api, ctx, state, clearLiveStatusOnSuccess).catch((error) => logAsyncFailure(api, ctx, "OpenAI provider tool result flush failed", error));
+	}, 0);
+}
+
+async function flushProviderToolResultCards(
+	api: ExtensionApiLike,
+	ctx: ExtensionContextLike,
+	state: ProviderToolResultState,
+	clearLiveStatusOnSuccess: () => void,
+): Promise<ProviderToolResultDelivery> {
+	if (state.flushInProgress) return "none";
+	if (state.pending.length === 0) return "none";
+	if (!isRuntimeIdle(ctx)) {
+		scheduleProviderToolResultFlush(api, ctx, state, clearLiveStatusOnSuccess);
+		return "none";
+	}
+	state.flushInProgress = true;
+	const generation = state.generation;
+	try {
+		let anyStarted = false;
+		while (state.pending.length > 0) {
+			if (!isRuntimeIdle(ctx)) {
+				scheduleProviderToolResultFlush(api, ctx, state, clearLiveStatusOnSuccess);
+				return anyStarted ? "started" : "none";
+			}
+			const card = state.pending[0];
+			if (!card) break;
+			const delivery = await sendProviderToolResultDisplayMessage(api, ctx, card);
+			if (state.generation !== generation) return anyStarted ? "started" : "none";
+			if (delivery !== "started") {
+				if (delivery === "failed" && (card.deliveryFailures ?? 0) < MAX_PROVIDER_TOOL_RESULT_DELIVERY_RETRIES) {
+					scheduleProviderToolResultFlush(api, ctx, state, clearLiveStatusOnSuccess);
+				}
+				return delivery;
+			}
+			state.pending.shift();
+			for (const resultKey of card.resultKeys) {
+				state.queuedKeys.delete(resultKey);
+				state.insertedKeys.add(resultKey);
+			}
+			if (card.replay) state.replayedKeys.add(card.resultKey);
+			anyStarted = true;
+			clearLiveStatusOnSuccess();
+		}
+		return anyStarted ? "started" : "none";
+	} finally {
+		if (state.generation === generation) state.flushInProgress = false;
 	}
 }
 
@@ -514,50 +692,130 @@ function handleAgentEndProviderToolResults({
 	api,
 	ctx,
 	event,
-	state,
-	seen,
+	imageState,
+	providerState,
 }: {
 	api: ExtensionApiLike;
 	ctx: ExtensionContextLike;
 	event: unknown;
-	state: ImageResultState;
-	seen: Set<string>;
-}): void {
+	imageState: ImageResultState;
+	providerState: ProviderToolResultState;
+}): ProviderToolResultDelivery {
 	let results;
 	try {
-		results = providerToolResultsFromAgentEndEvent(event);
+		results = completeProviderToolResultsForFinalEcho(providerToolResultsFromAgentEndEvent(event));
 	} catch (error) {
 		notifyWarningLater(api, ctx, `OpenAI provider tool results could not be extracted: ${error instanceof Error ? error.message : String(error)}`);
-		return;
+		return "failed";
 	}
-	handleProviderToolResults({ api, ctx, results, state, seen });
+	return enqueueProviderToolResultCards({ api, ctx, results, imageState, providerState }) ? "started" : "none";
 }
 
 function handleMessageEndProviderToolResults({
 	api,
 	ctx,
 	event,
-	state,
-	seen,
+	imageState,
+	providerState,
 }: {
 	api: ExtensionApiLike;
 	ctx: ExtensionContextLike;
 	event: unknown;
-	state: ImageResultState;
-	seen: Set<string>;
-}): void {
+	imageState: ImageResultState;
+	providerState: ProviderToolResultState;
+}): ProviderToolResultDelivery {
 	let results;
 	try {
-		results = completeProviderToolResultsForMessageEnd(providerToolResultsFromMessageEndEvent(event));
+		results = completeProviderToolResultsForFinalEcho(providerToolResultsFromMessageEndEvent(event));
 	} catch (error) {
 		notifyWarningLater(api, ctx, `OpenAI provider tool results could not be extracted: ${error instanceof Error ? error.message : String(error)}`);
-		return;
+		return "failed";
 	}
-	// Provider-native web_search summaries are UI-only and invisible to the agent
-	// (`content` is intentionally empty). Emitting at message_end surfaces the
-	// provider result before any subsequent local tool execution, while dedupe
-	// keeps the agent_end fallback from showing it twice.
-	handleProviderToolResults({ api, ctx, results, state, seen });
+	return enqueueProviderToolResultCards({ api, ctx, results, imageState, providerState }) ? "started" : "none";
+}
+
+function invalidateProviderToolResultState(state: ProviderToolResultState): void {
+	state.generation++;
+	state.pending.length = 0;
+	state.queuedKeys.clear();
+	if (state.retryHandle !== undefined) clearTimeout(state.retryHandle as ReturnType<typeof setTimeout>);
+	state.retryHandle = undefined;
+	state.retryScheduled = false;
+	state.flushInProgress = false;
+}
+
+function isProviderToolResultUiOnlyMessage(message: unknown): boolean {
+	if (!isRecord(message)) return false;
+	if (message.role !== "custom") return false;
+	if (message.customType !== PROVIDER_TOOL_RESULT_MESSAGE_TYPE) return false;
+	return isRecord(message.details) && message.details.uiOnly === true;
+}
+
+function filterProviderToolResultContextMessages(event: unknown): unknown {
+	if (!isRecord(event) || !Array.isArray(event.messages)) return event;
+	return {
+		...event,
+		messages: event.messages.filter((message) => !isProviderToolResultUiOnlyMessage(message)),
+	};
+}
+
+function validPersistedProviderToolResultCard(data: unknown): PendingProviderToolResultCard | undefined {
+	if (!isRecord(data)) return undefined;
+	if (typeof data.resultKey !== "string" || data.resultKey.length === 0) return undefined;
+	if (typeof data.sessionId !== "string" || data.sessionId.length === 0) return undefined;
+	if (!isRecord(data.message)) return undefined;
+	if (data.message.customType !== PROVIDER_TOOL_RESULT_MESSAGE_TYPE) return undefined;
+	if (data.message.display !== true) return undefined;
+	return {
+		resultKey: data.resultKey,
+		resultKeys: [data.resultKey],
+		sessionId: data.sessionId,
+		message: data.message as unknown as ProviderToolResultMessage,
+		replay: true,
+	};
+}
+
+function branchEntries(ctx: ExtensionContextLike): unknown[] {
+	try {
+		const branch = (ctx.sessionManager as { getBranch?: () => unknown } | undefined)?.getBranch?.();
+		if (Array.isArray(branch)) return branch;
+		if (isRecord(branch) && Array.isArray(branch.entries)) return branch.entries;
+	} catch {
+		return [];
+	}
+	return [];
+}
+
+function providerToolResultReplayScopeKey(entries: unknown[]): string {
+	return JSON.stringify(entries.map((entry, index) => {
+		if (!isRecord(entry)) return [index, undefined];
+		return [entry.type, entry.customType, isRecord(entry.data) ? entry.data.resultKey : undefined];
+	}));
+}
+
+function replayProviderToolResultEntries(
+	api: ExtensionApiLike,
+	ctx: ExtensionContextLike,
+	state: ProviderToolResultState,
+	clearLiveStatusOnSuccess: () => void,
+): void {
+	const entries = branchEntries(ctx);
+	const scopeKey = providerToolResultReplayScopeKey(entries);
+	if (state.replayScopeKey !== scopeKey) {
+		state.replayedKeys.clear();
+		state.insertedKeys.clear();
+		state.replayScopeKey = scopeKey;
+	}
+	for (const entry of entries) {
+		if (!isRecord(entry)) continue;
+		if (entry.type !== "custom" || entry.customType !== PROVIDER_TOOL_RESULT_ENTRY_TYPE) continue;
+		const card = validPersistedProviderToolResultCard(entry.data);
+		if (!card) continue;
+		if (state.queuedKeys.has(card.resultKey) || state.insertedKeys.has(card.resultKey) || state.replayedKeys.has(card.resultKey)) continue;
+		state.queuedKeys.add(card.resultKey);
+		state.pending.push(card);
+	}
+	void flushProviderToolResultCards(api, ctx, state, clearLiveStatusOnSuccess).catch((error) => logAsyncFailure(api, ctx, "OpenAI provider tool result flush failed", error));
 }
 async function notifyWarning(api: ExtensionApiLike, ctx: ExtensionContextLike, message: string): Promise<void> {
 	api.logger?.warn?.(message);
@@ -630,8 +888,8 @@ function requestPayload(event: unknown): unknown {
 }
 
 
-function providerToolLiveUiFromContext(ctx: ExtensionContextLike) {
-	return { hasUI: ctx.hasUI, setWidget: ctx.ui?.setWidget, custom: ctx.ui?.custom };
+function providerToolLiveUiFromContext(ctx: ExtensionContextLike): ProviderToolLiveUiSink {
+	return { hasUI: ctx.hasUI, setWidget: ctx.ui?.setWidget, custom: ctx.ui?.custom as ProviderToolLiveUiSink["custom"] };
 }
 
 export default function openAIProviderToolsExtension(api: ExtensionApiLike): void {
@@ -643,9 +901,8 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 	const expectedByTarget = new Map<string, ExpectedToolsState>();
 	const incompatibleTargets = new Set<string>();
 	const imageResultState: ImageResultState = { pendingRetries: new Map() };
+	const providerResultState = providerToolResultState();
 	const seenImageResults = new Set<string>();
-	const seenProviderToolResults = new Set<string>();
-
 	const liveStatusManager = createProviderToolLiveStatusManager({ logger: api.logger });
 	const clearLiveStatus = () => {
 		try {
@@ -658,26 +915,39 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 			}
 		}
 	};
+	const clearProviderResultState = () => invalidateProviderToolResultState(providerResultState);
 
 	api.on?.("session_start", async (_event, ctx) => {
 		clearLiveStatus();
+		clearProviderResultState();
 		expectedByTarget.clear();
 		incompatibleTargets.clear();
 		seenImageResults.clear();
-		seenProviderToolResults.clear();
 		imageResultState.outputDirectory = undefined;
 		imageResultState.sessionId = undefined;
 		imageResultState.artifactDirectory = undefined;
 		imageResultState.pendingRetries.clear();
 		clearInterruptibleImageGenerationRequests();
 		await preloadImageRuntimeState(imageResultState, ctx);
+		replayProviderToolResultEntries(api, ctx, providerResultState, clearLiveStatus);
 	});
 
 	for (const eventName of ["session_before_switch", "session_switch", "session_branch", "session_shutdown"]) {
-		api.on?.(eventName, () => {
+		api.on?.(eventName, (_event, ctx) => {
 			clearLiveStatus();
+			clearProviderResultState();
+			if (eventName === "session_switch" || eventName === "session_branch") {
+				replayProviderToolResultEntries(api, ctx, providerResultState, clearLiveStatus);
+			}
 		});
 	}
+
+	api.on?.("session_tree", (_event, ctx) => {
+		clearProviderResultState();
+		replayProviderToolResultEntries(api, ctx, providerResultState, clearLiveStatus);
+	});
+
+	api.on?.("context", (event) => filterProviderToolResultContextMessages(event));
 
 	api.on?.("before_agent_start", async (_event, ctx) => {
 		const syntheticPayload = modelPayloadForBeforeAgent(ctx.model);
@@ -904,32 +1174,29 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 	});
 
 	api.on?.("message_end", (event, ctx) => {
-		try {
-			handleMessageEndImageResults({ api, ctx, event, state: imageResultState, seen: seenImageResults });
-			handleMessageEndProviderToolResults({ api, ctx, event, state: imageResultState, seen: seenProviderToolResults });
-		} finally {
-			clearLiveStatus();
-		}
+		handleMessageEndImageResults({ api, ctx, event, state: imageResultState, seen: seenImageResults });
+		handleMessageEndProviderToolResults({ api, ctx, event, imageState: imageResultState, providerState: providerResultState });
+	});
+
+	api.on?.("turn_end", (_event, ctx) => {
+		void flushProviderToolResultCards(api, ctx, providerResultState, clearLiveStatus).catch((error) => logAsyncFailure(api, ctx, "OpenAI provider tool result flush failed", error));
 	});
 
 	api.on?.("agent_end", async (event, ctx) => {
-		try {
-			const pending = [...expectedByTarget.entries()].filter(([, state]) => state.removed);
-			for (const [key, state] of pending) {
-				await failAfterRemoval({
-					api,
-					ctx,
-					reason: "provider request was not observed after host-side tool removal",
-					state,
-					incompatibleTargets,
-					key,
-				});
-				expectedByTarget.delete(key);
-			}
-			handleAgentEndImageResults({ api, ctx, event, state: imageResultState, seen: seenImageResults });
-			handleAgentEndProviderToolResults({ api, ctx, event, state: imageResultState, seen: seenProviderToolResults });
-		} finally {
-			clearLiveStatus();
+		const pending = [...expectedByTarget.entries()].filter(([, state]) => state.removed);
+		for (const [key, state] of pending) {
+			await failAfterRemoval({
+				api,
+				ctx,
+				reason: "provider request was not observed after host-side tool removal",
+				state,
+				incompatibleTargets,
+				key,
+			});
+			expectedByTarget.delete(key);
 		}
+		handleAgentEndImageResults({ api, ctx, event, state: imageResultState, seen: seenImageResults });
+		const delivery = handleAgentEndProviderToolResults({ api, ctx, event, imageState: imageResultState, providerState: providerResultState });
+		if (delivery === "started") scheduleProviderToolResultFlush(api, ctx, providerResultState, clearLiveStatus);
 	});
 }

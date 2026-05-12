@@ -111,6 +111,8 @@ function registerExtension({
 	activeToolMethods = true,
 	setActiveTools,
 	getActiveTools,
+	sendMessageImpl,
+	appendEntry,
 }: {
 	runtime?: RuntimeKind;
 	initialActiveTools?: any[];
@@ -118,6 +120,8 @@ function registerExtension({
 	activeToolMethods?: boolean;
 	setActiveTools?: (next: any[]) => unknown | Promise<unknown>;
 	getActiveTools?: () => any[] | Promise<any[]>;
+	sendMessageImpl?: (message: unknown, options?: unknown) => unknown | Promise<unknown>;
+	appendEntry?: (customType: string, data: unknown) => unknown | Promise<unknown>;
 } = {}) {
 	const handlers = new Map<string, Handler[]>();
 	const warnings: unknown[][] = [];
@@ -159,8 +163,14 @@ function registerExtension({
 		...(sendMessage
 			? {
 				sendMessage(message: unknown, options?: unknown) {
+					if (sendMessageImpl) return sendMessageImpl(message, options);
 					sentMessages.push({ message, options });
 				},
+			}
+			: {}),
+		...(appendEntry
+			? {
+				appendEntry,
 			}
 			: {}),
 		registerMessageRenderer(customType: string, renderer: Function) {
@@ -183,8 +193,20 @@ function getHandlerFromMap(handlers: Map<string, Handler[]>, name: string): Hand
 	return handler;
 }
 
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return value !== null && typeof value === "object" && !Array.isArray(value);
+}
 function context(cwd: string, homeDir: string, overrides: Record<string, unknown> = {}) {
-	return { cwd, homeDir, model: targetModel, ...overrides };
+	const result: Record<string, unknown> = { cwd, homeDir, model: targetModel, ...overrides };
+	if (isRecord(overrides.ui)) {
+		const ui = overrides.ui;
+		if (isRecord(ui) && typeof ui.custom === "function") {
+			const recorder = (ui.custom as { __recorder?: unknown }).__recorder;
+			if (recorder) result.__uiRecorder = recorder;
+		}
+	}
+	return result;
 }
 
 async function runBeforeAgent(extension: ReturnType<typeof registerExtension>, ctx: any) {
@@ -197,6 +219,10 @@ async function runBeforeProvider(extension: ReturnType<typeof registerExtension>
 
 async function runAgentEnd(extension: ReturnType<typeof registerExtension>, event: unknown, ctx: any) {
 	return getHandler(extension, "agent_end")(event, ctx);
+}
+
+async function runTurnEnd(extension: ReturnType<typeof registerExtension>, event: unknown, ctx: any) {
+	return getHandler(extension, "turn_end")(event, ctx);
 }
 
 
@@ -225,11 +251,11 @@ function messageText(message: any): string {
 	const content = message.content;
 	if (typeof content === "string") return content;
 	if (!Array.isArray(content)) return "";
-	return content.flatMap(part => part?.type === "text" ? [part.text] : []).join("\n");
+	return content.flatMap((part: any) => part?.type === "text" ? [part.text] : []).join("\n");
 }
 
 function messageImages(message: any): Array<{ type: string; data: string; mimeType: string }> {
-	return Array.isArray(message.content) ? message.content.filter(part => part?.type === "image") : [];
+	return Array.isArray(message.content) ? message.content.filter((part: any) => part?.type === "image") : [];
 }
 
 
@@ -243,25 +269,88 @@ async function responseText(response: Response): Promise<string> {
 
 type TestOverlayComponent = { render(width: number): string[]; handleInput?(data: string): void; dispose?(): void };
 
+interface TestComponent {
+	render(width: number): string[];
+	invalidate?(): void;
+}
+
+class TestContainer implements TestComponent {
+	readonly children: TestComponent[] = [];
+	addChild(component: TestComponent): void {
+		this.children.push(component);
+	}
+	render(width: number): string[] {
+		return this.children.flatMap(child => child.render(width));
+	}
+	invalidate(): void {}
+}
+
+class TestBox extends TestContainer {
+	constructor(private readonly paddingX = 1, private readonly paddingY = 1, private readonly bgFn?: (text: string) => string) {
+		super();
+	}
+	clear(): void {
+		this.children.splice(0);
+	}
+	render(width: number): string[] {
+		const inner = super.render(Math.max(1, width - this.paddingX * 2));
+		const padded = [
+			...Array.from({ length: this.paddingY }, () => ""),
+			...inner.map(line => `${" ".repeat(this.paddingX)}${line}`),
+			...Array.from({ length: this.paddingY }, () => ""),
+		];
+		return this.bgFn ? padded.map(line => this.bgFn?.(line) ?? line) : padded;
+	}
+}
+
+class TestText implements TestComponent {
+	constructor(private readonly text = "") {}
+	render(): string[] {
+		return this.text ? this.text.split("\n") : [];
+	}
+	invalidate(): void {}
+}
+
+class TestSpacer implements TestComponent {
+	constructor(private readonly height = 1) {}
+	render(): string[] {
+		return Array.from({ length: this.height }, () => "");
+	}
+	invalidate(): void {}
+}
+
+const testTui = {
+	Box: TestBox,
+	Text: TestText,
+	Spacer: TestSpacer,
+};
+
+
 function uiRecorder() {
 	const widgetCalls: Array<{ key: string; content: string[] | undefined; options?: unknown }> = [];
 	const customCalls: Array<{ args: unknown[]; options?: unknown; component?: TestOverlayComponent; doneResults: unknown[]; requestRenderCalls: number }> = [];
-	const theme = { fg(_token: string, value: string) { return value; } };
+	const cardCalls: Array<{ args: unknown[]; options?: unknown; component?: TestOverlayComponent; doneResults: unknown[]; requestRenderCalls: number }> = [];
+	const theme = { fg(_token: string, value: string) { return value; }, bg(_token: string, value: string) { return value; }, bold(value: string) { return value; }, format: { bracketLeft: "[", bracketRight: "]" } };
+	function custom(factory: Function, options?: unknown) {
+		const call = { args: [factory, options], options, component: undefined as TestOverlayComponent | undefined, doneResults: [] as unknown[], requestRenderCalls: 0 };
+		const runtimeArg = isRecord(options) && options.overlay === true ? { requestRender() { call.requestRenderCalls++; } } : testTui;
+		const component = factory(runtimeArg, theme, {}, (result: unknown) => call.doneResults.push(result));
+		call.component = component as TestOverlayComponent;
+		customCalls.push(call);
+		if (!isRecord(options) || options.overlay !== true) cardCalls.push(call);
+		return isRecord(options) && options.overlay === false ? new Promise<undefined>(() => {}) : Promise.resolve(undefined);
+	}
+	(custom as { __recorder?: unknown }).__recorder = { widgetCalls, customCalls, cardCalls };
 	return {
 		widgetCalls,
 		customCalls,
+		cardCalls,
 		ctxUi: {
 			notify() {},
 			setWidget(key: string, content: string[] | undefined, options?: unknown) {
 				widgetCalls.push({ key, content, options });
 			},
-			custom(factory: Function, options?: unknown) {
-				const call = { args: [factory, options], options, component: undefined as TestOverlayComponent | undefined, doneResults: [] as unknown[], requestRenderCalls: 0 };
-				const component = factory({ requestRender() { call.requestRenderCalls++; } }, theme, {}, (result: unknown) => call.doneResults.push(result));
-				call.component = component as TestOverlayComponent;
-				customCalls.push(call);
-				return Promise.resolve(undefined);
-			},
+			custom,
 		},
 	};
 }
@@ -284,6 +373,80 @@ function liveWebSearchEvent(query: string, eventType = "response.output_item.don
 			action: { type: "search", query },
 		},
 	});
+}
+
+function providerToolResultCustomMessage(details: Record<string, unknown>) {
+	return {
+		role: "custom",
+		customType: "openai-provider-tool-result",
+		content: "OpenAI provider web_search result",
+		display: true,
+		details,
+	};
+}
+
+function persistedProviderToolResult(resultKey: string, sessionId = "session-1") {
+	return {
+		resultKey,
+		sessionId,
+		insertedAt: 1,
+		message: {
+			customType: "openai-provider-tool-result",
+			display: true,
+			attribution: "agent",
+			content: "",
+			details: {
+				summary: "OpenAI provider completed web_search (1 call).",
+				type: "web_search",
+				queries: ["persisted query"],
+				citations: [],
+				sources: [],
+				actionDetails: [],
+				results: [],
+			},
+		},
+	};
+}
+
+function currentBranchEntry(data: unknown) {
+	return { type: "custom", customType: "openai-provider-tool-result-ui", data };
+}
+
+function installDeferredTimerHarness() {
+	const originalSetTimeout = globalThis.setTimeout;
+	const originalClearTimeout = globalThis.clearTimeout;
+	const scheduled: Array<{ active: boolean; handler: () => void }> = [];
+	(globalThis as any).setTimeout = (handler: TimerHandler, _timeout?: number, ...args: unknown[]) => {
+		const task = {
+			active: true,
+			handler: () => {
+				if (typeof handler === "function") {
+					(handler as (...args: unknown[]) => void)(...args);
+				} else {
+					throw new Error("string timer handlers are unsupported in tests");
+				}
+			},
+		};
+		scheduled.push(task);
+		return task;
+	};
+	(globalThis as any).clearTimeout = (handle?: unknown) => {
+		if (isRecord(handle)) (handle as { active?: boolean }).active = false;
+	};
+	return {
+		scheduled,
+		runNext() {
+			const task = scheduled.shift();
+			if (task?.active) task.handler();
+		},
+		runAll() {
+			while (scheduled.length > 0) this.runNext();
+		},
+		restore() {
+			globalThis.setTimeout = originalSetTimeout;
+			globalThis.clearTimeout = originalClearTimeout;
+		},
+	};
 }
 
 function installMockResponsesFetch(bodyFactory: () => BodyInit | ReadableStream<Uint8Array>) {
@@ -360,9 +523,466 @@ function webSearchMessage(query = "latest OMP provider tools") {
 	};
 }
 
+function actionOnlyWebSearchMessage() {
+	return {
+		providerPayload: {
+			type: "openaiResponsesHistory",
+			items: [
+				{
+					type: "web_search_call",
+					action: { type: "open_page", url: "https://example.invalid/action-only" },
+				},
+			],
+		},
+	};
+}
+
 async function directoryEntries(directory: string): Promise<string[]> {
 	return (await fs.readdir(directory)).sort();
 }
+
+it("queues message_end final web_search while non-idle without sending or closing overlay", async () => {
+	const restoreFetch = installMockResponsesFetch(() => liveWebSearchEvent("queued final"));
+	try {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		const extension = registerExtension({ initialActiveTools: ["read", "generate_image"] });
+		const recorder = uiRecorder();
+		const ctx = context(cwd, homeDir, {
+			hasUI: true,
+			ui: recorder.ctxUi,
+			isIdle: () => false,
+			sessionManager: { getSessionId: () => "session-1" },
+		});
+		await createActiveLiveTracker(extension, ctx, "queued final");
+		const overlay = recorder.customCalls.find(call => isRecord(call.options) && call.options.overlay === true);
+
+		await runMessageEnd(extension, { type: "message_end", message: webSearchMessage("queued final") }, ctx);
+
+		expect(extension.sentMessages).toHaveLength(0);
+		expect(recorder.cardCalls).toEqual([]);
+		expect(overlay?.doneResults).toEqual([]);
+		expect(recorder.widgetCalls).toEqual([]);
+	} finally {
+		restoreFetch();
+	}
+});
+
+it("flushes queued final web_search on idle turn_end as a ui-only display custom message", async () => {
+	const cwd = await makeTempDir();
+	const homeDir = await makeTempDir();
+	const appended: Array<{ customType: string; data: unknown }> = [];
+	const extension = registerExtension({
+		appendEntry(customType, data) {
+			appended.push({ customType, data });
+		},
+	});
+	let idle = false;
+	const ctx = context(cwd, homeDir, {
+		hasUI: true,
+		isIdle: () => idle,
+		sessionManager: { getSessionId: () => "session-1" },
+	});
+	await runMessageEnd(extension, { type: "message_end", message: webSearchMessage("idle flush") }, ctx);
+
+	idle = true;
+	await runTurnEnd(extension, { type: "turn_end" }, ctx);
+
+	expect(extension.sentMessages).toHaveLength(1);
+	expect(extension.sentMessages[0]?.options).not.toMatchObject({ deliverAs: "nextTurn" });
+	expect(extension.sentMessages[0]?.options).not.toMatchObject({ triggerTurn: true });
+	expect(extension.sentMessages[0]?.message).toMatchObject({
+		customType: "openai-provider-tool-result",
+		display: true,
+		content: "OpenAI provider web_search result",
+		details: expect.objectContaining({
+			uiOnly: true,
+			source: "omp-openai-provider-tools",
+			resultKey: "session-1:web_search:ws-1",
+			message: expect.objectContaining({
+				customType: "openai-provider-tool-result",
+				details: expect.objectContaining({ queries: ["idle flush"] }),
+			}),
+		}),
+	});
+	expect(appended).toEqual([{ customType: "openai-provider-tool-result-ui", data: expect.objectContaining({ resultKey: "session-1:web_search:ws-1" }) }]);
+});
+
+it("renders idle-gated display custom messages through the registered provider result renderer", async () => {
+	const cwd = await makeTempDir();
+	const homeDir = await makeTempDir();
+	const extension = registerExtension();
+	const ctx = context(cwd, homeDir, { isIdle: () => true, sessionManager: { getSessionId: () => "session-1" } });
+
+	await runMessageEnd(extension, { type: "message_end", message: webSearchMessage("renderer integration") }, ctx);
+	await runTurnEnd(extension, { type: "turn_end" }, ctx);
+
+	const renderer = extension.renderers.get("openai-provider-tool-result");
+	expect(renderer).toBeDefined();
+	const component = renderer!(extension.sentMessages[0]!.message, { expanded: false }, {}, testTui);
+	const collapsed = component?.render(120).join("\n") ?? "";
+	expect(collapsed).toContain("OpenAI provider completed web_search (1 call).");
+	expect(collapsed).toContain("[(Ctrl+O for more)]");
+	expect(collapsed).not.toContain("https://example.invalid/omp-provider-tools");
+	const expanded = renderer!(extension.sentMessages[0]!.message, { expanded: true }, {}, testTui)?.render(120).join("\n") ?? "";
+	expect(expanded).toContain("renderer integration");
+	expect(expanded).toContain("https://example.invalid/omp-provider-tools");
+});
+
+it("retries queued final web_search after a non-idle turn_end and sends exactly once", async () => {
+	const timers = installDeferredTimerHarness();
+	try {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		const extension = registerExtension();
+		let idle = false;
+		const ctx = context(cwd, homeDir, { isIdle: () => idle, sessionManager: { getSessionId: () => "session-1" } });
+
+		await runMessageEnd(extension, { type: "message_end", message: webSearchMessage("deferred flush") }, ctx);
+		await runTurnEnd(extension, { type: "turn_end" }, ctx);
+
+		expect(extension.sentMessages).toHaveLength(0);
+		expect(timers.scheduled.length).toBeGreaterThan(0);
+
+		idle = true;
+		timers.runAll();
+		await Promise.resolve();
+
+		expect(extension.sentMessages).toHaveLength(1);
+		expect(extension.sentMessages[0]?.message).toMatchObject({
+			details: expect.objectContaining({ resultKey: "session-1:web_search:ws-1" }),
+		});
+		timers.runAll();
+		expect(extension.sentMessages).toHaveLength(1);
+	} finally {
+		timers.restore();
+	}
+});
+
+it("keeps retrying queued final web_search when deferred flush fires before idle", async () => {
+	const timers = installDeferredTimerHarness();
+	try {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		const extension = registerExtension();
+		let idle = false;
+		const ctx = context(cwd, homeDir, { isIdle: () => idle, sessionManager: { getSessionId: () => "session-1" } });
+
+		await runMessageEnd(extension, { type: "message_end", message: webSearchMessage("late idle") }, ctx);
+		await runTurnEnd(extension, { type: "turn_end" }, ctx);
+		timers.runNext();
+		await Promise.resolve();
+
+		expect(extension.sentMessages).toHaveLength(0);
+		expect(timers.scheduled.length).toBeGreaterThan(0);
+
+		idle = true;
+		timers.runAll();
+		await Promise.resolve();
+
+		expect(extension.sentMessages).toHaveLength(1);
+	} finally {
+		timers.restore();
+	}
+});
+
+it("keeps final card pending when async sendMessage rejects before retrying", async () => {
+	const timers = installDeferredTimerHarness();
+	try {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		let attempts = 0;
+		const sent: unknown[] = [];
+		const extension = registerExtension({
+			sendMessageImpl(message, options) {
+				attempts++;
+				if (attempts === 1) return Promise.reject(new Error("async send failed"));
+				sent.push({ message, options });
+			},
+		});
+		const ctx = context(cwd, homeDir, { isIdle: () => true, sessionManager: { getSessionId: () => "session-1" } });
+
+		await runMessageEnd(extension, { type: "message_end", message: webSearchMessage("async retry") }, ctx);
+		await runTurnEnd(extension, { type: "turn_end" }, ctx);
+		await Promise.resolve();
+
+		expect(sent).toHaveLength(0);
+		expect(extension.warnings.join("\n")).toContain("OpenAI provider tool result message delivery failed");
+
+		timers.runAll();
+		await Promise.resolve();
+
+		expect(sent).toHaveLength(1);
+		expect(attempts).toBe(2);
+	} finally {
+		timers.restore();
+	}
+});
+
+it("serializes final card flushes while async sendMessage is pending", async () => {
+	const cwd = await makeTempDir();
+	const homeDir = await makeTempDir();
+	let resolveSend: (() => void) | undefined;
+	let sends = 0;
+	const extension = registerExtension({
+		sendMessageImpl() {
+			sends++;
+			return new Promise<void>(resolve => { resolveSend = resolve; });
+		},
+	});
+	const first = webSearchMessage("overlap first");
+	const second = webSearchMessage("overlap second");
+	(second.providerPayload.items[0] as any).id = "ws-2";
+	const ctx = context(cwd, homeDir, { isIdle: () => true, sessionManager: { getSessionId: () => "session-1" } });
+
+	await runMessageEnd(extension, { type: "message_end", message: first }, ctx);
+	const firstFlush = runTurnEnd(extension, { type: "turn_end" }, ctx);
+	await Promise.resolve();
+	await runMessageEnd(extension, { type: "message_end", message: second }, ctx);
+	await runTurnEnd(extension, { type: "turn_end" }, ctx);
+
+	expect(sends).toBe(1);
+	resolveSend?.();
+	await firstFlush;
+	await Promise.resolve();
+
+	await runTurnEnd(extension, { type: "turn_end" }, ctx);
+	expect(sends).toBe(2);
+});
+
+it("does not let stale async flush shift replayed cards after session invalidation", async () => {
+	const cwd = await makeTempDir();
+	const homeDir = await makeTempDir();
+	let resolveSend: (() => void) | undefined;
+	let sends = 0;
+	const extension = registerExtension({
+		sendMessageImpl() {
+			sends++;
+			if (sends === 1) return new Promise<void>(resolve => { resolveSend = resolve; });
+		},
+	});
+	let branch: unknown[] = [];
+	const sessionManager = { getSessionId: () => "session-1", getBranch: () => branch };
+	const ctx = context(cwd, homeDir, { isIdle: () => true, sessionManager });
+
+	await runMessageEnd(extension, { type: "message_end", message: webSearchMessage("stale flush") }, ctx);
+	const staleFlush = runTurnEnd(extension, { type: "turn_end" }, ctx);
+	await Promise.resolve();
+	branch = [currentBranchEntry(persistedProviderToolResult("replayed-after-stale"))];
+	await runSessionLifecycle(extension, "session_branch", ctx);
+
+	resolveSend?.();
+	await staleFlush;
+	await Promise.resolve();
+
+	expect(extension.sentMessages.filter(sent => (sent.message as any)?.details?.resultKey === "replayed-after-stale")).toHaveLength(0);
+	await runTurnEnd(extension, { type: "turn_end" }, ctx);
+	expect(extension.sentMessages.filter(sent => (sent.message as any)?.details?.resultKey === "replayed-after-stale")).toHaveLength(0);
+	expect(sends).toBe(2);
+});
+
+it("does not let stale async flush unlock a newer replay flush", async () => {
+	const cwd = await makeTempDir();
+	const homeDir = await makeTempDir();
+	const resolvers: Array<() => void> = [];
+	let sends = 0;
+	const extension = registerExtension({
+		sendMessageImpl() {
+			sends++;
+			return new Promise<void>(resolve => { resolvers.push(resolve); });
+		},
+	});
+	let branch: unknown[] = [];
+	const sessionManager = { getSessionId: () => "session-1", getBranch: () => branch };
+	const ctx = context(cwd, homeDir, { isIdle: () => true, sessionManager });
+
+	await runMessageEnd(extension, { type: "message_end", message: webSearchMessage("stale lock") }, ctx);
+	const staleFlush = runTurnEnd(extension, { type: "turn_end" }, ctx);
+	await Promise.resolve();
+	branch = [currentBranchEntry(persistedProviderToolResult("replayed-lock"))];
+	await runSessionLifecycle(extension, "session_branch", ctx);
+	await Promise.resolve();
+	expect(sends).toBe(2);
+
+	resolvers[0]?.();
+	await staleFlush;
+	await Promise.resolve();
+	await runTurnEnd(extension, { type: "turn_end" }, ctx);
+	expect(sends).toBe(2);
+
+	resolvers[1]?.();
+	await Promise.resolve();
+	await runTurnEnd(extension, { type: "turn_end" }, ctx);
+	expect(sends).toBe(2);
+});
+
+it("agent_end fallback only queues and uses the same deferred idle retry path", async () => {
+	const timers = installDeferredTimerHarness();
+	try {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		const extension = registerExtension();
+		let idle = false;
+		const ctx = context(cwd, homeDir, { isIdle: () => idle, sessionManager: { getSessionId: () => "session-1" } });
+
+		await runAgentEnd(extension, { message: webSearchMessage("agent deferred") }, ctx);
+
+		expect(extension.sentMessages).toHaveLength(0);
+		idle = true;
+		timers.runAll();
+		await Promise.resolve();
+
+		expect(extension.sentMessages).toHaveLength(1);
+		expect(extension.sentMessages[0]?.message).toMatchObject({
+			details: expect.objectContaining({ resultKey: "session-1:web_search:ws-1" }),
+		});
+	} finally {
+		timers.restore();
+	}
+});
+
+it("filters only this plugin's ui-only provider result custom messages from LLM context", async () => {
+	const cwd = await makeTempDir();
+	const homeDir = await makeTempDir();
+	const extension = registerExtension();
+	const providerCard = providerToolResultCustomMessage({ uiOnly: true, resultKey: "r1", message: { details: { queries: ["filtered query"] } } });
+	const otherCustom = { role: "custom", customType: "other-plugin", content: "keep", display: true, timestamp: Date.now() };
+	const unsafeSameType = providerToolResultCustomMessage({ uiOnly: false, resultKey: "r2" });
+
+	const result = await getHandler(extension, "context")({ type: "context", messages: [providerCard, otherCustom, unsafeSameType] }, context(cwd, homeDir));
+
+	expect((result as any).messages).toEqual([otherCustom, unsafeSameType]);
+	expect(JSON.stringify((result as any).messages)).not.toContain("filtered query");
+});
+
+it("closes live overlay only after successful display card insertion", async () => {
+	const restoreFetch = installMockResponsesFetch(() => liveWebSearchEvent("display close"));
+	try {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		const recorder = uiRecorder();
+		const successful = registerExtension({ initialActiveTools: ["read", "generate_image"] });
+		const successfulCtx = context(cwd, homeDir, { hasUI: true, ui: recorder.ctxUi, isIdle: () => true, sessionManager: { getSessionId: () => "session-1" } });
+		await createActiveLiveTracker(successful, successfulCtx, "display close");
+		const overlay = recorder.customCalls.find(call => isRecord(call.options) && call.options.overlay === true);
+
+		await runMessageEnd(successful, { type: "message_end", message: webSearchMessage("display close") }, successfulCtx);
+		await runTurnEnd(successful, { type: "turn_end" }, successfulCtx);
+
+		expect(successful.sentMessages).toHaveLength(1);
+		expect(overlay?.doneResults).toEqual([undefined]);
+
+		const failedRecorder = uiRecorder();
+		const failed = registerExtension({
+			initialActiveTools: ["read", "generate_image"],
+			sendMessageImpl() { throw new Error("display failed"); },
+		});
+		const notifyCalls: unknown[] = [];
+		const failedCtx = context(cwd, homeDir, {
+			hasUI: true,
+			ui: { notify(message: unknown) { notifyCalls.push(message); }, custom: failedRecorder.ctxUi.custom, setWidget: failedRecorder.ctxUi.setWidget },
+			isIdle: () => true,
+			sessionManager: { getSessionId: () => "session-1" },
+		});
+		await createActiveLiveTracker(failed, failedCtx, "display close");
+		const failedOverlay = failedRecorder.customCalls.find(call => isRecord(call.options) && call.options.overlay === true);
+
+		await runMessageEnd(failed, { type: "message_end", message: webSearchMessage("display close") }, failedCtx);
+		await runTurnEnd(failed, { type: "turn_end" }, failedCtx);
+
+		expect(failedOverlay?.doneResults).toEqual([]);
+		expect(notifyCalls).toEqual([]);
+		expect(failedRecorder.widgetCalls).toEqual([]);
+		expect(failed.warnings.join("\n")).toContain("OpenAI provider tool result message delivery failed");
+	} finally {
+		restoreFetch();
+	}
+});
+
+it("treats appendEntry failure as non-fatal after successful display send", async () => {
+	const cwd = await makeTempDir();
+	const homeDir = await makeTempDir();
+	const appended: Array<{ customType: string; data: unknown }> = [];
+	const extension = registerExtension({
+		appendEntry(customType, data) {
+			appended.push({ customType, data });
+			throw new Error("append failed");
+		},
+	});
+	const ctx = context(cwd, homeDir, { isIdle: () => true, sessionManager: { getSessionId: () => "session-1" } });
+
+	await runMessageEnd(extension, { type: "message_end", message: webSearchMessage("append failure") }, ctx);
+	await runTurnEnd(extension, { type: "turn_end" }, ctx);
+	await Promise.resolve();
+
+	expect(extension.sentMessages).toHaveLength(1);
+	expect(appended).toHaveLength(1);
+	expect(appended[0]).toMatchObject({ customType: "openai-provider-tool-result-ui" });
+	expect(extension.warnings.join("\n")).toContain("OpenAI provider tool result UI persistence failed");
+});
+
+it("replays current-branch ui-only custom entries once after idle without appending", async () => {
+	const cwd = await makeTempDir();
+	const homeDir = await makeTempDir();
+	const appended: Array<{ customType: string; data: unknown }> = [];
+	const entry = currentBranchEntry(persistedProviderToolResult("replay-1"));
+	const extension = registerExtension({ appendEntry(customType, data) { appended.push({ customType, data }); } });
+	const sessionManager = { getSessionId: () => "session-1", getBranch: () => [entry] };
+	const ctx = context(cwd, homeDir, { isIdle: () => true, sessionManager });
+
+	await runSessionStart(extension, ctx);
+	await runSessionStart(extension, ctx);
+	await runSessionLifecycle(extension, "session_switch", ctx);
+	await runSessionLifecycle(extension, "session_tree", ctx);
+
+	expect(extension.sentMessages.filter(sent => (sent.message as any)?.details?.resultKey === "replay-1")).toHaveLength(1);
+	expect(appended).toEqual([]);
+
+	await runMessageEnd(extension, { type: "message_end", message: webSearchMessage("persist me") }, ctx);
+	await runTurnEnd(extension, { type: "turn_end" }, ctx);
+
+	expect(appended).toContainEqual({ customType: "openai-provider-tool-result-ui", data: expect.objectContaining({ resultKey: "session-1:web_search:ws-1" }) });
+});
+
+it("replays same resultKey again when the current branch entries change", async () => {
+	const cwd = await makeTempDir();
+	const homeDir = await makeTempDir();
+	let branch = [currentBranchEntry(persistedProviderToolResult("same-key"))];
+	const sessionManager = { getSessionId: () => "session-1", getBranch: () => branch };
+	const extension = registerExtension();
+	const ctx = context(cwd, homeDir, { isIdle: () => true, sessionManager });
+
+	await runSessionStart(extension, ctx);
+	await Promise.resolve();
+	expect(extension.sentMessages.filter(sent => (sent.message as any)?.details?.resultKey === "same-key")).toHaveLength(1);
+
+	branch = [currentBranchEntry(persistedProviderToolResult("branch-marker")), currentBranchEntry(persistedProviderToolResult("same-key"))];
+	await runSessionLifecycle(extension, "session_branch", ctx);
+	await Promise.resolve();
+	expect(extension.sentMessages.filter(sent => (sent.message as any)?.details?.resultKey === "same-key")).toHaveLength(2);
+});
+
+it("invalidates old pending and retry tokens on session lifecycle changes", async () => {
+	const timers = installDeferredTimerHarness();
+	try {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		const extension = registerExtension();
+		let idle = false;
+		const ctx = context(cwd, homeDir, { isIdle: () => idle, sessionManager: { getSessionId: () => "session-1" } });
+
+		await runMessageEnd(extension, { type: "message_end", message: webSearchMessage("stale pending") }, ctx);
+		await runTurnEnd(extension, { type: "turn_end" }, ctx);
+		await runSessionLifecycle(extension, "session_branch", ctx);
+		idle = true;
+		timers.runAll();
+		await Promise.resolve();
+
+		expect(extension.sentMessages).toHaveLength(0);
+	} finally {
+		timers.restore();
+	}
+});
 
 describe("OpenAI provider tools extension", () => {
 	it("registers session_start, before_agent_start, before_provider_request, and agent_end handlers without runtime package imports", async () => {
@@ -446,12 +1066,13 @@ describe("OpenAI provider tools extension", () => {
 			const recorder = uiRecorder();
 			const ctx = context(cwd, homeDir, { hasUI: true, ui: recorder.ctxUi, sessionManager: { getSessionId: () => "session-1" } });
 			await createActiveLiveTracker(extension, ctx, "message end cleanup");
-			const beforeMessages = extension.sentMessages.length;
+			const beforeCards = recorder.cardCalls.length;
 
 			await runMessageEnd(extension, { type: "message_end", message: webSearchMessage() }, ctx);
 
-			expect(extension.sentMessages.length).toBe(beforeMessages + 1);
-			expect(recorder.customCalls.at(-1)?.doneResults).toEqual([undefined]);
+			expect(extension.sentMessages).toHaveLength(0);
+			expect(recorder.cardCalls.length).toBe(beforeCards);
+			expect(recorder.customCalls.find(call => isRecord(call.options) && call.options.overlay === true)?.doneResults).toEqual([]);
 			expect(recorder.widgetCalls).toEqual([]);
 		} finally {
 			restoreFetch();
@@ -474,14 +1095,156 @@ describe("OpenAI provider tools extension", () => {
 
 			await runMessageEnd(extension, { type: "message_end", message: webSearchMessage("echo closes overlay") }, ctx);
 
-			expect(extension.sentMessages).toHaveLength(1);
-			expect(recorder.customCalls[0]?.doneResults).toEqual([undefined]);
+			expect(extension.sentMessages).toHaveLength(0);
+			expect(recorder.cardCalls).toHaveLength(0);
+			expect(recorder.customCalls[0]?.doneResults).toEqual([]);
 			expect(recorder.widgetCalls).toEqual([]);
 		} finally {
 			restoreFetch();
 		}
 	});
 
+	it("does not clear active live overlay for lifecycle events without complete provider results", async () => {
+		const restoreFetch = installMockResponsesFetch(() => liveWebSearchEvent("incomplete lifecycle cleanup"));
+		try {
+			const cwd = await makeTempDir();
+			const homeDir = await makeTempDir();
+
+			const messageEndExtension = registerExtension({ initialActiveTools: ["read", "generate_image"] });
+			const messageEndRecorder = uiRecorder();
+			const messageEndCtx = context(cwd, homeDir, { hasUI: true, ui: messageEndRecorder.ctxUi, sessionManager: { getSessionId: () => "session-1" } });
+			await createActiveLiveTracker(messageEndExtension, messageEndCtx, "message_end without provider result");
+			const messageEndOverlay = messageEndRecorder.customCalls.find(call => isRecord(call.options) && call.options.overlay === true);
+
+			await runMessageEnd(messageEndExtension, { type: "message_end", message: { role: "assistant", content: [] } }, messageEndCtx);
+
+			expect(messageEndOverlay?.doneResults).toEqual([]);
+			expect(messageEndRecorder.cardCalls).toEqual([]);
+			expect(messageEndExtension.sentMessages).toHaveLength(0);
+
+			const agentEndExtension = registerExtension({ initialActiveTools: ["read", "generate_image"] });
+			const agentEndRecorder = uiRecorder();
+			const agentEndCtx = context(cwd, homeDir, { hasUI: true, ui: agentEndRecorder.ctxUi, sessionManager: { getSessionId: () => "session-1" } });
+			await createActiveLiveTracker(agentEndExtension, agentEndCtx, "agent_end incomplete provider result");
+			const agentEndOverlay = agentEndRecorder.customCalls.find(call => isRecord(call.options) && call.options.overlay === true);
+			const incomplete = webSearchMessage("agent_end incomplete provider result");
+			((incomplete.providerPayload.items[0] as any).status) = "in_progress";
+
+			await runAgentEnd(agentEndExtension, { message: incomplete }, agentEndCtx);
+
+			expect(agentEndOverlay?.doneResults).toEqual([]);
+			expect(agentEndRecorder.cardCalls).toEqual([]);
+			expect(agentEndExtension.sentMessages).toHaveLength(0);
+		} finally {
+			restoreFetch();
+		}
+	});
+
+	it("closes active live overlay when final web_search custom card startup succeeds without waiting for card close", async () => {
+		const restoreFetch = installMockResponsesFetch(() => liveWebSearchEvent("non resolving final card"));
+		try {
+			const cwd = await makeTempDir();
+			const homeDir = await makeTempDir();
+			const extension = registerExtension({ initialActiveTools: ["read", "generate_image"] });
+			const recorder = uiRecorder();
+			const ctx = context(cwd, homeDir, { hasUI: true, ui: recorder.ctxUi, sessionManager: { getSessionId: () => "session-1" } });
+			await createActiveLiveTracker(extension, ctx, "non resolving final card");
+			const overlay = recorder.customCalls.find(call => isRecord(call.options) && call.options.overlay === true);
+
+			const completion = Promise.resolve(runMessageEnd(extension, { type: "message_end", message: webSearchMessage("non resolving final card") }, ctx)).then(() => "returned" as const);
+			const timeout = new Promise<"timeout">(resolve => setTimeout(() => resolve("timeout"), 25));
+
+			await expect(Promise.race([completion, timeout])).resolves.toBe("returned");
+			expect(extension.sentMessages).toHaveLength(0);
+			expect(recorder.cardCalls).toHaveLength(0);
+			expect(overlay?.doneResults).toEqual([]);
+			expect(recorder.widgetCalls).toEqual([]);
+		} finally {
+			restoreFetch();
+		}
+	});
+
+	it("closes active live overlay after nextTurn fallback starts without triggering a turn", async () => {
+		const restoreFetch = installMockResponsesFetch(() => liveWebSearchEvent("fallback final echo"));
+		try {
+			const cwd = await makeTempDir();
+			const homeDir = await makeTempDir();
+			const extension = registerExtension({ initialActiveTools: ["read", "generate_image"] });
+			const recorder = uiRecorder();
+			const overlayCtx = context(cwd, homeDir, { hasUI: true, ui: recorder.ctxUi, sessionManager: { getSessionId: () => "session-1" } });
+			await createActiveLiveTracker(extension, overlayCtx, "fallback final echo");
+			const overlay = recorder.customCalls.find(call => isRecord(call.options) && call.options.overlay === true);
+			const fallbackCtx = context(cwd, homeDir, { hasUI: true, ui: {}, sessionManager: { getSessionId: () => "session-1" } });
+
+			await runMessageEnd(extension, { type: "message_end", message: webSearchMessage("fallback final echo") }, fallbackCtx);
+
+			expect(extension.sentMessages).toHaveLength(0);
+			expect(overlay?.doneResults).toEqual([]);
+			expect(recorder.cardCalls).toEqual([]);
+			expect(recorder.widgetCalls).toEqual([]);
+		} finally {
+			restoreFetch();
+		}
+	});
+
+	it("does not fallback or close active live overlay when final custom card startup throws", async () => {
+		const restoreFetch = installMockResponsesFetch(() => liveWebSearchEvent("custom startup failure"));
+		try {
+			const cwd = await makeTempDir();
+			const homeDir = await makeTempDir();
+			const extension = registerExtension({ initialActiveTools: ["read", "generate_image"] });
+			const recorder = uiRecorder();
+			const notifyCalls: unknown[] = [];
+			const custom = (factory: Function, options?: unknown) => {
+				if (isRecord(options) && options.overlay === false) throw new Error("custom card startup failed");
+				return recorder.ctxUi.custom(factory, options as { overlay?: boolean });
+			};
+			const ctx = context(cwd, homeDir, {
+				hasUI: true,
+				ui: {
+					notify(message: unknown) { notifyCalls.push(message); },
+					setWidget: recorder.ctxUi.setWidget,
+					custom,
+				},
+				sessionManager: { getSessionId: () => "session-1" },
+			});
+			await createActiveLiveTracker(extension, ctx, "custom startup failure");
+			const overlay = recorder.customCalls.find(call => isRecord(call.options) && call.options.overlay === true);
+
+			await runMessageEnd(extension, { type: "message_end", message: webSearchMessage("custom startup failure") }, ctx);
+			await Promise.resolve();
+			await Promise.resolve();
+
+			expect(extension.sentMessages).toHaveLength(0);
+			expect(recorder.cardCalls).toEqual([]);
+			expect(overlay?.doneResults).toEqual([]);
+			expect(recorder.widgetCalls).toEqual([]);
+			expect(notifyCalls).toEqual([]);
+			expect(extension.warnings.join("\n")).not.toContain("OpenAI provider tool result message delivery failed");
+			expect(extension.warnings.join("\n")).not.toContain("custom card startup failed");
+		} finally {
+			restoreFetch();
+		}
+	});
+
+
+	it("echoes statusless agent_end web_search when query is displayable", async () => {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		const extension = registerExtension();
+		const recorder = uiRecorder();
+		const ctx = context(cwd, homeDir, { hasUI: true, ui: recorder.ctxUi, sessionManager: { getSessionId: () => "session-1" } });
+
+		const statusless = webSearchMessage("statusless final");
+		delete (statusless.providerPayload.items[0] as any).status;
+		statusless.providerPayload.items = [statusless.providerPayload.items[0]];
+		await runAgentEnd(extension, { message: statusless }, ctx);
+		await runTurnEnd(extension, { type: "turn_end" }, ctx);
+
+		const finalMessage = extension.sentMessages.find(sent => (sent.message as any)?.customType === "openai-provider-tool-result")?.message as any;
+		expect(finalMessage).toBeDefined();
+		expect(finalMessage.details.message.details.queries).toContain("statusless final");
+	});
 	it("clears active live overlay on agent_end after final echo handling", async () => {
 		const restoreFetch = installMockResponsesFetch(() => liveWebSearchEvent("agent end cleanup"));
 		try {
@@ -493,9 +1256,11 @@ describe("OpenAI provider tools extension", () => {
 			await createActiveLiveTracker(extension, ctx, "agent end cleanup");
 
 			await runAgentEnd(extension, { message: webSearchMessage() }, ctx);
+			await runTurnEnd(extension, { type: "turn_end" }, ctx);
 
 			expect(extension.sentMessages).toHaveLength(1);
-			expect(recorder.customCalls.at(-1)?.doneResults).toEqual([undefined]);
+			expect(recorder.cardCalls).toHaveLength(0);
+			expect(recorder.customCalls.find(call => isRecord(call.options) && call.options.overlay === true)?.doneResults).toEqual([undefined]);
 			expect(recorder.widgetCalls).toEqual([]);
 		} finally {
 			restoreFetch();
@@ -926,27 +1691,54 @@ describe("OpenAI provider tools extension", () => {
 		expect(extension.activeTools()).toEqual(["read", "web_search", "generate_image"]);
 	});
 
-	it("echoes provider-native web_search results as a visible custom message without steering", async () => {
+	it("echoes provider-native web_search results as a styled UI-only card without steering", async () => {
 		const cwd = await makeTempDir();
 		const homeDir = await makeTempDir();
 		const extension = registerExtension();
+		const recorder = uiRecorder();
 		const ctx = context(cwd, homeDir, {
+			hasUI: true,
+			ui: recorder.ctxUi,
 			sessionManager: {
 				getSessionId: () => "session-1",
 			},
 		});
 
 		await runAgentEnd(extension, { message: webSearchMessage() }, ctx);
+		await runTurnEnd(extension, { type: "turn_end" }, ctx);
 
 		expect(extension.sentMessages).toHaveLength(1);
-		expect(extension.sentMessages[0]?.options).toEqual({ deliverAs: "nextTurn" });
+		expect(recorder.cardCalls).toHaveLength(0);
 		const message = extension.sentMessages[0]?.message as any;
 		expect(message.display).toBe(true);
 		expect(message.customType).toBe("openai-provider-tool-result");
-		expect(message.content).toBe("");
-		expect(message.details.queries).toContain("latest OMP provider tools");
-		expect(JSON.stringify(message.details)).toContain("https://example.invalid/omp-provider-tools");
-		expect(JSON.stringify(message.details)).not.toContain("OMP provider tools are available.");
+		expect(message.details.uiOnly).toBe(true);
+		expect(message.details.message.details.queries).toContain("latest OMP provider tools");
+	});
+
+	it("does not use nextTurn fallback for interactive web_search summaries without custom UI", async () => {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		const extension = registerExtension();
+		const ctx = context(cwd, homeDir, {
+			hasUI: true,
+			ui: {},
+			sessionManager: {
+				getSessionId: () => "session-1",
+			},
+		});
+
+		await runAgentEnd(extension, { message: webSearchMessage() }, ctx);
+		await runTurnEnd(extension, { type: "turn_end" }, ctx);
+
+		expect(extension.sentMessages).toHaveLength(1);
+		expect(extension.sentMessages[0]?.options).not.toMatchObject({ deliverAs: "nextTurn" });
+		const message = extension.sentMessages[0]?.message as any;
+		expect(message.display).toBe(true);
+		expect(message.customType).toBe("openai-provider-tool-result");
+		expect(message.content).toBe("OpenAI provider web_search result");
+		expect(message.details.message.details.queries).toContain("latest OMP provider tools");
+		expect(JSON.stringify(message.details.message.details)).toContain("https://example.invalid/omp-provider-tools");
 	});
 
 	it("logs provider-native web_search summary delivery failures without throwing", async () => {
@@ -978,6 +1770,7 @@ describe("OpenAI provider tools extension", () => {
 		providerToolsExtension(failingApi);
 
 		expect(() => getHandlerFromMap(handlers, "agent_end")({ message: webSearchMessage() }, ctx)).not.toThrow();
+		expect(() => getHandlerFromMap(handlers, "turn_end")({ type: "turn_end" }, ctx)).not.toThrow();
 		await Promise.resolve();
 		await Promise.resolve();
 		expect(warnings.join("\n")).toContain("OpenAI provider tool result message delivery failed");
@@ -987,7 +1780,10 @@ describe("OpenAI provider tools extension", () => {
 		const cwd = await makeTempDir();
 		const homeDir = await makeTempDir();
 		const extension = registerExtension();
+		const recorder = uiRecorder();
 		const ctx = context(cwd, homeDir, {
+			hasUI: true,
+			ui: recorder.ctxUi,
 			sessionManager: {
 				getSessionId: () => "session-1",
 			},
@@ -996,22 +1792,29 @@ describe("OpenAI provider tools extension", () => {
 
 		getHandler(extension, "message_end")({ type: "message_end", message }, ctx);
 
-		expect(extension.sentMessages).toHaveLength(1);
-		expect(extension.sentMessages[0]?.options).toEqual({ deliverAs: "nextTurn" });
-		expect((extension.sentMessages[0]?.message as any).content).toBe("");
-		await runAgentEnd(extension, { message }, ctx);
-
+		expect(extension.sentMessages).toHaveLength(0);
+		expect(recorder.cardCalls).toHaveLength(0);
+		await runTurnEnd(extension, { type: "turn_end" }, ctx);
 		expect(extension.sentMessages).toHaveLength(1);
 		await runAgentEnd(extension, { message }, ctx);
 
 		expect(extension.sentMessages).toHaveLength(1);
+		expect(recorder.cardCalls).toHaveLength(0);
+		await runAgentEnd(extension, { message }, ctx);
+		await runTurnEnd(extension, { type: "turn_end" }, ctx);
+
+		expect(extension.sentMessages).toHaveLength(1);
+		expect(recorder.cardCalls).toHaveLength(0);
 	});
 
 	it("does not let incomplete message_end web_search echoes suppress final agent_end details", async () => {
 		const cwd = await makeTempDir();
 		const homeDir = await makeTempDir();
 		const extension = registerExtension();
+		const recorder = uiRecorder();
 		const ctx = context(cwd, homeDir, {
+			hasUI: true,
+			ui: recorder.ctxUi,
 			sessionManager: {
 				getSessionId: () => "session-1",
 			},
@@ -1024,9 +1827,45 @@ describe("OpenAI provider tools extension", () => {
 		expect(extension.sentMessages).toHaveLength(0);
 
 		await runAgentEnd(extension, { message: completed }, ctx);
+		await runTurnEnd(extension, { type: "turn_end" }, ctx);
 
 		expect(extension.sentMessages).toHaveLength(1);
-		expect(JSON.stringify((extension.sentMessages[0]?.message as any).details)).toContain("https://example.invalid/omp-provider-tools");
+		expect(recorder.cardCalls).toHaveLength(0);
+		expect((extension.sentMessages[0]?.message as any).details.message.details.queries).toContain("latest OMP provider tools");
+	});
+
+	it("echoes statusless action-only web_search final cards", async () => {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		const extension = registerExtension();
+		const ctx = context(cwd, homeDir, { isIdle: () => true, sessionManager: { getSessionId: () => "session-1" } });
+
+		await runMessageEnd(extension, { type: "message_end", message: actionOnlyWebSearchMessage() }, ctx);
+		await runTurnEnd(extension, { type: "turn_end" }, ctx);
+
+		expect(extension.sentMessages).toHaveLength(1);
+		expect((extension.sentMessages[0]?.message as any).details.message.details.actionDetails).toContainEqual({ type: "open_page", label: "url", value: "https://example.invalid/action-only" });
+	});
+
+	it("deduplicates every result in a pending multi-call web_search summary", async () => {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		const extension = registerExtension();
+		const message = webSearchMessage() as any;
+		message.providerPayload.items.unshift({
+			type: "web_search_call",
+			id: "ws-2",
+			status: "completed",
+			action: { type: "search", query: "second provider call" },
+		});
+		const ctx = context(cwd, homeDir, { isIdle: () => true, sessionManager: { getSessionId: () => "session-1" } });
+
+		await runMessageEnd(extension, { type: "message_end", message }, ctx);
+		await runAgentEnd(extension, { message }, ctx);
+		await runTurnEnd(extension, { type: "turn_end" }, ctx);
+
+		expect(extension.sentMessages).toHaveLength(1);
+		expect((extension.sentMessages[0]?.message as any).details.message.details.summary).toBe("OpenAI provider completed web_search (2 calls).");
 	});
 
 	it("saves an image_generation_call result and sends a visible message without base64", async () => {
@@ -1191,6 +2030,7 @@ describe("OpenAI provider tools extension", () => {
 		expect(messageText(message)).toContain(path.join(artifactsDir, files[0] ?? ""));
 		expect(message.details.path).toBe(path.join(artifactsDir, files[0] ?? ""));
 	});
+
 
 	it("retries image saving on agent_end when message_end save fails before marking seen", async () => {
 		const cwd = await makeTempDir();
@@ -1504,22 +2344,26 @@ describe("OpenAI provider tools extension", () => {
 			status: "completed",
 			action: { type: "search", query: "provider native image_generation" },
 		});
+		const recorder = uiRecorder();
 		const ctx = context(cwd, homeDir, {
+			hasUI: true,
+			ui: recorder.ctxUi,
 			sessionManager: {
 				getSessionId: () => "session-1",
 			},
 		});
 
 		await runAgentEnd(extension, { message }, ctx);
+		await runTurnEnd(extension, { type: "turn_end" }, ctx);
 
 		expect(extension.sentMessages).toHaveLength(1);
-		expect(extension.sentMessages[0]?.options).toEqual({ deliverAs: "nextTurn" });
-		const sent = extension.sentMessages[0]?.message as any;
-		expect(sent.content).toBe("");
-		expect(sent.details.queries).toEqual(["provider native image_generation", "latest OMP provider tools"]);
+		expect(recorder.cardCalls).toHaveLength(0);
+		const sent = (extension.sentMessages[0]?.message as any).details.message;
+		expect(sent.details.summary).toContain("OpenAI provider completed web_search (2 calls).");
+		expect(sent.details.queries).toContain("latest OMP provider tools");
+		expect(sent.details.queries).toContain("provider native image_generation");
 		expect(JSON.stringify(sent.details)).not.toContain("Call:");
 		expect(JSON.stringify(sent.details)).not.toContain("Status:");
-		expect(sent.details.results).toHaveLength(2);
 	});
 
 

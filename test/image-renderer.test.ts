@@ -309,6 +309,7 @@ describe("provider image renderer", () => {
 		expect(expanded).not.toContain(imagePath);
 	});
 
+
 	it("background-fills runtime image rows without a fold hint that can accumulate", async () => {
 		const message = await makeImageMessage();
 

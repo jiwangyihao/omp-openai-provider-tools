@@ -115,8 +115,8 @@ export function installOpenAIResponsesImageInterruption(): void {
 	originalFetch = globalThis.fetch.bind(globalThis) as FetchLike;
 	wrappedFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
 		const payload = await responsesRequestPayload(input, init);
-		const policy = payload ? consumeProviderToolRequestPolicy(payload) : undefined;
 		const response = await originalFetch!(input, init);
+		const policy = payload ? consumeProviderToolRequestPolicy(payload) : undefined;
 		if (!policy || !response.body) return response;
 		const wrappedResponse = new Response(wrapOpenAIResponsesStream(response.body, policy), {
 			status: response.status,

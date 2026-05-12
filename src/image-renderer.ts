@@ -166,7 +166,6 @@ function renderProviderImageMessage(
 	const text = imageSummary(message) || messageContent(message);
 	const images = imageDetails(message);
 	if (!Tui) return undefined;
-
 	const detailLines = expandedImageDetailLines(images);
 	const runtimeImagePreview = buildRuntimeImagePreview(runtimePi, images);
 	if (runtimeImagePreview) {
