@@ -4,12 +4,12 @@
 [![npm downloads](https://img.shields.io/npm/dw/omp-openai-provider-tools.svg)](https://www.npmjs.com/package/omp-openai-provider-tools)
 [![License: MPL-2.0](https://img.shields.io/badge/License-MPL--2.0-blue.svg)](./LICENSE)
 
-> **Latest in v0.1.3 | v0.1.3 最近更新**
+> **Latest in v0.1.4 | v0.1.4 最近更新**
 >
-> - Fixes long-running provider-native `image_generation` streams on OMP 14.9+ | 修复 OMP 14.9+ 中 provider-native `image_generation` 长时间生成的流式空闲误判
-> - Adds request-scoped semantic keepalives without disabling global runtime timeout protection | 增加请求级语义 keepalive，不全局关闭运行时 timeout 保护
-> - Keeps OpenAI SDK stream patching lazy so the extension loads without a direct `openai` runtime dependency | 保持 OpenAI SDK stream patch 惰性加载，扩展不需要直接运行时依赖 `openai`
-> - Limits image-only custom provider opt-in to `image_generation`, avoiding accidental `web_search` injection | 自定义 provider 仅开启图像能力时只注入 `image_generation`，避免误注入 `web_search`
+> - Fixes provider-native `web_search` live overlay disappearing after unbound TUI render callbacks | 修复 provider-native `web_search` 实时 overlay 因 TUI 渲染回调失绑而消失
+> - Keeps overlay `calls` counts cumulative across collapse / hide and preserves three visible items | overlay 的 `calls` 计数改为累计值，并在折叠 / 隐藏后保留 3 个展示项
+> - Flushes final `web_search` cards immediately from `message_end` when the runtime is already idle | runtime 已 idle 时从 `message_end` 立即 flush 最终 `web_search` 回显
+> - Documents live overlay lifecycle, count, and collapse semantics | 补充实时 overlay 生命周期、计数和折叠语义说明
 
 [中文](#中文) | [English](#english)
 
@@ -129,7 +129,7 @@ OpenAI provider-executed tools 通常不会把原始工具输出暴露给宿主�
 当前版本：
 
 ```bash
-omp plugin install npm:omp-openai-provider-tools@0.1.3
+omp plugin install npm:omp-openai-provider-tools@0.1.4
 ```
 
 本地开发时可以链接 checkout：
@@ -156,7 +156,7 @@ omp plugin link <path-to-this-repo>
 2. 提取其中带明确版本号的安装命令。当前版本示例：
 
    ```bash
-   omp plugin install npm:omp-openai-provider-tools@0.1.3
+   omp plugin install npm:omp-openai-provider-tools@0.1.4
    ```
 
 3. 安装后不要停在插件安装本身。继续帮助用户配置 OpenAI 官方 provider 或用户自己的 OpenAI-compatible 中转站：确认当前模型使用 `openai-responses`，把能力声明写入模型或 provider 元数据的 `compat.openaiProviderTools`，不要新建插件专用配置文件。
@@ -410,7 +410,7 @@ Provider-executed `web_search` lets the main Agent use provider-side search resu
 For OMP:
 
 ```bash
-omp plugin install npm:omp-openai-provider-tools@0.1.3
+omp plugin install npm:omp-openai-provider-tools@0.1.4
 ```
 
 For local development:
@@ -422,8 +422,8 @@ omp plugin link <path-to-this-repo>
 For Pi-family runtimes:
 
 ```bash
-pi install npm:omp-openai-provider-tools@0.1.3
-pi -e npm:omp-openai-provider-tools@0.1.3
+pi install npm:omp-openai-provider-tools@0.1.4
+pi -e npm:omp-openai-provider-tools@0.1.4
 ```
 
 Verify:
