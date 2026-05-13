@@ -568,6 +568,40 @@ it("queues message_end final web_search while non-idle without sending or closin
 	}
 });
 
+it("flushes idle message_end final web_search immediately without waiting for turn_end", async () => {
+	const cwd = await makeTempDir();
+	const homeDir = await makeTempDir();
+	const extension = registerExtension();
+	const ctx = context(cwd, homeDir, { hasUI: true, isIdle: () => true, sessionManager: { getSessionId: () => "session-1" } });
+
+	await runMessageEnd(extension, { type: "message_end", message: webSearchMessage("message_end immediate") }, ctx);
+	await Promise.resolve();
+
+	expect(extension.sentMessages).toHaveLength(1);
+	expect(extension.sentMessages[0]?.options).not.toMatchObject({ deliverAs: "nextTurn" });
+	expect(extension.sentMessages[0]?.options).not.toMatchObject({ triggerTurn: true });
+	expect(extension.sentMessages[0]?.message).toMatchObject({
+		customType: "openai-provider-tool-result",
+		details: expect.objectContaining({
+			uiOnly: true,
+			resultKey: "session-1:web_search:ws-1",
+			message: expect.objectContaining({ details: expect.objectContaining({ queries: ["message_end immediate"] }) }),
+		}),
+	});
+});
+
+it("does not send message_end final web_search while runtime is still streaming", async () => {
+	const cwd = await makeTempDir();
+	const homeDir = await makeTempDir();
+	const extension = registerExtension();
+	const ctx = context(cwd, homeDir, { hasUI: true, isIdle: () => false, sessionManager: { getSessionId: () => "session-1" } });
+
+	await runMessageEnd(extension, { type: "message_end", message: webSearchMessage("still streaming") }, ctx);
+	await Promise.resolve();
+
+	expect(extension.sentMessages).toHaveLength(0);
+});
+
 it("flushes queued final web_search on idle turn_end as a ui-only display custom message", async () => {
 	const cwd = await makeTempDir();
 	const homeDir = await makeTempDir();
@@ -1069,10 +1103,11 @@ describe("OpenAI provider tools extension", () => {
 			const beforeCards = recorder.cardCalls.length;
 
 			await runMessageEnd(extension, { type: "message_end", message: webSearchMessage() }, ctx);
+			await Promise.resolve();
 
-			expect(extension.sentMessages).toHaveLength(0);
+			expect(extension.sentMessages).toHaveLength(1);
 			expect(recorder.cardCalls.length).toBe(beforeCards);
-			expect(recorder.customCalls.find(call => isRecord(call.options) && call.options.overlay === true)?.doneResults).toEqual([]);
+			expect(recorder.customCalls.find(call => isRecord(call.options) && call.options.overlay === true)?.doneResults).toEqual([undefined]);
 			expect(recorder.widgetCalls).toEqual([]);
 		} finally {
 			restoreFetch();
@@ -1094,10 +1129,11 @@ describe("OpenAI provider tools extension", () => {
 			expect(recorder.customCalls[0]?.doneResults).toEqual([]);
 
 			await runMessageEnd(extension, { type: "message_end", message: webSearchMessage("echo closes overlay") }, ctx);
+			await Promise.resolve();
 
-			expect(extension.sentMessages).toHaveLength(0);
+			expect(extension.sentMessages).toHaveLength(1);
 			expect(recorder.cardCalls).toHaveLength(0);
-			expect(recorder.customCalls[0]?.doneResults).toEqual([]);
+			expect(recorder.customCalls[0]?.doneResults).toEqual([undefined]);
 			expect(recorder.widgetCalls).toEqual([]);
 		} finally {
 			restoreFetch();
@@ -1155,16 +1191,17 @@ describe("OpenAI provider tools extension", () => {
 			const timeout = new Promise<"timeout">(resolve => setTimeout(() => resolve("timeout"), 25));
 
 			await expect(Promise.race([completion, timeout])).resolves.toBe("returned");
-			expect(extension.sentMessages).toHaveLength(0);
+			await Promise.resolve();
+			expect(extension.sentMessages).toHaveLength(1);
 			expect(recorder.cardCalls).toHaveLength(0);
-			expect(overlay?.doneResults).toEqual([]);
+			expect(overlay?.doneResults).toEqual([undefined]);
 			expect(recorder.widgetCalls).toEqual([]);
 		} finally {
 			restoreFetch();
 		}
 	});
 
-	it("closes active live overlay after nextTurn fallback starts without triggering a turn", async () => {
+	it("sends final web_search custom message without nextTurn fallback when custom UI is unavailable", async () => {
 		const restoreFetch = installMockResponsesFetch(() => liveWebSearchEvent("fallback final echo"));
 		try {
 			const cwd = await makeTempDir();
@@ -1177,9 +1214,12 @@ describe("OpenAI provider tools extension", () => {
 			const fallbackCtx = context(cwd, homeDir, { hasUI: true, ui: {}, sessionManager: { getSessionId: () => "session-1" } });
 
 			await runMessageEnd(extension, { type: "message_end", message: webSearchMessage("fallback final echo") }, fallbackCtx);
+			await Promise.resolve();
 
-			expect(extension.sentMessages).toHaveLength(0);
-			expect(overlay?.doneResults).toEqual([]);
+			expect(extension.sentMessages).toHaveLength(1);
+			expect(extension.sentMessages[0]?.options).not.toMatchObject({ deliverAs: "nextTurn" });
+			expect(extension.sentMessages[0]?.options).not.toMatchObject({ triggerTurn: true });
+			expect(overlay?.doneResults).toEqual([undefined]);
 			expect(recorder.cardCalls).toEqual([]);
 			expect(recorder.widgetCalls).toEqual([]);
 		} finally {
@@ -1187,7 +1227,7 @@ describe("OpenAI provider tools extension", () => {
 		}
 	});
 
-	it("does not fallback or close active live overlay when final custom card startup throws", async () => {
+	it("ignores non-overlay custom startup failures because final echo uses sendMessage", async () => {
 		const restoreFetch = installMockResponsesFetch(() => liveWebSearchEvent("custom startup failure"));
 		try {
 			const cwd = await makeTempDir();
@@ -1213,11 +1253,10 @@ describe("OpenAI provider tools extension", () => {
 
 			await runMessageEnd(extension, { type: "message_end", message: webSearchMessage("custom startup failure") }, ctx);
 			await Promise.resolve();
-			await Promise.resolve();
 
-			expect(extension.sentMessages).toHaveLength(0);
+			expect(extension.sentMessages).toHaveLength(1);
 			expect(recorder.cardCalls).toEqual([]);
-			expect(overlay?.doneResults).toEqual([]);
+			expect(overlay?.doneResults).toEqual([undefined]);
 			expect(recorder.widgetCalls).toEqual([]);
 			expect(notifyCalls).toEqual([]);
 			expect(extension.warnings.join("\n")).not.toContain("OpenAI provider tool result message delivery failed");
@@ -1790,12 +1829,11 @@ describe("OpenAI provider tools extension", () => {
 		});
 		const message = webSearchMessage();
 
-		getHandler(extension, "message_end")({ type: "message_end", message }, ctx);
+		await runMessageEnd(extension, { type: "message_end", message }, ctx);
+		await Promise.resolve();
 
-		expect(extension.sentMessages).toHaveLength(0);
-		expect(recorder.cardCalls).toHaveLength(0);
-		await runTurnEnd(extension, { type: "turn_end" }, ctx);
 		expect(extension.sentMessages).toHaveLength(1);
+		expect(recorder.cardCalls).toHaveLength(0);
 		await runAgentEnd(extension, { message }, ctx);
 
 		expect(extension.sentMessages).toHaveLength(1);

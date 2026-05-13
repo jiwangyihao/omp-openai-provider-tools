@@ -6,6 +6,7 @@ export const LIVE_STATUS_WIDGET_KEY = "openai-provider-tools-live";
 const DEFAULT_THROTTLE_MS = 250;
 const MAX_QUERIES = 3;
 const DEFAULT_COMPLETED_AUTO_CLOSE_MS = 10_000;
+const MAX_EXPANDED_LIVE_CALLS = 3;
 const DEFAULT_COMPLETED_COLLAPSE_MS = 3_000;
 const DEFAULT_COMPLETED_HIDE_MS = 8_000;
 const DEFAULT_OVERLAY_WIDTH = 80;
@@ -29,6 +30,7 @@ export interface LiveOverlayCallSnapshot {
 export interface LiveOverlaySnapshot {
 	phase: LiveOverlayPhase;
 	calls: LiveOverlayCallSnapshot[];
+	totalCalls: number;
 	startedAt: number;
 	updatedAt: number;
 }
@@ -100,6 +102,7 @@ interface LiveToolStatus {
 	sourceCount?: number;
 	actionDetails: string[];
 	error?: string;
+	hideReady?: boolean;
 	collapseTimer?: LiveStatusTimer;
 	hideTimer?: LiveStatusTimer;
 }
@@ -153,7 +156,7 @@ export function renderProviderToolLiveOverlay(
 	const elapsedSeconds = Math.max(0, Math.floor((now - snapshot.startedAt) / 1_000));
 	const phaseToken = snapshot.phase === "failed" ? "error" : snapshot.phase === "completed" ? "success" : "warning";
 	lines.push(truncateToWidth(
-		`phase ${color(theme, phaseToken, snapshot.phase)}  calls ${snapshot.calls.length}  elapsed ${elapsedSeconds}s`,
+		`phase ${color(theme, phaseToken, snapshot.phase)}  calls ${snapshot.totalCalls ?? snapshot.calls.length}  elapsed ${elapsedSeconds}s`,
 		normalizedWidth,
 	));
 	lines.push(truncateToWidth(color(theme, "borderMuted", "-".repeat(normalizedWidth)), normalizedWidth));
@@ -254,6 +257,7 @@ export function createProviderToolLiveStatusManager(
 		private openingOverlay = false;
 		private overlay: { requestRender?: () => void; close?: () => void; open: boolean } | undefined;
 		private requestCompleted = false;
+		private readonly seenDisplayableStatusIds = new Set<string>();
 		private readonly startedAt = now();
 
 		constructor(private readonly ui: ProviderToolLiveUiSink | undefined) {}
@@ -366,12 +370,14 @@ export function createProviderToolLiveStatusManager(
 				const status = this.upsertStatus(item, typedEvent, eventType === "response.output_item.done" ? "completed" : undefined);
 				if (eventType === "response.output_item.done") {
 					if (!statusHasVisibleDetails(status)) return;
+					this.reconcileCompletedVisibility();
 					this.cancelPendingAutoClose();
 					this.renderNow();
 					this.scheduleCompletedTimers(status);
 					this.scheduleAutoCloseIfComplete();
 				} else {
 					if (statusHasVisibleDetails(status)) {
+						this.reconcileCompletedVisibility();
 						this.cancelPendingAutoClose();
 						this.scheduleRender();
 					} else {
@@ -391,6 +397,7 @@ export function createProviderToolLiveStatusManager(
 				const phase = eventType === "response.web_search_call.completed" ? "completed" : "searching";
 				const status = this.upsertStatus(item, typedEvent, phase);
 				if (statusHasVisibleDetails(status)) {
+					this.reconcileCompletedVisibility();
 					if (status.phase === "completed") this.scheduleCompletedTimers(status);
 					this.cancelPendingAutoClose();
 					this.scheduleRender();
@@ -556,6 +563,32 @@ export function createProviderToolLiveStatusManager(
 			}
 		}
 
+		private reconcileCompletedVisibility(): void {
+			this.rememberDisplayableStatuses();
+			const displayable = [...this.statuses.values()].filter(statusHasVisibleDetails);
+			if (displayable.length <= MAX_EXPANDED_LIVE_CALLS) {
+				for (const status of displayable) {
+					if (status.phase === "completed") status.visibility = "full";
+				}
+				return;
+			}
+
+			const nonCompleted = displayable.filter(status => status.phase !== "completed" && status.visibility !== "hidden");
+			const completed = displayable
+				.filter(status => status.phase === "completed")
+				.sort((left, right) => right.updatedAt - left.updatedAt || right.ordinal - left.ordinal);
+			const visibleTarget = Math.min(MAX_EXPANDED_LIVE_CALLS, displayable.length);
+			const visibleCompletedSlots = Math.max(0, visibleTarget - nonCompleted.length);
+			const keepVisible = new Set(completed.slice(0, visibleCompletedSlots));
+			for (const status of completed) {
+				if (keepVisible.has(status)) {
+					status.visibility = "full";
+				} else {
+					status.visibility = status.hideReady ? "hidden" : "collapsed";
+				}
+			}
+		}
+
 		private markIncompleteStatuses(phase: Phase): void {
 			const timestamp = now();
 			for (const status of this.statuses.values()) {
@@ -565,6 +598,7 @@ export function createProviderToolLiveStatusManager(
 					this.scheduleCompletedTimers(status);
 				}
 			}
+			this.reconcileCompletedVisibility();
 		}
 
 		private hasVisibleStatuses(): boolean {
@@ -584,15 +618,15 @@ export function createProviderToolLiveStatusManager(
 			if (this.ended || status.phase !== "completed" || !statusHasVisibleDetails(status)) return;
 			this.cancelCompletedTimers(status);
 			status.completionGeneration += 1;
+			status.hideReady = false;
 			status.visibility = "full";
 			const generation = status.completionGeneration;
 			if (completedCollapseMs > 0) {
 				try {
 					status.collapseTimer = scheduler.setTimeout(() => {
 						status.collapseTimer = undefined;
-						if (this.ended || status.phase !== "completed" || status.visibility !== "full" || status.completionGeneration !== generation) return;
-						status.visibility = "collapsed";
-						status.updatedAt = now();
+						if (this.ended || status.phase !== "completed" || status.completionGeneration !== generation) return;
+						this.reconcileCompletedVisibility();
 						this.renderNow();
 					}, completedCollapseMs);
 				} catch (error) {
@@ -603,9 +637,9 @@ export function createProviderToolLiveStatusManager(
 				try {
 					status.hideTimer = scheduler.setTimeout(() => {
 						status.hideTimer = undefined;
-						if (this.ended || status.phase !== "completed" || status.visibility === "hidden" || status.completionGeneration !== generation) return;
-						status.visibility = "hidden";
-						status.updatedAt = now();
+						if (this.ended || status.phase !== "completed" || status.completionGeneration !== generation) return;
+						status.hideReady = true;
+						this.reconcileCompletedVisibility();
 						this.scheduleAutoCloseIfComplete();
 						this.renderNow();
 					}, completedHideMs);
@@ -739,7 +773,8 @@ export function createProviderToolLiveStatusManager(
 						this.disable();
 					},
 				};
-				this.overlay = { requestRender: tui?.requestRender, close, open: true };
+				const requestRender = typeof tui?.requestRender === "function" ? () => tui.requestRender?.() : undefined;
+				this.overlay = { requestRender, close, open: true };
 				return component;
 			};
 		}
@@ -757,7 +792,14 @@ export function createProviderToolLiveStatusManager(
 			}
 		}
 
+		private rememberDisplayableStatuses(): void {
+			for (const status of this.statuses.values()) {
+				if (statusHasVisibleDetails(status)) this.seenDisplayableStatusIds.add(status.id);
+			}
+		}
+
 		private snapshot(): LiveOverlaySnapshot {
+			this.rememberDisplayableStatuses();
 			const visibleStatuses = [...this.statuses.values()].filter(status => status.visibility !== "hidden" && statusHasVisibleDetails(status));
 			const calls = visibleStatuses
 				.sort((left, right) => right.updatedAt - left.updatedAt)
@@ -778,6 +820,7 @@ export function createProviderToolLiveStatusManager(
 			return {
 				phase: hasFailure ? "failed" : allCompleted ? "completed" : "searching",
 				calls,
+				totalCalls: this.seenDisplayableStatusIds.size,
 				startedAt: this.startedAt,
 				updatedAt,
 			};

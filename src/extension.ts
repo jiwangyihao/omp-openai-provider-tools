@@ -1175,7 +1175,10 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 
 	api.on?.("message_end", (event, ctx) => {
 		handleMessageEndImageResults({ api, ctx, event, state: imageResultState, seen: seenImageResults });
-		handleMessageEndProviderToolResults({ api, ctx, event, imageState: imageResultState, providerState: providerResultState });
+		const delivery = handleMessageEndProviderToolResults({ api, ctx, event, imageState: imageResultState, providerState: providerResultState });
+		if (delivery === "started" && isRuntimeIdle(ctx)) {
+			void flushProviderToolResultCards(api, ctx, providerResultState, clearLiveStatus).catch((error) => logAsyncFailure(api, ctx, "OpenAI provider tool result flush failed", error));
+		}
 	});
 
 	api.on?.("turn_end", (_event, ctx) => {

@@ -27,7 +27,7 @@ function createTestTheme() {
 	};
 }
 
-function createUiRecorder(options: { hasUI?: boolean; throwOnCustom?: boolean; throwOnRequestRender?: boolean | (() => boolean); throwOnWidget?: boolean; useFourArgFactory?: boolean } = {}) {
+function createUiRecorder(options: { hasUI?: boolean; throwOnCustom?: boolean; throwOnRequestRender?: boolean | (() => boolean); throwOnWidget?: boolean; useFourArgFactory?: boolean; tui?: { requestRender?: () => void } } = {}) {
 	const widgetCalls: WidgetCall[] = [];
 	const customCalls: CustomCall[] = [];
 	const doneResults: unknown[] = [];
@@ -48,7 +48,7 @@ function createUiRecorder(options: { hasUI?: boolean; throwOnCustom?: boolean; t
 				component: undefined as unknown as OverlayComponentLike,
 				requestRenderCalls: 0,
 			};
-			const tui = { requestRender() { const shouldThrow = typeof options.throwOnRequestRender === "function" ? options.throwOnRequestRender() : options.throwOnRequestRender; if (shouldThrow) throw new Error("requestRender failed"); call.requestRenderCalls++; } };
+			const tui = options.tui ?? { requestRender() { const shouldThrow = typeof options.throwOnRequestRender === "function" ? options.throwOnRequestRender() : options.throwOnRequestRender; if (shouldThrow) throw new Error("requestRender failed"); call.requestRenderCalls++; } };
 			const done = (result: unknown) => doneResults.push(result);
 			const component = options.useFourArgFactory
 				? factory(tui, createTestTheme(), {}, done)
@@ -128,6 +128,42 @@ describe("provider tool live status", () => {
 		expect(recorder.customCalls[0]!.component.render(100).join("\n")).not.toContain("waiting for provider query");
 	});
 
+	it("keeps overlay alive when runtime requestRender is an unbound method", () => {
+		class Runtime {
+			#renderRequested = false;
+
+			requestRender() {
+				this.#renderRequested = true;
+			}
+
+			get renderRequested() {
+				return this.#renderRequested;
+			}
+		}
+		const runtime = new Runtime();
+		const recorder = createUiRecorder({ hasUI: true, tui: runtime });
+		const warnings: unknown[] = [];
+		const manager = createProviderToolLiveStatusManager({
+			throttleMs: 0,
+			logger: { warn: (...args: unknown[]) => { warnings.push(args); } },
+		});
+		const tracker = manager.createTracker({ enabledTools: ["web_search"], ui: recorder.ui });
+
+		tracker?.onEvent({ type: "response.output_item.added", item: { type: "web_search_call", id: "ws-unbound", status: "searching" } });
+		expect(recorder.customCalls).toHaveLength(1);
+		recorder.customCalls[0]!.component.render(120);
+		expect(recorder.doneResults).toEqual([]);
+
+		tracker?.onEvent({ type: "response.output_item.done", item: { type: "web_search_call", id: "ws-unbound", status: "completed", action: { query: "unbound render" } } });
+
+		expect(runtime.renderRequested).toBe(true);
+		expect(recorder.doneResults).toEqual([]);
+		tracker?.onEvent({ type: "response.output_item.added", item: { type: "web_search_call", id: "ws-unbound", status: "searching", action: { query: "unbound render again" } } });
+		tracker?.onEvent({ type: "response.output_item.done", item: { type: "web_search_call", id: "ws-unbound", status: "completed", action: { query: "unbound render again" } } });
+		expect(warnings).toEqual([]);
+		expect(recorder.doneResults).toEqual([]);
+	});
+
 
 	it("renders action-only final web_search calls in the live overlay", () => {
 		const recorder = createUiRecorder({ hasUI: true });
@@ -196,12 +232,11 @@ describe("provider tool live status", () => {
 
 		defaultTracker?.onEvent({ type: "response.output_item.done", item: { type: "web_search_call", id: "ws-default", status: "completed", action: { query: "default timing" } } });
 		defaultTracker?.onEvent({ type: "response.completed" });
-
 		expect(activeTimeouts(defaultScheduler)).toContain(3_000);
 		expect(activeTimeouts(defaultScheduler)).toContain(8_000);
 		expect(activeTimeouts(defaultScheduler).some(timeout => timeout < 3_000)).toBe(false);
 		defaultScheduler.runNextTimerByTimeout(8_000);
-		expect(activeTimeouts(defaultScheduler)).toContain(10_000);
+		expect(activeTimeouts(defaultScheduler)).not.toContain(10_000);
 
 		const overrideScheduler = createScheduler();
 		const overrideRecorder = createUiRecorder({ hasUI: true });
@@ -220,7 +255,7 @@ describe("provider tool live status", () => {
 		expect(activeTimeouts(overrideScheduler)).toContain(11);
 		expect(activeTimeouts(overrideScheduler)).toContain(22);
 		overrideScheduler.runNextTimerByTimeout(22);
-		expect(activeTimeouts(overrideScheduler)).toContain(33);
+		expect(activeTimeouts(overrideScheduler)).not.toContain(33);
 	});
 
 	it("keeps completed auto-close when a late queryless output item arrives", () => {
@@ -232,7 +267,7 @@ describe("provider tool live status", () => {
 		tracker?.onEvent({ type: "response.output_item.done", item: { type: "web_search_call", id: "ws-complete", status: "completed", action: { query: "auto close remains" } } });
 		tracker?.onEvent({ type: "response.completed" });
 		scheduler.runNextTimerByTimeout(22);
-		expect(activeTimeouts(scheduler)).toContain(33);
+		expect(activeTimeouts(scheduler)).not.toContain(33);
 
 		tracker?.onEvent({ type: "response.output_item.added", item: { type: "web_search_call", id: "ws-queryless", status: "searching" } });
 
@@ -289,8 +324,7 @@ describe("provider tool live status", () => {
 		const autoTracker = autoManager.createTracker({ enabledTools: ["web_search"], ui: auto.ui });
 		autoTracker?.onEvent({ type: "response.output_item.done", item: { type: "web_search_call", id: "ws-auto", status: "completed", action: { query: "auto close" } } });
 		autoTracker?.onEvent({ type: "response.completed" });
-		autoScheduler.runNextTimerByTimeout(2);
-		autoScheduler.runNextTimerByTimeout(3);
+		autoTracker?.clear();
 		expect(auto.doneResults).toEqual([undefined]);
 
 		const afterAuto = createUiRecorder({ hasUI: true });
@@ -380,6 +414,160 @@ describe("provider tool live status", () => {
 		expect((text.match(/web_search_call/g) ?? []).length).toBe(2);
 	});
 
+	it("keeps header call count cumulative after completed calls hide", () => {
+		const scheduler = createScheduler();
+		const recorder = createUiRecorder({ hasUI: true });
+		const manager = createProviderToolLiveStatusManager({
+			throttleMs: 0,
+			completedCollapseMs: 1_000,
+			completedHideMs: 2_000,
+			completedAutoCloseMs: 0,
+			scheduler: scheduler.scheduler,
+		});
+		const tracker = manager.createTracker({ enabledTools: ["web_search"], ui: recorder.ui });
+
+		for (const id of ["ws-1", "ws-2", "ws-3", "ws-4"]) {
+			tracker?.onEvent({
+				type: "response.output_item.done",
+				item: { type: "web_search_call", id, status: "completed", action: { query: id } },
+			});
+		}
+
+		expect(recorder.customCalls[0]!.component.render(120).join("\n")).toContain("calls 4");
+		scheduler.runNextTimerByTimeout(2_000);
+		const afterHide = recorder.customCalls[0]!.component.render(120).join("\n");
+
+		expect(afterHide).toContain("calls 4");
+		expect(afterHide).not.toContain("calls 0");
+	});
+
+	it("keeps up to three completed calls expanded after collapse timers fire", () => {
+		const scheduler = createScheduler();
+		const recorder = createUiRecorder({ hasUI: true });
+		const manager = createProviderToolLiveStatusManager({
+			throttleMs: 0,
+			completedCollapseMs: 1_000,
+			completedHideMs: 0,
+			completedAutoCloseMs: 0,
+			scheduler: scheduler.scheduler,
+		});
+		const tracker = manager.createTracker({ enabledTools: ["web_search"], ui: recorder.ui });
+
+		for (const id of ["ws-1", "ws-2", "ws-3"]) {
+			tracker?.onEvent({
+				type: "response.output_item.done",
+				item: { type: "web_search_call", id, status: "completed", action: { query: id } },
+			});
+		}
+
+		scheduler.runNextTimerByTimeout(1_000);
+		const text = recorder.customCalls[0]!.component.render(120).join("\n");
+
+		expect(text).toContain("calls 3");
+		expect(text).toContain("│ query  \"ws-1\"");
+		expect(text).toContain("│ query  \"ws-2\"");
+		expect(text).toContain("│ query  \"ws-3\"");
+	});
+
+	it("collapses the oldest completed call once a fourth displayable call appears", () => {
+		const scheduler = createScheduler();
+		const recorder = createUiRecorder({ hasUI: true });
+		const manager = createProviderToolLiveStatusManager({
+			throttleMs: 0,
+			completedCollapseMs: 1_000,
+			completedHideMs: 0,
+			completedAutoCloseMs: 0,
+			scheduler: scheduler.scheduler,
+		});
+		const tracker = manager.createTracker({ enabledTools: ["web_search"], ui: recorder.ui });
+
+		for (const id of ["ws-1", "ws-2", "ws-3"]) {
+			tracker?.onEvent({
+				type: "response.output_item.done",
+				item: { type: "web_search_call", id, status: "completed", action: { query: id } },
+			});
+		}
+		scheduler.runNextTimerByTimeout(1_000);
+
+		tracker?.onEvent({
+			type: "response.output_item.done",
+			item: { type: "web_search_call", id: "ws-4", status: "completed", action: { query: "ws-4" } },
+		});
+		const text = recorder.customCalls[0]!.component.render(120).join("\n");
+
+		expect(text).toContain("calls 4");
+		expect(text).toContain("ws-1");
+		expect(text).not.toContain("│ query  \"ws-1\"");
+		expect(text).toContain("│ query  \"ws-2\"");
+		expect(text).toContain("│ query  \"ws-3\"");
+		expect(text).toContain("│ query  \"ws-4\"");
+	});
+
+	it("keeps non-completed calls expanded and collapses older completed calls first", () => {
+		const scheduler = createScheduler();
+		const recorder = createUiRecorder({ hasUI: true });
+		const manager = createProviderToolLiveStatusManager({
+			throttleMs: 0,
+			completedCollapseMs: 1_000,
+			completedHideMs: 0,
+			completedAutoCloseMs: 0,
+			scheduler: scheduler.scheduler,
+		});
+		const tracker = manager.createTracker({ enabledTools: ["web_search"], ui: recorder.ui });
+
+		for (const id of ["done-a", "done-b", "done-c"]) {
+			tracker?.onEvent({
+				type: "response.output_item.done",
+				item: { type: "web_search_call", id, status: "completed", action: { query: id } },
+			});
+		}
+		scheduler.runNextTimerByTimeout(1_000);
+		tracker?.onEvent({ type: "response.output_item.added", item: { type: "web_search_call", id: "active-1", status: "searching", action: { query: "active-1" } } });
+		tracker?.onEvent({ type: "response.output_item.added", item: { type: "web_search_call", id: "active-2", status: "searching", action: { query: "active-2" } } });
+
+		const text = recorder.customCalls[0]!.component.render(140).join("\n");
+
+		expect(text).toContain("calls 5");
+		expect(text).toContain("│ query  \"active-1\"");
+		expect(text).toContain("│ query  \"active-2\"");
+		expect(text).toContain("│ query  \"done-c\"");
+		expect(text).not.toContain("│ query  \"done-a\"");
+		expect(text).not.toContain("│ query  \"done-b\"");
+		expect(text).toContain("done-a");
+		expect(text).toContain("done-b");
+	});
+
+	it("keeps three displayable calls visible after completed hide timers fire", () => {
+		const scheduler = createScheduler();
+		const recorder = createUiRecorder({ hasUI: true });
+		const manager = createProviderToolLiveStatusManager({
+			throttleMs: 0,
+			completedCollapseMs: 1_000,
+			completedHideMs: 2_000,
+			completedAutoCloseMs: 0,
+			scheduler: scheduler.scheduler,
+		});
+		const tracker = manager.createTracker({ enabledTools: ["web_search"], ui: recorder.ui });
+
+		for (const id of ["ws-1", "ws-2", "ws-3", "ws-4", "ws-5"]) {
+			tracker?.onEvent({
+				type: "response.output_item.done",
+				item: { type: "web_search_call", id, status: "completed", action: { query: id } },
+			});
+		}
+
+		scheduler.runActiveTimers();
+		const text = recorder.customCalls[0]!.component.render(160).join("\n");
+
+		expect(text).toContain("calls 5");
+		expect((text.match(/web_search_call/g) ?? []).length).toBe(3);
+		expect(text).toContain("ws-3");
+		expect(text).toContain("ws-4");
+		expect(text).toContain("ws-5");
+		expect(text).not.toContain("ws-1");
+		expect(text).not.toContain("ws-2");
+	});
+
 	it("collapses then hides completed calls before closing the overlay", () => {
 		const scheduler = createScheduler();
 		const recorder = createUiRecorder({ hasUI: true });
@@ -396,15 +584,16 @@ describe("provider tool live status", () => {
 		tracker?.onEvent({ type: "response.completed" });
 
 		const initial = recorder.customCalls[0]!.component.render(120).join("\n");
+		expect(initial).toContain("calls 1");
 		expect(initial).toContain("│ query  \"collapse me\"");
 
 		scheduler.runNextTimerByTimeout(1_000);
-		const collapsed = recorder.customCalls[0]!.component.render(120).join("\n");
-		expect(collapsed).toContain("collapse me");
-		expect(collapsed).not.toContain("│ query  \"collapse me\"");
+		const afterCollapseTimer = recorder.customCalls[0]!.component.render(120).join("\n");
+		expect(afterCollapseTimer).toContain("collapse me");
+		expect(afterCollapseTimer).toContain("│ query  \"collapse me\"");
 
 		scheduler.runNextTimerByTimeout(2_000);
-		expect(recorder.customCalls[0]!.component.render(120).join("\n")).not.toContain("collapse me");
+		expect(recorder.customCalls[0]!.component.render(120).join("\n")).toContain("collapse me");
 
 		scheduler.runActiveTimers();
 		expect(recorder.doneResults).toEqual([undefined]);
@@ -429,8 +618,8 @@ describe("provider tool live status", () => {
 		expect(recorder.doneResults).toEqual([]);
 		expect(recorder.customCalls[0]!.component.render(120).join("\n")).toContain("later completed");
 		scheduler.runNextTimerByTimeout(5_000);
-		scheduler.runNextTimerByTimeout(3_000);
-		expect(recorder.doneResults).toEqual([undefined]);
+		expect(() => scheduler.runNextTimerByTimeout(3_000)).toThrow("No active timer scheduled");
+		expect(recorder.doneResults).toEqual([]);
 	});
 
 	it("does not merge new temporary searches into completed final calls with the same query", () => {
@@ -469,7 +658,7 @@ describe("provider tool live status", () => {
 
 		tracker?.onEvent({ type: "response.output_item.done", item: { type: "web_search_call", id: "ws-1", status: "completed", action: { query: "first" } } });
 		scheduler.runNextTimerByTimeout(2_000);
-		expect(recorder.customCalls[0]!.component.render(120).join("\n")).not.toContain("first");
+		expect(recorder.customCalls[0]!.component.render(120).join("\n")).toContain("first");
 
 		tracker?.onEvent({ type: "response.output_item.done", item: { type: "web_search_call", id: "ws-2", status: "completed", action: { query: "second" } } });
 		expect(recorder.customCalls[0]!.component.render(120).join("\n")).toContain("second");
@@ -494,10 +683,10 @@ describe("provider tool live status", () => {
 		expect(recorder.customCalls[0]!.component.render(120).join("\n")).toContain("done only");
 		scheduler.runNextTimerByTimeout(2_000);
 		const hiddenText = recorder.customCalls[0]!.component.render(120).join("\n");
-		expect(hiddenText).not.toContain("done only");
+		expect(hiddenText).toContain("done only");
 		expect(hiddenText).not.toContain("pending");
 		tracker?.onEvent({ type: "response.completed" });
-		expect(recorder.doneResults).toEqual([undefined]);
+		expect(recorder.doneResults).toEqual([]);
 	});
 
 	it("cancels pending auto-close when a new searching event starts", () => {
@@ -516,7 +705,7 @@ describe("provider tool live status", () => {
 		tracker?.onEvent({ type: "response.completed" });
 		scheduler.runNextTimerByTimeout(2_000);
 		tracker?.onEvent({ type: "response.web_search_call.searching", item: { type: "web_search_call", id: "res_new" }, query: "new live" });
-		expect(scheduler.cleared.some(handle => (handle as { timeout?: number }).timeout === 3_000)).toBe(true);
+		expect(scheduler.cleared.some(handle => (handle as { timeout?: number }).timeout === 3_000)).toBe(false);
 		expect(recorder.customCalls[0]!.component.render(120).join("\n")).toContain("new live");
 		expect(() => scheduler.runNextTimerByTimeout(3_000)).toThrow("No active timer scheduled");
 		expect(recorder.doneResults).toEqual([]);
@@ -556,7 +745,7 @@ describe("provider tool live status", () => {
 
 		tracker?.onEvent({ type: "response.output_item.done", item: { type: "web_search_call", id: "ws-repeat", status: "completed", action: { query: "repeat" } } });
 		scheduler.runNextTimerByTimeout(2_000);
-		expect(recorder.customCalls[0]!.component.render(120).join("\n")).not.toContain("repeat");
+		expect(recorder.customCalls[0]!.component.render(120).join("\n")).toContain("repeat");
 
 		tracker?.onEvent({ type: "response.output_item.done", item: { type: "web_search_call", id: "ws-repeat", status: "completed", action: { query: "repeat" } } });
 		const text = recorder.customCalls[0]!.component.render(120).join("\n");
