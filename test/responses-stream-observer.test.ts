@@ -133,6 +133,110 @@ describe("OpenAI Responses stream observer", () => {
 		}
 	});
 
+	it("observes provider request policies registered after fetch response returns", async () => {
+		const originalFetch = globalThis.fetch;
+		try {
+			const recorder = trackerRecorder();
+			const payload = { model: "gpt-5", input: "hello", stream: true };
+			globalThis.fetch = (async () => new Response(sseEvent({
+				type: "response.output_item.added",
+				item: { type: "web_search_call", id: "ws-after-response" },
+			}), { headers: { "content-type": "text/event-stream" } })) as typeof fetch;
+			installOpenAIResponsesImageInterruption();
+
+			const response = await fetch("https://gateway.example.invalid/v1/responses", { method: "POST", body: JSON.stringify(payload) });
+			registerProviderToolRequest(payload, {
+				enabledTools: ["web_search"],
+				interruptOnImageResult: false,
+				liveTracker: recorder.tracker,
+			});
+			await responseText(response.body!);
+
+			expect(recorder.events).toEqual([{ type: "response.output_item.added", item: { type: "web_search_call", id: "ws-after-response" } }]);
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	it("binds identical concurrent payload policies by request start order when responses resolve out of order", async () => {
+		const originalFetch = globalThis.fetch;
+		try {
+			const first = trackerRecorder();
+			const second = trackerRecorder();
+			const payload = { model: "gpt-5", input: "hello", stream: true };
+			const releases: Array<(response: Response) => void> = [];
+			const starts: Promise<void>[] = [];
+			globalThis.fetch = (async () => {
+				starts.push(Promise.resolve());
+				return await new Promise<Response>(resolve => {
+					releases.push(resolve);
+				});
+			}) as typeof fetch;
+			installOpenAIResponsesImageInterruption();
+
+			const firstResponsePromise = fetch("https://gateway.example.invalid/v1/responses", { method: "POST", body: JSON.stringify(payload) });
+			const secondResponsePromise = fetch("https://gateway.example.invalid/v1/responses", { method: "POST", body: JSON.stringify(payload) });
+			for (let attempt = 0; attempt < 10 && releases.length < 2; attempt += 1) {
+				await new Promise(resolve => setTimeout(resolve, 0));
+			}
+			await Promise.all(starts);
+			expect(releases).toHaveLength(2);
+
+			registerProviderToolRequest(payload, { enabledTools: ["web_search"], interruptOnImageResult: false, liveTracker: first.tracker });
+			registerProviderToolRequest(payload, { enabledTools: ["web_search"], interruptOnImageResult: false, liveTracker: second.tracker });
+			releases[1](new Response(sseEvent({
+				type: "response.output_item.added",
+				item: { type: "web_search_call", id: "ws-second" },
+			}), { headers: { "content-type": "text/event-stream" } }));
+			releases[0](new Response(sseEvent({
+				type: "response.output_item.added",
+				item: { type: "web_search_call", id: "ws-first" },
+			}), { headers: { "content-type": "text/event-stream" } }));
+
+			const firstResponse = await firstResponsePromise;
+			const secondResponse = await secondResponsePromise;
+			await responseText(firstResponse.body!);
+			await responseText(secondResponse.body!);
+
+			expect(first.events).toEqual([{ type: "response.output_item.added", item: { type: "web_search_call", id: "ws-first" } }]);
+			expect(second.events).toEqual([{ type: "response.output_item.added", item: { type: "web_search_call", id: "ws-second" } }]);
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	it("releases reserved policy slots when a responses fetch returns without a body", async () => {
+		const originalFetch = globalThis.fetch;
+		try {
+			const stale = trackerRecorder();
+			const fresh = trackerRecorder();
+			const payload = { model: "gpt-5", input: "hello", stream: true };
+			let fetchCount = 0;
+			globalThis.fetch = (async () => {
+				fetchCount += 1;
+				if (fetchCount === 1) return new Response(null, { status: 204 });
+				return new Response(sseEvent({
+					type: "response.output_item.added",
+					item: { type: "web_search_call", id: "ws-fresh" },
+				}), { headers: { "content-type": "text/event-stream" } });
+			}) as typeof fetch;
+			installOpenAIResponsesImageInterruption();
+
+			const noBodyResponse = await fetch("https://gateway.example.invalid/v1/responses", { method: "POST", body: JSON.stringify(payload) });
+			expect(noBodyResponse.body).toBeNull();
+			registerProviderToolRequest(payload, { enabledTools: ["web_search"], interruptOnImageResult: false, liveTracker: stale.tracker });
+
+			const bodyResponse = await fetch("https://gateway.example.invalid/v1/responses", { method: "POST", body: JSON.stringify(payload) });
+			registerProviderToolRequest(payload, { enabledTools: ["web_search"], interruptOnImageResult: false, liveTracker: fresh.tracker });
+			await responseText(bodyResponse.body!);
+
+			expect(stale.events).toEqual([]);
+			expect(fresh.events).toEqual([{ type: "response.output_item.added", item: { type: "web_search_call", id: "ws-fresh" } }]);
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
 	it("does not send image_generation_call to live tracker but preserves image interruption", async () => {
 		const recorder = trackerRecorder();
 		const imageEvent = sseEvent({ type: "response.output_item.done", item: { type: "image_generation_call", id: "ig-1", result: "abc" } });

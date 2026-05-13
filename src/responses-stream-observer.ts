@@ -21,6 +21,19 @@ export interface RequestObservationPolicy {
 	observeLiveEventsInIterable?: boolean;
 }
 
+export interface RequestObservationPolicyBinding {
+	currentPolicy(): RequestObservationPolicy | undefined;
+	onPolicy(callback: (policy: RequestObservationPolicy) => void): void;
+	dispose(): void;
+}
+
+type RequestObservationPolicySource = RequestObservationPolicy | RequestObservationPolicyBinding;
+
+function isPolicyBinding(source: RequestObservationPolicySource): source is RequestObservationPolicyBinding {
+	return typeof (source as RequestObservationPolicyBinding).currentPolicy === "function"
+		&& typeof (source as RequestObservationPolicyBinding).onPolicy === "function";
+}
+
 function isRecord(value: unknown): value is JsonRecord {
 	return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -48,17 +61,26 @@ function isClosedControllerError(error: unknown): boolean {
 	return message.includes("controller is already closed") || (message.includes("invalid state") && message.includes("closed"));
 }
 
-export function wrapOpenAIResponsesStream(body: ReadableStream<Uint8Array>, policy: RequestObservationPolicy): ReadableStream<Uint8Array> {
+export function wrapOpenAIResponsesStream(body: ReadableStream<Uint8Array>, policySource: RequestObservationPolicySource): ReadableStream<Uint8Array> {
 	const reader = body.getReader();
 	const decoder = new TextDecoder();
 	const encoder = new TextEncoder();
+	let policy = isPolicyBinding(policySource) ? policySource.currentPolicy() : policySource;
 	let buffer = "";
 	let finished = false;
 	let keepaliveTimer: ReturnType<typeof setTimeout> | undefined;
 	let keepaliveController: ReadableStreamDefaultController<Uint8Array> | undefined;
 	let sawLiveWebSearchEvent = false;
 	let lastSyntheticKeepaliveAt = Date.now();
+	let replayableLiveEvents: unknown[] = [];
 
+	const disposeBinding = () => {
+		if (isPolicyBinding(policySource)) policySource.dispose();
+	};
+	const imageKeepaliveEnabled = () => {
+		const enabledTools = policy?.enabledTools;
+		return policy !== undefined && (enabledTools === undefined || enabledTools.includes("image_generation"));
+	};
 	const clearKeepalive = () => {
 		if (keepaliveTimer) clearTimeout(keepaliveTimer);
 		keepaliveTimer = undefined;
@@ -66,12 +88,13 @@ export function wrapOpenAIResponsesStream(body: ReadableStream<Uint8Array>, poli
 	const finish = () => {
 		finished = true;
 		clearKeepalive();
+		disposeBinding();
 	};
 	const failAndClearTracker = (error: unknown) => {
+		if (!policy) return;
 		failTracker(policy.liveTracker, error);
 		clearTracker(policy.liveTracker);
 	};
-	const imageKeepaliveEnabled = policy.enabledTools === undefined || policy.enabledTools.includes("image_generation");
 	const emitSyntheticKeepalive = (): boolean => {
 		if (finished || !keepaliveController) return false;
 		lastSyntheticKeepaliveAt = Date.now();
@@ -79,12 +102,24 @@ export function wrapOpenAIResponsesStream(body: ReadableStream<Uint8Array>, poli
 	};
 	const scheduleKeepalive = () => {
 		clearKeepalive();
-		if (!imageKeepaliveEnabled || finished || policy.keepaliveIntervalMs === undefined || policy.keepaliveIntervalMs <= 0) return;
+		if (!keepaliveController || !imageKeepaliveEnabled() || finished || policy?.keepaliveIntervalMs === undefined || policy.keepaliveIntervalMs <= 0) return;
 		const delayMs = Math.max(0, policy.keepaliveIntervalMs - (Date.now() - lastSyntheticKeepaliveAt));
 		keepaliveTimer = setTimeout(() => {
 			if (emitSyntheticKeepalive()) scheduleKeepalive();
 		}, delayMs);
 	};
+	const bindPolicy = (nextPolicy: RequestObservationPolicy) => {
+		if (finished || policy) return;
+		policy = nextPolicy;
+		if (replayableLiveEvents.length > 0) {
+			for (const event of replayableLiveEvents) {
+				sawLiveWebSearchEvent = observeEventWithPolicy(nextPolicy, event, true, sawLiveWebSearchEvent).sawLiveWebSearchEvent;
+			}
+			replayableLiveEvents = [];
+		}
+		scheduleKeepalive();
+	};
+	if (isPolicyBinding(policySource)) policySource.onPolicy(bindPolicy);
 
 	return new ReadableStream<Uint8Array>({
 		start(controller) {
@@ -110,10 +145,12 @@ export function wrapOpenAIResponsesStream(body: ReadableStream<Uint8Array>, poli
 						const rawEvent = buffer.slice(0, delimiter.index);
 						buffer = buffer.slice(delimiter.index + delimiter.length);
 						const event = parseSseEvent(rawEvent);
-						sawLiveWebSearchEvent = observeEvent(policy, event, true, sawLiveWebSearchEvent);
+						const observeResult = observeEventWithPolicy(policy, event, true, sawLiveWebSearchEvent);
+						sawLiveWebSearchEvent = observeResult.sawLiveWebSearchEvent;
+						if (!policy && observeResult.replayableEvent) replayableLiveEvents.push(observeResult.replayableEvent);
 						if (!tryEnqueueChunk(controller, encoder.encode(`${rawEvent}\n\n`), finish)) return;
 						emitted = true;
-						if (policy.interruptOnImageResult && isImageGenerationResultDoneEvent(rawEvent)) {
+						if (policy?.interruptOnImageResult && isImageGenerationResultDoneEvent(rawEvent)) {
 							clearTracker(policy.liveTracker);
 							finish();
 							if (!tryEnqueueChunk(controller, encoder.encode(INTERRUPT_DONE_EVENT), finish)) return;
@@ -132,7 +169,7 @@ export function wrapOpenAIResponsesStream(body: ReadableStream<Uint8Array>, poli
 		},
 		async cancel(reason) {
 			finish();
-			clearTracker(policy.liveTracker);
+			if (policy) clearTracker(policy.liveTracker);
 			await reader.cancel(reason).catch(() => undefined);
 		},
 	});
@@ -230,21 +267,35 @@ export function wrapOpenAIResponsesEventIterable<T>(source: AsyncIterable<T>, po
 	};
 }
 
+type ObserveEventResult = {
+	sawLiveWebSearchEvent: boolean;
+	replayableEvent?: unknown;
+};
+
 function observeEvent(policy: RequestObservationPolicy, event: unknown, shouldCallOnEvent: boolean, sawLiveWebSearchEvent = false): boolean {
-	if (!isRecord(event)) return sawLiveWebSearchEvent;
+	return observeEventWithPolicy(policy, event, shouldCallOnEvent, sawLiveWebSearchEvent).sawLiveWebSearchEvent;
+}
+
+function observeEventWithPolicy(policy: RequestObservationPolicy | undefined, event: unknown, shouldCallOnEvent: boolean, sawLiveWebSearchEvent = false): ObserveEventResult {
+	if (!isRecord(event)) return { sawLiveWebSearchEvent };
 	const observesLiveEvent = shouldObserveLiveEvent(event);
 	const shouldForward = observesLiveEvent && (event.type !== "response.completed" || sawLiveWebSearchEvent);
-	if (shouldCallOnEvent && shouldForward) {
+	if (policy && shouldCallOnEvent && shouldForward) {
 		callTrackerOnEvent(policy.liveTracker, event);
 	}
 	const type = event.type;
 	if (type === "response.completed") {
-		return sawLiveWebSearchEvent;
+		return { sawLiveWebSearchEvent, replayableEvent: shouldForward ? event : undefined };
 	} else if (type === "response.failed" || type === "error") {
-		failTracker(policy.liveTracker, event.error ?? event);
-		clearTracker(policy.liveTracker);
+		if (policy) {
+			failTracker(policy.liveTracker, event.error ?? event);
+			clearTracker(policy.liveTracker);
+		}
 	}
-	return sawLiveWebSearchEvent || isWebSearchLifecycleEvent(event);
+	return {
+		sawLiveWebSearchEvent: sawLiveWebSearchEvent || isWebSearchLifecycleEvent(event),
+		replayableEvent: shouldForward ? event : undefined,
+	};
 }
 
 function shouldObserveLiveEvent(event: JsonRecord): boolean {

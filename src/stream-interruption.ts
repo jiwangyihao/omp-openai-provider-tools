@@ -4,12 +4,17 @@ import {
 	wrapOpenAIResponsesEventIterable,
 	wrapOpenAIResponsesStream,
 } from "./responses-stream-observer";
-import type { JsonRecord, RequestObservationPolicy } from "./responses-stream-observer";
+import type { JsonRecord, RequestObservationPolicy, RequestObservationPolicyBinding } from "./responses-stream-observer";
 
 type FetchLike = typeof fetch;
 
-const requestPolicies = new Map<string, RequestObservationPolicy[]>();
-const responsePolicies = new WeakMap<Response, RequestObservationPolicy>();
+type RequestPolicySlot = RequestObservationPolicyBinding & {
+	bind(policy: RequestObservationPolicy): void;
+};
+
+const requestPolicies = new Map<string, RequestPolicySlot[]>();
+const responsePolicies = new WeakMap<Response, RequestObservationPolicyBinding>();
+const abandonedPolicySlots = new Map<string, number>();
 
 let installed = false;
 let originalFetch: FetchLike | undefined;
@@ -44,7 +49,7 @@ export function registerProviderToolRequest(payload: unknown, policy: Partial<Re
 	const key = stableStringify(payload);
 	const queue = requestPolicies.get(key) ?? [];
 	const imageKeepaliveEnabled = policy.enabledTools?.includes("image_generation") ?? false;
-	queue.push({
+	const normalizedPolicy = {
 		interruptOnImageResult: imageKeepaliveEnabled && Boolean(policy.interruptOnImageResult),
 		keepaliveIntervalMs: imageKeepaliveEnabled
 			? policy.keepaliveIntervalMs ?? DEFAULT_IMAGE_GENERATION_KEEPALIVE_INTERVAL_MS
@@ -52,16 +57,110 @@ export function registerProviderToolRequest(payload: unknown, policy: Partial<Re
 		liveTracker: policy.liveTracker,
 		enabledTools: policy.enabledTools,
 		observeLiveEventsInIterable: policy.observeLiveEventsInIterable,
-	});
-	requestPolicies.set(key, queue);
+	};
+	const slot = queue.find(entry => entry.currentPolicy() === undefined);
+	if (slot) {
+		slot.bind(normalizedPolicy);
+	} else if (consumeAbandonedPolicySlot(key)) {
+		return;
+	} else {
+		queue.push(createBoundPolicySlot(normalizedPolicy));
+		requestPolicies.set(key, queue);
+	}
 }
 
 export function consumeProviderToolRequestPolicy(payload: unknown): RequestObservationPolicy | undefined {
 	const key = stableStringify(payload);
 	const queue = requestPolicies.get(key);
-	const policy = queue?.shift();
-	if (!queue || queue.length === 0) requestPolicies.delete(key);
-	return policy;
+	const slot = queue?.find(entry => entry.currentPolicy() !== undefined);
+	if (!slot) return undefined;
+	removePolicySlot(key, slot);
+	return slot.currentPolicy();
+}
+
+function reserveProviderToolRequestPolicySlot(payload: unknown): RequestPolicySlot | undefined {
+	const key = stableStringify(payload);
+	const queue = requestPolicies.get(key) ?? [];
+	const existing = queue.find(entry => entry.currentPolicy() !== undefined);
+	if (existing) {
+		removePolicySlot(key, existing);
+		return existing;
+	}
+	const slot = createPendingPolicySlot((wasUnbound) => {
+		removePolicySlot(key, slot);
+		if (wasUnbound) markAbandonedPolicySlot(key);
+	});
+	queue.push(slot);
+	requestPolicies.set(key, queue);
+	return slot;
+}
+
+function createBoundPolicySlot(policy: RequestObservationPolicy): RequestPolicySlot {
+	let current: RequestObservationPolicy | undefined = policy;
+	return {
+		currentPolicy() {
+			return current;
+		},
+		onPolicy(callback) {
+			if (current) callback(current);
+		},
+		bind(nextPolicy) {
+			current = nextPolicy;
+		},
+		dispose() {},
+	};
+}
+
+function createPendingPolicySlot(onDispose: (wasUnbound: boolean) => void): RequestPolicySlot {
+	let current: RequestObservationPolicy | undefined;
+	let disposed = false;
+	const callbacks: Array<(policy: RequestObservationPolicy) => void> = [];
+	return {
+		currentPolicy() {
+			return current;
+		},
+		onPolicy(callback) {
+			if (current) {
+				callback(current);
+			} else if (!disposed) {
+				callbacks.push(callback);
+			}
+		},
+		bind(nextPolicy) {
+			if (disposed || current) return;
+			current = nextPolicy;
+			for (const callback of callbacks.splice(0)) callback(nextPolicy);
+		},
+		dispose() {
+			if (disposed) return;
+			disposed = true;
+			callbacks.length = 0;
+			onDispose(current === undefined);
+		},
+	};
+}
+
+function removePolicySlot(key: string, slot: RequestPolicySlot): void {
+	const queue = requestPolicies.get(key);
+	if (!queue) return;
+	const index = queue.indexOf(slot);
+	if (index >= 0) queue.splice(index, 1);
+	if (queue.length === 0) requestPolicies.delete(key);
+}
+
+function markAbandonedPolicySlot(key: string): void {
+	abandonedPolicySlots.set(key, (abandonedPolicySlots.get(key) ?? 0) + 1);
+}
+
+function consumeAbandonedPolicySlot(key: string): boolean {
+	const count = abandonedPolicySlots.get(key) ?? 0;
+	if (count <= 0) return false;
+	if (count === 1) {
+		abandonedPolicySlots.delete(key);
+	} else {
+		abandonedPolicySlots.set(key, count - 1);
+	}
+	return true;
 }
 
 export function registerInterruptibleImageGenerationRequest(payload: unknown): void {
@@ -78,6 +177,7 @@ export function consumeImageGenerationRequestPolicy(payload: unknown): RequestOb
 
 export function clearInterruptibleImageGenerationRequests(): void {
 	requestPolicies.clear();
+	abandonedPolicySlots.clear();
 }
 
 export function wrapImageGenerationStream(body: ReadableStream<Uint8Array>, policy: RequestObservationPolicy): ReadableStream<Uint8Array> {
@@ -115,16 +215,24 @@ export function installOpenAIResponsesImageInterruption(): void {
 	originalFetch = globalThis.fetch.bind(globalThis) as FetchLike;
 	wrappedFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
 		const payload = await responsesRequestPayload(input, init);
-		const response = await originalFetch!(input, init);
-		const policy = payload ? consumeProviderToolRequestPolicy(payload) : undefined;
-		if (!policy || !response.body) return response;
-		const wrappedResponse = new Response(wrapOpenAIResponsesStream(response.body, policy), {
-			status: response.status,
-			statusText: response.statusText,
-			headers: response.headers,
-		});
-		responsePolicies.set(wrappedResponse, { ...policy, observeLiveEventsInIterable: false });
-		return wrappedResponse;
+		const slot = payload ? reserveProviderToolRequestPolicySlot(payload) : undefined;
+		try {
+			const response = await originalFetch!(input, init);
+			if (!slot || !response.body) {
+				slot?.dispose();
+				return response;
+			}
+			const wrappedResponse = new Response(wrapOpenAIResponsesStream(response.body, slot), {
+				status: response.status,
+				statusText: response.statusText,
+				headers: response.headers,
+			});
+			responsePolicies.set(wrappedResponse, slot);
+			return wrappedResponse;
+		} catch (error) {
+			slot?.dispose();
+			throw error;
+		}
 	}) as FetchLike;
 	globalThis.fetch = wrappedFetch;
 
@@ -161,6 +269,7 @@ export function restoreOpenAIResponsesImageInterruptionForTests(): void {
 	wrappedFetch = undefined;
 	streamModulePatch = undefined;
 	requestPolicies.clear();
+	abandonedPolicySlots.clear();
 }
 
 async function responsesRequestPayload(input: RequestInfo | URL, init?: RequestInit): Promise<unknown | undefined> {
@@ -169,7 +278,8 @@ async function responsesRequestPayload(input: RequestInfo | URL, init?: RequestI
 }
 
 function responsePolicy(response: Response): RequestObservationPolicy | undefined {
-	return responsePolicies.get(response);
+	const policy = responsePolicies.get(response)?.currentPolicy();
+	return policy ? { ...policy, observeLiveEventsInIterable: false } : undefined;
 }
 
 function isResponsesRequest(input: RequestInfo | URL): boolean {
