@@ -4,12 +4,12 @@
 [![npm downloads](https://img.shields.io/npm/dw/omp-openai-provider-tools.svg)](https://www.npmjs.com/package/omp-openai-provider-tools)
 [![License: MPL-2.0](https://img.shields.io/badge/License-MPL--2.0-blue.svg)](./LICENSE)
 
-> **Latest in v0.1.4 | v0.1.4 最近更新**
+> **Latest in v0.1.5 | v0.1.5 最近更新**
 >
-> - Fixes provider-native `web_search` live overlay disappearing after unbound TUI render callbacks | 修复 provider-native `web_search` 实时 overlay 因 TUI 渲染回调失绑而消失
-> - Keeps overlay `calls` counts cumulative across collapse / hide and preserves three visible items | overlay 的 `calls` 计数改为累计值，并在折叠 / 隐藏后保留 3 个展示项
-> - Flushes final `web_search` cards immediately from `message_end` when the runtime is already idle | runtime 已 idle 时从 `message_end` 立即 flush 最终 `web_search` 回显
-> - Documents live overlay lifecycle, count, and collapse semantics | 补充实时 overlay 生命周期、计数和折叠语义说明
+> - Falls back to runtime `models.yml` when OMP strips `compat.openaiProviderTools` from hook model metadata | 当 OMP hook 模型元数据剥离 `compat.openaiProviderTools` 时，回退读取 runtime `models.yml`
+> - Preserves provider identity before `baseUrl` fallback for shared gateway routes | 多个 provider 共用同一 gateway 时优先按 provider identity 匹配
+> - Keeps provider-native `image_generation` / `web_search` injection credential-free and without `tool_choice` | 保持 provider-native `image_generation` / `web_search` 注入不接管凭据且不设置 `tool_choice`
+> - Documents the metadata fallback and credential boundary | 补充元数据兜底与凭据边界说明
 
 [中文](#中文) | [English](#english)
 
@@ -129,7 +129,7 @@ OpenAI provider-executed tools 通常不会把原始工具输出暴露给宿主�
 当前版本：
 
 ```bash
-omp plugin install npm:omp-openai-provider-tools@0.1.4
+omp plugin install npm:omp-openai-provider-tools@0.1.5
 ```
 
 本地开发时可以链接 checkout：
@@ -156,7 +156,7 @@ omp plugin link <path-to-this-repo>
 2. 提取其中带明确版本号的安装命令。当前版本示例：
 
    ```bash
-   omp plugin install npm:omp-openai-provider-tools@0.1.4
+   omp plugin install npm:omp-openai-provider-tools@0.1.5
    ```
 
 3. 安装后不要停在插件安装本身。继续帮助用户配置 OpenAI 官方 provider 或用户自己的 OpenAI-compatible 中转站：确认当前模型使用 `openai-responses`，把能力声明写入模型或 provider 元数据的 `compat.openaiProviderTools`，不要新建插件专用配置文件。
@@ -190,6 +190,8 @@ omp plugin link <path-to-this-repo>
 ## 配置
 
 推荐把配置放在 OMP/Pi 的模型或 provider 元数据里，而不是再维护一个插件专用 YAML。provider-executed tools 是所选 provider/model 的能力，配置应该跟模型路由放在一起。
+
+插件优先使用运行时传给 extension hook 的模型元数据。如果某些 OMP 版本在 hook 上下文里剥离了 `compat.openaiProviderTools`，插件会退回读取当前 runtime home 下的 `models.yml`，只合并当前 provider/model 对应的 `openaiProviderTools` 元数据；不会读取、复制、记录或管理 API key。
 
 ### 官方 OpenAI Responses provider
 
@@ -410,7 +412,7 @@ Provider-executed `web_search` lets the main Agent use provider-side search resu
 For OMP:
 
 ```bash
-omp plugin install npm:omp-openai-provider-tools@0.1.4
+omp plugin install npm:omp-openai-provider-tools@0.1.5
 ```
 
 For local development:
@@ -422,8 +424,8 @@ omp plugin link <path-to-this-repo>
 For Pi-family runtimes:
 
 ```bash
-pi install npm:omp-openai-provider-tools@0.1.4
-pi -e npm:omp-openai-provider-tools@0.1.4
+pi install npm:omp-openai-provider-tools@0.1.5
+pi -e npm:omp-openai-provider-tools@0.1.5
 ```
 
 Verify:

@@ -1,5 +1,7 @@
 import * as os from "node:os";
+import * as fs from "node:fs";
 import * as path from "node:path";
+import YAML from "yaml";
 
 import { enabledProviderToolsToHostTools, normalizeActiveToolNames, removeHostSideTools } from "./active-tools";
 import { buildRequestTarget, type RequestTarget } from "./match";
@@ -150,6 +152,76 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function openAIProviderToolsMetadata(model: RuntimeModelLike | undefined): NonNullable<RuntimeModelLike["compat"]>["openaiProviderTools"] | undefined {
 	const metadata = model?.compat?.openaiProviderTools;
 	return isRecord(metadata) ? metadata : undefined;
+}
+
+function mergeProviderToolsMetadata(
+	base: NonNullable<RuntimeModelLike["compat"]>["openaiProviderTools"] | undefined,
+	override: NonNullable<RuntimeModelLike["compat"]>["openaiProviderTools"] | undefined,
+): NonNullable<RuntimeModelLike["compat"]>["openaiProviderTools"] | undefined {
+	if (!isRecord(base)) return isRecord(override) ? override : undefined;
+	if (!isRecord(override)) return base;
+	return { ...base, ...override };
+}
+
+function runtimeConfigPath(ctx: ExtensionContextLike, api: ExtensionApiLike): string {
+	const runtime = detectRuntimeKind(api, ctx) === "pi" ? "pi" : "omp";
+	return path.join(ctx.homeDir ?? os.homedir(), `.${runtime}`, "agent", "models.yml");
+}
+
+
+function modelConfigMetadataForModel(modelConfigs: unknown, model: RuntimeModelLike): NonNullable<RuntimeModelLike["compat"]>["openaiProviderTools"] | undefined {
+	if (!Array.isArray(modelConfigs)) return undefined;
+	for (const modelConfig of modelConfigs) {
+		if (!isRecord(modelConfig)) continue;
+		const id = typeof modelConfig.id === "string" ? modelConfig.id : undefined;
+		if (id && model.id && id !== model.id) continue;
+		const name = typeof modelConfig.name === "string" ? modelConfig.name : undefined;
+		if (!id && name && model.name && name !== model.name) continue;
+		const compat = isRecord(modelConfig.compat) ? modelConfig.compat : undefined;
+		const metadata = isRecord(compat?.openaiProviderTools) ? compat.openaiProviderTools : undefined;
+		if (metadata) return metadata as NonNullable<RuntimeModelLike["compat"]>["openaiProviderTools"];
+	}
+	return undefined;
+}
+
+function readModelConfigMetadata(model: RuntimeModelLike | undefined, ctx: ExtensionContextLike, api: ExtensionApiLike): NonNullable<RuntimeModelLike["compat"]>["openaiProviderTools"] | undefined {
+	if (!model) return undefined;
+	let parsed: unknown;
+	try {
+		const text = fs.readFileSync(runtimeConfigPath(ctx, api), "utf8");
+		parsed = YAML.parse(text);
+	} catch {
+		return undefined;
+	}
+	if (!isRecord(parsed) || !isRecord(parsed.providers)) return undefined;
+	let baseUrlFallback: NonNullable<RuntimeModelLike["compat"]>["openaiProviderTools"] | undefined;
+	for (const [providerName, providerConfig] of Object.entries(parsed.providers)) {
+		if (!isRecord(providerConfig)) continue;
+		const providerMatches = typeof model.provider === "string" && model.provider === providerName;
+		const baseUrlMatches = !providerMatches && typeof providerConfig.baseUrl === "string" && providerConfig.baseUrl === model.baseUrl;
+		if (!providerMatches && !baseUrlMatches) continue;
+		const providerCompat = isRecord(providerConfig.compat) ? providerConfig.compat : undefined;
+		const providerMetadata = isRecord(providerCompat?.openaiProviderTools) ? providerCompat.openaiProviderTools as NonNullable<RuntimeModelLike["compat"]>["openaiProviderTools"] : undefined;
+		const modelMetadata = modelConfigMetadataForModel(providerConfig.models, model);
+		const metadata = mergeProviderToolsMetadata(providerMetadata, modelMetadata);
+		if (providerMatches) return metadata;
+		baseUrlFallback ??= metadata;
+	}
+	return baseUrlFallback;
+
+}
+
+function resolveModelWithProviderToolsMetadata(model: RuntimeModelLike | undefined, configMetadata: NonNullable<RuntimeModelLike["compat"]>["openaiProviderTools"] | undefined): RuntimeModelLike | undefined {
+	if (!model) return undefined;
+	const metadata = mergeProviderToolsMetadata(openAIProviderToolsMetadata(model), configMetadata);
+	if (!metadata) return model;
+	return {
+		...model,
+		compat: {
+			...(model.compat ?? {}),
+			openaiProviderTools: metadata,
+		},
+	};
 }
 
 function isEnabledFlag(value: unknown): boolean {
@@ -950,19 +1022,21 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 	api.on?.("context", (event) => filterProviderToolResultContextMessages(event));
 
 	api.on?.("before_agent_start", async (_event, ctx) => {
-		const syntheticPayload = modelPayloadForBeforeAgent(ctx.model);
-		if (!isExplicitOpenAIResponsesModel(ctx.model)) return undefined;
+		const configMetadata = readModelConfigMetadata(ctx.model, ctx, api);
+		const configuredModel = resolveModelWithProviderToolsMetadata(ctx.model, configMetadata);
+		const syntheticPayload = modelPayloadForBeforeAgent(configuredModel);
+		if (!isExplicitOpenAIResponsesModel(configuredModel)) return undefined;
 		if (!syntheticPayload) return undefined;
 
-		const target = buildRequestTarget({ payload: syntheticPayload, contextModel: ctx.model });
+		const target = buildRequestTarget({ payload: syntheticPayload, contextModel: configuredModel });
 		if (!target) return undefined;
 		const key = targetKey(target);
 		if (incompatibleTargets.has(key)) return undefined;
 
-		const entry = providerEntryFromModel(ctx.model);
+		const entry = providerEntryFromModel(configuredModel);
 		if (!entry) return undefined;
 
-		const enabledProviderTools = getEnabledProviderToolTypesForModel(entry, ctx.model);
+		const enabledProviderTools = getEnabledProviderToolTypesForModel(entry, configuredModel);
 		if (enabledProviderTools.length === 0) return undefined;
 
 		if (!api.getActiveTools || !api.setActiveTools) {
@@ -998,7 +1072,8 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 		const payload = requestPayload(event);
 		normalizeProviderImageGenerationReplayItemsFromPayload(payload);
 		const eventModel = requestEventModel(event);
-		const eligibilityModel = eventModel ?? ctx.model;
+		const configMetadata = readModelConfigMetadata(eventModel ?? ctx.model, ctx, api);
+		const eligibilityModel = resolveModelWithProviderToolsMetadata(eventModel ?? ctx.model, configMetadata);
 		imageResultState.outputDirectory = undefined;
 		if (!isExplicitOpenAIResponsesModel(eligibilityModel)) {
 			const pending = pendingRemovedState(expectedByTarget);
@@ -1016,7 +1091,7 @@ export default function openAIProviderToolsExtension(api: ExtensionApiLike): voi
 			}
 			return undefined;
 		}
-		const target = buildRequestTarget({ payload, contextModel: ctx.model, eventModel });
+		const target = buildRequestTarget({ payload, contextModel: resolveModelWithProviderToolsMetadata(ctx.model, configMetadata), eventModel: eligibilityModel });
 		if (!target) {
 			const pending = pendingRemovedState(expectedByTarget);
 			if (pending) {

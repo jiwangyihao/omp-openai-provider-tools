@@ -74,6 +74,12 @@ describe("package manifest", () => {
 		expect(readme).toContain("用户自己的 OpenAI-compatible 中转站");
 	});
 
+	it("documents models.yml metadata fallback without plugin credential storage", () => {
+		const readme = readFileSync(readmePath, "utf8");
+		expect(readme).toContain("插件优先使用运行时传给 extension hook 的模型元数据");
+		expect(readme).toContain("不会读取、复制、记录或管理 API key");
+	});
+
 	it("documents explicit image agent CLI configuration", () => {
 		const readme = readFileSync(readmePath, "utf8");
 		expect(readme).toContain("configure-image-agent --model <image-capable-model-alias>");

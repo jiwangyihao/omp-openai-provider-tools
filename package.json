@@ -1,7 +1,7 @@
 {
 	"type": "module",
 	"name": "omp-openai-provider-tools",
-	"version": "0.1.4",
+	"version": "0.1.5",
 	"description": "Provider-native OpenAI Responses tools for OMP and Pi-family runtimes.",
 	"repository": {
 		"type": "git",

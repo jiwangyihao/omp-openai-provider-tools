@@ -3,6 +3,7 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import YAML from "yaml";
 
 import providerToolsExtension from "../src/extension";
 import { tryEnqueueChunk, wrapImageGenerationEventIterable, wrapImageGenerationStream } from "../src/stream-interruption";
@@ -71,6 +72,14 @@ const providerToolsInterruptImageModel = {
 	},
 };
 
+const providerToolsImageModelWithoutCompat = {
+	...customProviderModel,
+	provider: "sub2api-openai-image",
+	id: "gpt-5.5",
+	name: "GPT-5.5 Image",
+	baseUrl: "https://oai.jwyihao.top/v1",
+};
+
 afterEach(async () => {
 	for (const dir of tempDirs.splice(0)) {
 		await fs.rm(dir, { recursive: true, force: true });
@@ -95,6 +104,12 @@ function imageModelWithOutput(directory: string) {
 	};
 }
 
+function writeModelsConfig(homeDir: string, config: unknown): void {
+	const agentDir = path.join(homeDir, ".omp", "agent");
+	fsSync.mkdirSync(agentDir, { recursive: true });
+	fsSync.writeFileSync(path.join(agentDir, "models.yml"), YAML.stringify(config), "utf8");
+}
+
 const unsupportedExtraBodyImageModel = {
 	...targetModel,
 	compat: {
@@ -113,6 +128,7 @@ function registerExtension({
 	getActiveTools,
 	sendMessageImpl,
 	appendEntry,
+	registerMessageRenderer = false,
 }: {
 	runtime?: RuntimeKind;
 	initialActiveTools?: any[];
@@ -122,6 +138,7 @@ function registerExtension({
 	getActiveTools?: () => any[] | Promise<any[]>;
 	sendMessageImpl?: (message: unknown, options?: unknown) => unknown | Promise<unknown>;
 	appendEntry?: (customType: string, data: unknown) => unknown | Promise<unknown>;
+	registerMessageRenderer?: boolean;
 } = {}) {
 	const handlers = new Map<string, Handler[]>();
 	const warnings: unknown[][] = [];
@@ -173,9 +190,13 @@ function registerExtension({
 				appendEntry,
 			}
 			: {}),
-		registerMessageRenderer(customType: string, renderer: Function) {
-			renderers.set(customType, renderer);
-		},
+		...(registerMessageRenderer
+			? {
+				registerMessageRenderer(customType: string, renderer: Function) {
+					renderers.set(customType, renderer);
+				},
+			}
+			: {}),
 	};
 	providerToolsExtension(api);
 	return { activeTools: () => activeTools, handlers, label: () => label, sentMessages, warnings, renderers };
@@ -645,7 +666,7 @@ it("flushes queued final web_search on idle turn_end as a ui-only display custom
 it("renders idle-gated display custom messages through the registered provider result renderer", async () => {
 	const cwd = await makeTempDir();
 	const homeDir = await makeTempDir();
-	const extension = registerExtension();
+	const extension = registerExtension({ registerMessageRenderer: true });
 	const ctx = context(cwd, homeDir, { isIdle: () => true, sessionManager: { getSessionId: () => "session-1" } });
 
 	await runMessageEnd(extension, { type: "message_end", message: webSearchMessage("renderer integration") }, ctx);
@@ -1609,6 +1630,71 @@ describe("OpenAI provider tools extension", () => {
 		expect(payload.tools).toEqual([{ type: "image_generation" }]);
 	});
 
+	it("falls back to models.yml compat when OMP strips openaiProviderTools from ctx.model", async () => {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		writeModelsConfig(homeDir, {
+			providers: {
+				"sub2api-openai-image": {
+					api: "openai-responses",
+					baseUrl: "https://oai.jwyihao.top/v1",
+					compat: {
+						openaiProviderTools: {
+							enabled: true,
+						},
+					},
+					models: [
+						{
+							id: "gpt-5.5",
+							name: "GPT-5.5 Image",
+							api: "openai-responses",
+							compat: {
+								openaiProviderTools: {
+									imageGeneration: true,
+								},
+							},
+						},
+					],
+				},
+			},
+		});
+		const extension = registerExtension({ initialActiveTools: ["read"] });
+		const ctx = context(cwd, homeDir, { model: providerToolsImageModelWithoutCompat });
+		const payload: Record<string, unknown> = { model: "gpt-5.5", input: "hello" };
+
+		await runBeforeProvider(extension, payload, ctx, { requestModel: providerToolsImageModelWithoutCompat });
+
+		expect(payload.tools).toEqual([{ type: "web_search" }, { type: "image_generation" }]);
+	});
+
+	it("uses provider identity before baseUrl fallback when multiple providers share a gateway", async () => {
+		const cwd = await makeTempDir();
+		const homeDir = await makeTempDir();
+		writeModelsConfig(homeDir, {
+			providers: {
+				"sub2api-openai": {
+					api: "openai-responses",
+					baseUrl: "https://oai.jwyihao.top/v1",
+					compat: { openaiProviderTools: { enabled: true } },
+					models: [{ id: "gpt-5.5", name: "GPT-5.5", api: "openai-responses" }],
+				},
+				"sub2api-openai-image": {
+					api: "openai-responses",
+					baseUrl: "https://oai.jwyihao.top/v1",
+					compat: { openaiProviderTools: { enabled: true } },
+					models: [{ id: "gpt-5.5", name: "GPT-5.5 Image", api: "openai-responses", compat: { openaiProviderTools: { imageGeneration: true } } }],
+				},
+			},
+		});
+		const extension = registerExtension({ initialActiveTools: ["read"] });
+		const ctx = context(cwd, homeDir, { model: providerToolsImageModelWithoutCompat });
+		const payload: Record<string, unknown> = { model: "gpt-5.5", input: "hello" };
+
+		await runBeforeProvider(extension, payload, ctx, { requestModel: providerToolsImageModelWithoutCompat });
+
+		expect(payload.tools).toEqual([{ type: "web_search" }, { type: "image_generation" }]);
+	});
+
 	it("does not inject image_generation for unsupported extraBody image markers", async () => {
 		const cwd = await makeTempDir();
 		const homeDir = await makeTempDir();
@@ -1804,13 +1890,12 @@ describe("OpenAI provider tools extension", () => {
 			getActiveTools() { return ["read", "web_search", "generate_image"]; },
 			async setActiveTools() {},
 			sendMessage() { return Promise.reject(new Error("send failed")); },
-			registerMessageRenderer() {},
+			// No renderer registration: this test exercises sendMessage failure only.
 		};
 		providerToolsExtension(failingApi);
 
-		expect(() => getHandlerFromMap(handlers, "agent_end")({ message: webSearchMessage() }, ctx)).not.toThrow();
-		expect(() => getHandlerFromMap(handlers, "turn_end")({ type: "turn_end" }, ctx)).not.toThrow();
-		await Promise.resolve();
+		await expect(getHandlerFromMap(handlers, "agent_end")({ message: webSearchMessage() }, ctx)).resolves.toBeUndefined();
+		expect(getHandlerFromMap(handlers, "turn_end")({ type: "turn_end" }, ctx)).toBeUndefined();
 		await Promise.resolve();
 		expect(warnings.join("\n")).toContain("OpenAI provider tool result message delivery failed");
 	});
@@ -2834,7 +2919,7 @@ describe("OpenAI provider tools extension", () => {
 	});
 
 	it("registers a folded image renderer for provider image messages", () => {
-		const extension = registerExtension();
+		const extension = registerExtension({ registerMessageRenderer: true });
 
 		const renderer = extension.renderers.get("openai-provider-image-generation");
 		expect(renderer).toBeDefined();
