@@ -4,12 +4,11 @@
 [![npm downloads](https://img.shields.io/npm/dw/omp-openai-provider-tools.svg)](https://www.npmjs.com/package/omp-openai-provider-tools)
 [![License: MPL-2.0](https://img.shields.io/badge/License-MPL--2.0-blue.svg)](./LICENSE)
 
-> **Latest in v0.1.5 | v0.1.5 最近更新**
+> **Latest in v0.1.6 | v0.1.6 最近更新**
 >
-> - Falls back to runtime `models.yml` when OMP strips `compat.openaiProviderTools` from hook model metadata | 当 OMP hook 模型元数据剥离 `compat.openaiProviderTools` 时，回退读取 runtime `models.yml`
-> - Preserves provider identity before `baseUrl` fallback for shared gateway routes | 多个 provider 共用同一 gateway 时优先按 provider identity 匹配
-> - Keeps provider-native `image_generation` / `web_search` injection credential-free and without `tool_choice` | 保持 provider-native `image_generation` / `web_search` 注入不接管凭据且不设置 `tool_choice`
-> - Documents the metadata fallback and credential boundary | 补充元数据兜底与凭据边界说明
+> - Fixes provider-native `web_search` live overlay so one shared panel is reused, events append to it, and final card / q / session cleanup closes it | 修复 provider-native `web_search` live overlay，复用单一 panel、追加新事件，并由 final card / q / 会话清理关闭
+> - Removes Escape-based closing and keeps the overlay UI-only | 去掉 Escape 关闭语义，overlay 仍然只属于 UI
+> - Updates the release notes and install commands to `v0.1.6` | 更新发布说明与安装命令至 `v0.1.6`
 
 [中文](#中文) | [English](#english)
 
@@ -94,9 +93,9 @@ OpenAI provider-executed tools 通常不会把原始工具输出暴露给宿主�
 - **实时展示 provider-native `web_search` 状态**
   - 在支持 `ctx.ui.custom(..., { overlay: true })` 的 OMP/Pi 交互 runtime 中，provider-native `web_search_call` 流式事件到达时，插件会自动弹出一块临时 dashboard-style overlay，提示正在搜索的 query、状态和 source 计数。没有 query、source 或 error 的 queryless placeholder 事件不会打开 overlay，会等待后续可展示事件归并。
   - The overlay counts `response.web_search_call.in_progress`, `response.web_search_call.searching`, and `response.web_search_call.completed`, and tracks `response.output_item.added` and `response.output_item.done` so repeated lifecycle updates do not disappear behind provider temp IDs.
-  - 这个实时 overlay 是 UI-only、非持久状态，不写入 session message，不进入 Agent 上下文。完成条目的默认时序是 collapse 3000 ms, hide 8000 ms, and auto-close 10000 ms：先完整保留，再折叠为摘要，然后从 overlay 中隐藏，最后才自动关闭。
+  - 这个实时 overlay 是 UI-only、非持久状态，不写入 session message，不进入 Agent 上下文；同一时刻最多打开一个 live overlay，新 provider 事件会追加到当前 overlay。完成条目的默认时序是 collapse 3000 ms and hide 8000 ms：先完整保留，再折叠为摘要，然后仅在超过 3 个可展示条目时隐藏旧的 completed 条目；provider lifecycle 事件不会自动关闭 overlay。
   - Overlay hides temporary provider IDs such as `res_...`, `resp_...`, or `unknown`; it prefers the final `web_search_call` ID when available, otherwise `search #N` or query identity. final card delivery closes the active overlay only after the idle display send starts; incomplete `message_end` / `agent_end` events do not close the overlay.
-  - overlay 可在 final-card close、auto-close、manual close、runtime dispose 或单次 UI failure 后重新打开。headless / print / RPC / 旧 runtime 缺少交互 overlay 能力时自动降级为 no-op；插件 does not fall back to the old short status widget。
+  - overlay 可在 final-card close、q manual close、session lifecycle cleanup、runtime dispose 或单次 UI failure 后重新打开。headless / print / RPC / 旧 runtime 缺少交互 overlay 能力时自动降级为 no-op；插件 does not fall back to the old short status widget。
   - The header calls count is cumulative across the overlay lifetime: completed collapse, hide, and max visible rows do not reduce it.
   - Completed calls collapse only after more than 3 displayable calls. Non-completed calls stay expanded while older completed calls collapse first.
   - Provider-native `image_generation` does not use a live overlay and remains provider-native；它继续使用现有 keepalive、可选中断、图片保存和最终回显路径。
@@ -129,7 +128,7 @@ OpenAI provider-executed tools 通常不会把原始工具输出暴露给宿主�
 当前版本：
 
 ```bash
-omp plugin install npm:omp-openai-provider-tools@0.1.5
+omp plugin install npm:omp-openai-provider-tools@0.1.6
 ```
 
 本地开发时可以链接 checkout：
@@ -156,7 +155,7 @@ omp plugin link <path-to-this-repo>
 2. 提取其中带明确版本号的安装命令。当前版本示例：
 
    ```bash
-   omp plugin install npm:omp-openai-provider-tools@0.1.5
+   omp plugin install npm:omp-openai-provider-tools@0.1.6
    ```
 
 3. 安装后不要停在插件安装本身。继续帮助用户配置 OpenAI 官方 provider 或用户自己的 OpenAI-compatible 中转站：确认当前模型使用 `openai-responses`，把能力声明写入模型或 provider 元数据的 `compat.openaiProviderTools`，不要新建插件专用配置文件。
@@ -308,7 +307,7 @@ OpenAI provider completed web_search (1 call).
 
 按 Ctrl+O 展开后可看到检索词、引用和 sources（如果 provider history 中保留了这些信息）。这个回显不是 overlay，也不是 non-overlay `ctx.ui.custom(..., { overlay: false })`。non-overlay custom UI 属于 editor replacement semantics，会占用编辑器区域直到 runtime 生命周期关闭或替换；最终 `web_search` 回显需要留在 chat transcript 中，所以插件 uses an idle-gated display custom message, context hook filtering, and UI-only custom entry replay. It flushes immediately from `message_end` when the runtime is already idle; otherwise it waits for the idle-gated `turn_end` / deferred retry path. It does not use `{ deliverAs: "nextTurn" }` as the interactive primary path; if no safe UI path exists, it degrades without breaking the editor.
 
-如果 runtime 支持 `ctx.ui.custom(..., { overlay: true })`，provider-native `web_search_call` 流式事件到达且 provider 暴露了 query/source/error 等可展示细节时，还会自动弹出一块临时 dashboard-style overlay，实时提示 query、状态和 source 计数。The overlay counts `response.web_search_call.in_progress`, `response.web_search_call.searching`, and `response.web_search_call.completed`, and tracks `response.output_item.added` and `response.output_item.done`. 这个 overlay 是 UI-only，不持久化、不进入 Agent 上下文，也不会替代请求结束后的 summary 回显；完成条目的默认时序是 collapse 3000 ms, hide 8000 ms, and auto-close 10000 ms。Overlay hides temporary provider IDs such as `res_...`, `resp_...`, or `unknown`; it prefers the final `web_search_call` ID when available, otherwise `search #N` or query identity. Final card delivery closes the active overlay only after the idle display send starts；不完整的 `message_end` / `agent_end` 不会关闭 overlay。headless / print / RPC / 旧 runtime 缺少交互 overlay 能力时自动降级为 no-op，且 does not fall back to the old short status widget。Provider-native `image_generation` does not use a live overlay and remains provider-native。
+如果 runtime 支持 `ctx.ui.custom(..., { overlay: true })`，provider-native `web_search_call` 流式事件到达且 provider 暴露了 query/source/error 等可展示细节时，还会自动弹出一块临时 dashboard-style overlay，实时提示 query、状态和 source 计数。The overlay counts `response.web_search_call.in_progress`, `response.web_search_call.searching`, and `response.web_search_call.completed`, and tracks `response.output_item.added` and `response.output_item.done`. 这个 overlay 是 UI-only，不持久化、不进入 Agent 上下文，也不会替代请求结束后的 summary 回显；同一时刻最多打开一个 live overlay，新 provider 事件会追加到当前 overlay。完成条目的默认时序是 collapse 3000 ms and hide 8000 ms：provider lifecycle 事件不会自动关闭 overlay，only the final card delivery, q manual close, session lifecycle cleanup, runtime dispose, or a UI failure closes it。Overlay hides temporary provider IDs such as `res_...`, `resp_...`, or `unknown`; it prefers the final `web_search_call` ID when available, otherwise `search #N` or query identity. Final card delivery closes the active overlay only after the idle display send starts. Incomplete `message_end` / `agent_end` events do not close the overlay.
 
 The header calls count is cumulative across the overlay lifetime: completed collapse, hide, and max visible rows do not reduce it. Completed calls collapse only after more than 3 displayable calls. Non-completed calls stay expanded while older completed calls collapse first.
 
@@ -400,7 +399,7 @@ Provider-executed `web_search` lets the main Agent use provider-side search resu
 - Emits visible UI-only summaries for provider-native `web_search` calls through an idle-gated display custom message. The plugin tries to flush the final card immediately from `message_end` when the runtime is already idle; otherwise it waits for the existing `turn_end` / deferred idle retry path. The plugin uses context hook filtering so display custom messages are filtered from LLM context, and it persists/replays the card through UI-only custom entry replay when the runtime supports UI-only custom entries.
 - The final `web_search` card does not use non-overlay `ctx.ui.custom(..., { overlay: false })` because that path has editor replacement semantics. The interactive runtime does not use `{ deliverAs: "nextTurn" }` as the interactive primary path; if no safe UI path exists, the extension degrades without breaking the editor.
 - Automatically opens a temporary UI-only dashboard-style overlay for provider-native `web_search` stream events on interactive runtimes that expose `ctx.ui.custom(..., { overlay: true })` once provider events include displayable query/source/error details. The overlay counts `response.web_search_call.in_progress`, `response.web_search_call.searching`, and `response.web_search_call.completed`, and tracks `response.output_item.added` and `response.output_item.done`.
-- The live overlay is not persisted, is not sent as a session message, and is not visible to the Agent. Completed entry defaults are collapse 3000 ms, hide 8000 ms, and auto-close 10000 ms. It hides temporary provider IDs such as `res_...`, `resp_...`, or `unknown`; it uses the final `web_search_call` ID when available, otherwise `search #N` or query identity. Final card delivery closes the active overlay only after the idle display send starts. Incomplete `message_end` / `agent_end` events do not close the overlay. Headless, print, RPC, or older runtimes without interactive overlay support degrade to no-op and the plugin does not fall back to the old short status widget.
+- The live overlay is not persisted, is not sent as a session message, and is not visible to the Agent. At most one live overlay is open at a time, and new provider events append to the current overlay. Completed entry defaults are collapse 3000 ms and hide 8000 ms; provider lifecycle events do not auto-close the overlay. It hides temporary provider IDs such as `res_...`, `resp_...`, or `unknown`; it uses the final `web_search_call` ID when available, otherwise `search #N` or query identity. Final card delivery closes the active overlay only after the idle display send starts. Incomplete `message_end` / `agent_end` events do not close the overlay. Only the final card delivery, q manual close, session lifecycle cleanup, runtime dispose, or a UI failure closes it. Headless, print, RPC, or older runtimes without interactive overlay support degrade to no-op and the plugin does not fall back to the old short status widget.
 - The header calls count is cumulative across the overlay lifetime: completed collapse, hide, and max visible rows do not reduce it. Completed calls collapse only after more than 3 displayable calls, and non-completed calls stay expanded while older completed calls collapse first.
 - Provider-native `image_generation` does not use a live overlay and remains provider-native; it keeps the existing keepalive, optional interruption, save, and final echo paths.
 - Saves provider-native image results, renders them inline in the terminal, and exposes expanded generation metadata.
@@ -412,7 +411,7 @@ Provider-executed `web_search` lets the main Agent use provider-side search resu
 For OMP:
 
 ```bash
-omp plugin install npm:omp-openai-provider-tools@0.1.5
+omp plugin install npm:omp-openai-provider-tools@0.1.6
 ```
 
 For local development:
@@ -424,8 +423,8 @@ omp plugin link <path-to-this-repo>
 For Pi-family runtimes:
 
 ```bash
-pi install npm:omp-openai-provider-tools@0.1.5
-pi -e npm:omp-openai-provider-tools@0.1.5
+pi install npm:omp-openai-provider-tools@0.1.6
+pi -e npm:omp-openai-provider-tools@0.1.6
 ```
 
 Verify:

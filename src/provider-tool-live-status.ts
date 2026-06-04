@@ -5,7 +5,7 @@ export const LIVE_STATUS_WIDGET_KEY = "openai-provider-tools-live";
 
 const DEFAULT_THROTTLE_MS = 250;
 const MAX_QUERIES = 3;
-const DEFAULT_COMPLETED_AUTO_CLOSE_MS = 10_000;
+
 const MAX_EXPANDED_LIVE_CALLS = 3;
 const DEFAULT_COMPLETED_COLLAPSE_MS = 3_000;
 const DEFAULT_COMPLETED_HIDE_MS = 8_000;
@@ -196,7 +196,7 @@ export function renderProviderToolLiveOverlay(
 	}
 
 	lines.push(truncateToWidth(color(theme, "borderMuted", "-".repeat(normalizedWidth)), normalizedWidth));
-	lines.push(truncateToWidth(color(theme, "dim", " esc/q close  j/k scroll "), normalizedWidth));
+	lines.push(truncateToWidth(color(theme, "dim", " q close  j/k scroll "), normalizedWidth));
 	return lines;
 }
 
@@ -219,10 +219,10 @@ export function createProviderToolLiveStatusManager(
 	const scheduler = options.scheduler ?? globalThis;
 	const throttleMs = options.throttleMs ?? DEFAULT_THROTTLE_MS;
 	void options.placement;
-	const completedAutoCloseMs = options.completedAutoCloseMs ?? DEFAULT_COMPLETED_AUTO_CLOSE_MS;
+	void options.completedAutoCloseMs;
 	const completedCollapseMs = options.completedCollapseMs ?? DEFAULT_COMPLETED_COLLAPSE_MS;
 	const completedHideMs = options.completedHideMs ?? DEFAULT_COMPLETED_HIDE_MS;
-	const activeTrackers = new Set<LiveTracker>();
+	let currentTracker: LiveTracker | undefined;
 
 	function warn(message: string, error: unknown): void {
 		try {
@@ -273,9 +273,6 @@ export function createProviderToolLiveStatusManager(
 
 		fail(error: unknown): void {
 			if (this.ended) return;
-			this.cancelPendingRender();
-			this.cancelPendingAutoClose();
-			this.cancelAllCompletedTimers();
 			const timestamp = now();
 			const status = this.firstStatus() ?? this.createStatus("failure", timestamp);
 			status.phase = "failed";
@@ -284,21 +281,14 @@ export function createProviderToolLiveStatusManager(
 			status.updatedAt = timestamp;
 			status.error = describeError(error);
 			this.statuses.set(status.id, status);
+			this.cancelPendingAutoClose();
 			this.renderNow();
-			this.closeOverlay();
-			this.ended = true;
-			activeTrackers.delete(this);
 		}
 
 		clear(): void {
-			this.cancelPendingRender();
-			this.cancelPendingAutoClose();
-			this.cancelAllCompletedTimers();
-			if (!this.ended) {
-				this.ended = true;
-				this.closeOverlay();
-				activeTrackers.delete(this);
-			}
+			// Request-local stream cleanup must not close the shared live panel.
+			// The panel closes when the final custom echo is displayed, when the
+			// session clears all live UI, or when the user presses q.
 		}
 
 		cancelPendingRender(): void {
@@ -338,7 +328,7 @@ export function createProviderToolLiveStatusManager(
 			}
 			this.overlay = undefined;
 			this.openingOverlay = false;
-			activeTrackers.delete(this);
+			if (currentTracker === this) currentTracker = undefined;
 		}
 
 		private handleEvent(event: unknown): void {
@@ -609,9 +599,10 @@ export function createProviderToolLiveStatusManager(
 		}
 
 		private scheduleAutoCloseIfComplete(): void {
-			if (!this.requestCompleted) return;
-			const calls = [...this.statuses.values()].filter(status => status.visibility !== "hidden" && statusHasVisibleDetails(status));
-			if (calls.length === 0) this.scheduleAutoClose();
+			// The live panel lifetime is tied to the final provider-result custom message.
+			// Provider lifecycle events may mark calls complete, collapse, or hide rows, but
+			// they must not close the overlay before the final UI-only echo is displayed.
+			return;
 		}
 
 		private scheduleCompletedTimers(status: LiveToolStatus): void {
@@ -671,19 +662,6 @@ export function createProviderToolLiveStatusManager(
 		private cancelAllCompletedTimers(): void {
 			for (const status of this.statuses.values()) {
 				this.cancelCompletedTimers(status);
-			}
-		}
-
-		private scheduleAutoClose(): void {
-			if (this.ended || completedAutoCloseMs <= 0) return;
-			this.cancelPendingAutoClose();
-			try {
-				this.pendingAutoClose = scheduler.setTimeout(() => {
-					this.pendingAutoClose = undefined;
-					this.clear();
-				}, completedAutoCloseMs);
-			} catch (error) {
-				handleOverlayFailure(this, error);
 			}
 		}
 
@@ -756,15 +734,14 @@ export function createProviderToolLiveStatusManager(
 					this.ended = true;
 					this.cancelPendingRender();
 					this.cancelPendingAutoClose();
-					this.cancelAllCompletedTimers();
-					activeTrackers.delete(this);
+					if (currentTracker === this) currentTracker = undefined;
 				};
 
 				const component: OverlayComponentLike = {
 					render: (width: number) => renderProviderToolLiveOverlay(this.snapshot(), width, theme, { now }),
 					handleInput: (data: string) => {
 						const normalized = String(data).toLowerCase();
-						if (normalized === "q" || normalized === "escape" || normalized === "esc") {
+						if (normalized === "q") {
 							close();
 						}
 					},
@@ -834,14 +811,12 @@ export function createProviderToolLiveStatusManager(
 	return {
 		createTracker({ enabledTools, ui }) {
 			if (!enabledTools.includes("web_search")) return undefined;
-			const tracker = new LiveTracker(ui);
-			activeTrackers.add(tracker);
-			return tracker;
+			if (currentTracker) return currentTracker;
+			currentTracker = new LiveTracker(ui);
+			return currentTracker;
 		},
 		clearAll() {
-			for (const tracker of [...activeTrackers]) {
-				tracker.clear();
-			}
+			currentTracker?.disable();
 		},
 	};
 }

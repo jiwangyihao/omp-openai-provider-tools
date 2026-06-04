@@ -258,13 +258,13 @@ describe("provider tool live status", () => {
 		expect(activeTimeouts(overrideScheduler)).not.toContain(33);
 	});
 
-	it("keeps completed auto-close when a late queryless output item arrives", () => {
+	it("does not schedule auto-close when a late queryless output item arrives", () => {
 		const scheduler = createScheduler();
 		const recorder = createUiRecorder({ hasUI: true });
 		const manager = createProviderToolLiveStatusManager({ throttleMs: 0, completedCollapseMs: 11, completedHideMs: 22, completedAutoCloseMs: 33, scheduler: scheduler.scheduler });
 		const tracker = manager.createTracker({ enabledTools: ["web_search"], ui: recorder.ui });
 
-		tracker?.onEvent({ type: "response.output_item.done", item: { type: "web_search_call", id: "ws-complete", status: "completed", action: { query: "auto close remains" } } });
+		tracker?.onEvent({ type: "response.output_item.done", item: { type: "web_search_call", id: "ws-complete", status: "completed", action: { query: "late queryless update" } } });
 		tracker?.onEvent({ type: "response.completed" });
 		scheduler.runNextTimerByTimeout(22);
 		expect(activeTimeouts(scheduler)).not.toContain(33);
@@ -292,7 +292,7 @@ describe("provider tool live status", () => {
 		expect(text).not.toContain("unknown");
 	});
 
-	it("allows new trackers to open after render failure, manual close, auto-close, and dispose", () => {
+	it("allows new trackers to open after render failure, manual close, explicit clear, and dispose", () => {
 		let requestRenderShouldThrow = false;
 		const manager = createProviderToolLiveStatusManager({ throttleMs: 0, completedCollapseMs: 1, completedHideMs: 2, completedAutoCloseMs: 3, scheduler: createScheduler().scheduler });
 
@@ -307,6 +307,8 @@ describe("provider tool live status", () => {
 		manager.createTracker({ enabledTools: ["web_search"], ui: afterFailure.ui })?.onEvent({ type: "response.output_item.added", item: { type: "web_search_call", id: "ws-after-failure", query: "after failure" } });
 		expect(afterFailure.customCalls).toHaveLength(1);
 		expect(afterFailure.customCalls[0]!.component.render(120).join("\n")).toContain("after failure");
+		afterFailure.customCalls[0]!.component.handleInput?.("q");
+		expect(afterFailure.doneResults).toEqual([undefined]);
 
 		const manual = createUiRecorder({ hasUI: true });
 		const manualTracker = manager.createTracker({ enabledTools: ["web_search"], ui: manual.ui });
@@ -322,20 +324,13 @@ describe("provider tool live status", () => {
 		const autoManager = createProviderToolLiveStatusManager({ throttleMs: 0, completedCollapseMs: 1, completedHideMs: 2, completedAutoCloseMs: 3, scheduler: autoScheduler.scheduler });
 		const auto = createUiRecorder({ hasUI: true });
 		const autoTracker = autoManager.createTracker({ enabledTools: ["web_search"], ui: auto.ui });
-		autoTracker?.onEvent({ type: "response.output_item.done", item: { type: "web_search_call", id: "ws-auto", status: "completed", action: { query: "auto close" } } });
+		autoTracker?.onEvent({ type: "response.output_item.done", item: { type: "web_search_call", id: "ws-auto", status: "completed", action: { query: "explicit clear" } } });
 		autoTracker?.onEvent({ type: "response.completed" });
-		autoTracker?.clear();
+		autoManager.clearAll();
 		expect(auto.doneResults).toEqual([undefined]);
 
-		const afterAuto = createUiRecorder({ hasUI: true });
-		autoManager.createTracker({ enabledTools: ["web_search"], ui: afterAuto.ui })?.onEvent({ type: "response.output_item.added", item: { type: "web_search_call", id: "ws-after-auto", query: "after auto" } });
-		expect(afterAuto.customCalls[0]!.component.render(120).join("\n")).toContain("after auto");
-
-		const dispose = createUiRecorder({ hasUI: true });
-		const disposeTracker = manager.createTracker({ enabledTools: ["web_search"], ui: dispose.ui });
-		disposeTracker?.onEvent({ type: "response.output_item.added", item: { type: "web_search_call", id: "ws-dispose", query: "dispose" } });
-		dispose.customCalls[0]!.component.dispose?.();
-		expect(dispose.doneResults).toEqual([]);
+		afterManual.customCalls[0]!.component.dispose?.();
+		expect(afterManual.doneResults).toEqual([]);
 
 		const afterDispose = createUiRecorder({ hasUI: true });
 		manager.createTracker({ enabledTools: ["web_search"], ui: afterDispose.ui })?.onEvent({ type: "response.output_item.added", item: { type: "web_search_call", id: "ws-after-dispose", query: "after dispose" } });
@@ -596,10 +591,12 @@ describe("provider tool live status", () => {
 		expect(recorder.customCalls[0]!.component.render(120).join("\n")).toContain("collapse me");
 
 		scheduler.runActiveTimers();
+		expect(recorder.doneResults).toEqual([]);
+		manager.clearAll();
 		expect(recorder.doneResults).toEqual([undefined]);
 	});
 
-	it("waits for completed entries to hide before auto-closing after response.completed", () => {
+	it("does not auto-close after completed entries hide following response.completed", () => {
 		const scheduler = createScheduler();
 		const recorder = createUiRecorder({ hasUI: true });
 		const manager = createProviderToolLiveStatusManager({
@@ -788,7 +785,7 @@ describe("provider tool live status", () => {
 		expect(text).toContain("OpenAI provider web_search");
 		expect(text).toContain("provider native overlay style");
 		expect(text).toContain("searching");
-		expect(text).toContain("esc/q close");
+		expect(text).toContain("q close");
 		expect(lines.length).toBeGreaterThanOrEqual(6);
 	});
 
@@ -821,7 +818,7 @@ describe("provider tool live status", () => {
 		expect(text).toContain("sources 2");
 		expect(text).toContain("first query");
 		expect(text).toContain("second query");
-		expect(text).toContain("esc/q close");
+		expect(text).toContain("q close");
 	});
 
 	it("does not create a tracker or render when only image_generation is enabled", () => {
@@ -834,7 +831,7 @@ describe("provider tool live status", () => {
 		expect(recorder.widgetCalls).toEqual([]);
 	});
 
-	it("cancels pending throttled overlay render on response.completed and closes the overlay", () => {
+	it("cancels pending throttled overlay render on response.completed and keeps the overlay open", () => {
 		const scheduler = createScheduler();
 		const recorder = createUiRecorder({ hasUI: true });
 		const manager = createProviderToolLiveStatusManager({ throttleMs: 250, scheduler: scheduler.scheduler });
@@ -855,7 +852,7 @@ describe("provider tool live status", () => {
 		expect(recorder.doneResults).toEqual([undefined]);
 	});
 
-	it("keeps a completed search visible briefly before auto-closing the overlay", () => {
+	it("keeps a completed search visible until explicit final-card cleanup", () => {
 		const scheduler = createScheduler();
 		const recorder = createUiRecorder({ hasUI: true });
 		const manager = createProviderToolLiveStatusManager({ throttleMs: 0, completedCollapseMs: 1_000, completedHideMs: 3_000, completedAutoCloseMs: 1_500, scheduler: scheduler.scheduler });
@@ -877,10 +874,12 @@ describe("provider tool live status", () => {
 
 		scheduler.runActiveTimers();
 
+		expect(recorder.doneResults).toEqual([]);
+		manager.clearAll();
 		expect(recorder.doneResults).toEqual([undefined]);
 	});
 
-	it("closes the automatic overlay on auto-close, failed, clear, and keyboard input", () => {
+	it("keeps completed and failed overlays open until explicit clear and closes on clear and q input", () => {
 		const scheduler = createScheduler();
 		const manager = createProviderToolLiveStatusManager({ throttleMs: 0, scheduler: scheduler.scheduler });
 
@@ -888,8 +887,10 @@ describe("provider tool live status", () => {
 		const completedTracker = manager.createTracker({ enabledTools: ["web_search"], ui: completed.ui });
 		completedTracker?.onEvent({ type: "response.output_item.added", item: { type: "web_search_call", id: "ws-1", query: "done" } });
 		completedTracker?.onEvent({ type: "response.completed" });
-		expect(completed.doneResults).toEqual([]);
 		scheduler.runActiveTimers();
+		expect(completed.doneResults).toEqual([]);
+		expect(completed.customCalls[0]!.component.render(120).join("\n")).toContain("done");
+		manager.clearAll();
 		expect(completed.doneResults).toEqual([undefined]);
 
 		const failed = createUiRecorder({ hasUI: true });
@@ -898,19 +899,22 @@ describe("provider tool live status", () => {
 		expect(failed.customCalls).toHaveLength(1);
 		expect(failed.customCalls[0]!.component.render(80).join("\n")).toContain("failed");
 		expect(failed.customCalls[0]!.component.render(80).join("\n")).toContain("rate limited");
+		expect(failed.doneResults).toEqual([]);
+		manager.clearAll();
 		expect(failed.doneResults).toEqual([undefined]);
 
 		const manual = createUiRecorder({ hasUI: true });
 		const manualTracker = manager.createTracker({ enabledTools: ["web_search"], ui: manual.ui });
 		manualTracker?.onEvent({ type: "response.output_item.added", item: { type: "web_search_call", id: "ws-2", query: "manual" } });
-		manualTracker?.clear();
+		manager.clearAll();
 		expect(manual.doneResults).toEqual([undefined]);
 
 		const keyboard = createUiRecorder({ hasUI: true });
 		const keyboardTracker = manager.createTracker({ enabledTools: ["web_search"], ui: keyboard.ui });
 		keyboardTracker?.onEvent({ type: "response.output_item.added", item: { type: "web_search_call", id: "ws-3", query: "keyboard" } });
-		keyboard.customCalls[0]!.component.handleInput?.("q");
 		keyboard.customCalls[0]!.component.handleInput?.("escape");
+		expect(keyboard.doneResults).toEqual([]);
+		keyboard.customCalls[0]!.component.handleInput?.("q");
 		expect(keyboard.doneResults).toEqual([undefined]);
 	});
 
@@ -956,28 +960,20 @@ describe("provider tool live status", () => {
 		expect(recorder.widgetCalls).toEqual([]);
 	});
 
-	it("clearAll closes only active overlays once", () => {
-		const manuallyCleared = createUiRecorder({ hasUI: true });
-		const completed = createUiRecorder({ hasUI: true });
-		const stillActive = createUiRecorder({ hasUI: true });
+	it("clearAll closes the single active overlay once", () => {
+		const recorder = createUiRecorder({ hasUI: true });
 		const manager = createProviderToolLiveStatusManager({ throttleMs: 0 });
-		const manualTracker = manager.createTracker({ enabledTools: ["web_search"], ui: manuallyCleared.ui });
-		const completedTracker = manager.createTracker({ enabledTools: ["web_search"], ui: completed.ui });
-		manager.createTracker({ enabledTools: ["web_search"], ui: stillActive.ui })?.onEvent({
-			type: "response.output_item.added",
-			item: { type: "web_search_call", id: "ws-3", query: "active" },
-		});
+		const firstTracker = manager.createTracker({ enabledTools: ["web_search"], ui: recorder.ui });
+		const secondTracker = manager.createTracker({ enabledTools: ["web_search"], ui: recorder.ui });
 
-		manualTracker?.onEvent({ type: "response.output_item.added", item: { type: "web_search_call", id: "ws-1", query: "manual" } });
-		completedTracker?.onEvent({ type: "response.output_item.added", item: { type: "web_search_call", id: "ws-2", query: "complete" } });
-		manualTracker?.clear();
-		completedTracker?.onEvent({ type: "response.completed" });
+		firstTracker?.onEvent({ type: "response.output_item.added", item: { type: "web_search_call", id: "ws-1", query: "manual" } });
+		secondTracker?.onEvent({ type: "response.output_item.added", item: { type: "web_search_call", id: "ws-2", query: "complete" } });
+		secondTracker?.onEvent({ type: "response.output_item.added", item: { type: "web_search_call", id: "ws-3", query: "active" } });
+		manager.clearAll();
 		manager.clearAll();
 
-		expect(manuallyCleared.doneResults).toEqual([undefined]);
-		expect(completed.doneResults).toEqual([undefined]);
-		expect(stillActive.doneResults).toEqual([undefined]);
-		expect(stillActive.widgetCalls).toEqual([]);
+		expect(recorder.doneResults).toEqual([undefined]);
+		expect(recorder.widgetCalls).toEqual([]);
 	});
 
 	it("updates an already-open overlay by requesting render instead of opening duplicates", () => {
@@ -993,6 +989,55 @@ describe("provider tool live status", () => {
 		const text = recorder.customCalls[0]!.component.render(100).join("\n");
 		expect(text).toContain("completed");
 		expect(text).toContain("sources 1");
+	});
+
+	it("reuses one open overlay across concurrent trackers and appends new web_search events", () => {
+		const recorder = createUiRecorder({ hasUI: true, useFourArgFactory: true });
+		const manager = createProviderToolLiveStatusManager({ throttleMs: 0 });
+		const firstTracker = manager.createTracker({ enabledTools: ["web_search"], ui: recorder.ui });
+		const secondTracker = manager.createTracker({ enabledTools: ["web_search"], ui: recorder.ui });
+
+		firstTracker?.onEvent({ type: "response.output_item.added", item: { type: "web_search_call", id: "ws-first", action: { query: "first panel query" } } });
+		secondTracker?.onEvent({ type: "response.output_item.added", item: { type: "web_search_call", id: "ws-second", action: { query: "second panel query" } } });
+
+		expect(recorder.customCalls).toHaveLength(1);
+		const text = recorder.customCalls[0]!.component.render(160).join("\n");
+		expect(text).toContain("first panel query");
+		expect(text).toContain("second panel query");
+		expect(recorder.customCalls[0]?.requestRenderCalls).toBeGreaterThan(0);
+	});
+
+	it("keeps the live overlay open after response.completed until final result delivery clears it", () => {
+		const scheduler = createScheduler();
+		const recorder = createUiRecorder({ hasUI: true });
+		const manager = createProviderToolLiveStatusManager({ throttleMs: 0, scheduler: scheduler.scheduler });
+		const tracker = manager.createTracker({ enabledTools: ["web_search"], ui: recorder.ui });
+
+		tracker?.onEvent({ type: "response.output_item.added", item: { type: "web_search_call", id: "ws-final", action: { query: "await final echo" } } });
+		tracker?.onEvent({ type: "response.output_item.done", item: { type: "web_search_call", id: "ws-final", status: "completed", action: { query: "await final echo" } } });
+		tracker?.onEvent({ type: "response.completed" });
+		scheduler.runActiveTimers();
+
+		expect(recorder.doneResults).toEqual([]);
+		expect(recorder.customCalls[0]!.component.render(160).join("\n")).toContain("await final echo");
+
+		manager.clearAll();
+		expect(recorder.doneResults).toEqual([undefined]);
+	});
+
+	it("keeps the live overlay open for Escape-like input and closes it with q", () => {
+		const recorder = createUiRecorder({ hasUI: true });
+		const manager = createProviderToolLiveStatusManager({ throttleMs: 0 });
+		const tracker = manager.createTracker({ enabledTools: ["web_search"], ui: recorder.ui });
+
+		tracker?.onEvent({ type: "response.output_item.added", item: { type: "web_search_call", id: "ws-q-only", action: { query: "q only close" } } });
+		recorder.customCalls[0]!.component.handleInput?.("escape");
+		recorder.customCalls[0]!.component.handleInput?.("esc");
+		recorder.customCalls[0]!.component.handleInput?.("\x1b");
+		expect(recorder.doneResults).toEqual([]);
+
+		recorder.customCalls[0]!.component.handleInput?.("q");
+		expect(recorder.doneResults).toEqual([undefined]);
 	});
 
 	it("closes the mounted overlay when requestRender fails", () => {
