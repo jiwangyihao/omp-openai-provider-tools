@@ -45,11 +45,14 @@ export type Reference = { title?: string; url: string };
 let tuiModule: TuiLike | undefined;
 let tuiLoadStarted = false;
 
-export function registerProviderToolResultRenderer(api: RendererApiLike, tuiOverride?: TuiLike): void {
+export function registerProviderToolResultRenderer(api: RendererApiLike, tuiOverride?: TuiLike, loadTui: () => Promise<TuiLike | undefined> = () => loadProviderToolResultTui(api)): void {
 	if (!api.registerMessageRenderer) return;
-	if (!tuiOverride) void ensureTuiLoaded(api);
-	api.registerMessageRenderer(PROVIDER_TOOL_RESULT_MESSAGE_TYPE, (message, options, theme, runtimeTuiOverride) =>
-		renderProviderToolResultMessage(message, options, theme, tuiOverride ?? (isTuiLike(runtimeTuiOverride) ? runtimeTuiOverride : undefined) ?? tuiModule));
+	api.registerMessageRenderer(PROVIDER_TOOL_RESULT_MESSAGE_TYPE, (message, options, theme, runtimeTuiOverride) => {
+		const runtimeTui = isTuiLike(runtimeTuiOverride) ? runtimeTuiOverride : undefined;
+		const Tui = tuiOverride ?? runtimeTui ?? tuiModule;
+		if (!Tui && !runtimeTui) void ensureTuiLoaded(loadTui);
+		return renderProviderToolResultMessage(message, options, theme, Tui);
+	});
 }
 
 export async function loadProviderToolResultTui(api: { logger?: { warn?: (...args: unknown[]) => void }; pi?: { VERSION?: string } }, tuiOverride?: TuiLike): Promise<TuiLike | undefined> {
@@ -65,10 +68,10 @@ export async function loadProviderToolResultTui(api: { logger?: { warn?: (...arg
 	}
 }
 
-async function ensureTuiLoaded(api: RendererApiLike): Promise<void> {
+async function ensureTuiLoaded(loadTui: () => Promise<TuiLike | undefined>): Promise<void> {
 	if (tuiLoadStarted) return;
 	tuiLoadStarted = true;
-	const loaded = await loadProviderToolResultTui(api);
+	const loaded = await loadTui();
 	if (loaded) tuiModule = loaded;
 }
 

@@ -146,6 +146,36 @@ function outerDisplayMessage(message = webSearchMessageWithActionDetails()) {
 }
 
 describe("provider tool result renderer", () => {
+	it("loads TUI lazily after the first render without a runtime override", async () => {
+		const renderers = new Map<string, Function>();
+		let loadCalls = 0;
+		registerProviderToolResultRenderer(
+			{
+				registerMessageRenderer(customType: string, renderer: Function) {
+					renderers.set(customType, renderer);
+				},
+			},
+			undefined,
+			async () => {
+				loadCalls++;
+				return fakeTui;
+			},
+		);
+
+		const renderer = renderers.get(PROVIDER_TOOL_RESULT_MESSAGE_TYPE);
+		expect(renderer).toBeDefined();
+		expect(loadCalls).toBe(0);
+
+		const firstRender = renderer!(webSearchMessage(), { expanded: false }, testTheme());
+		expect(firstRender).toBeUndefined();
+		expect(loadCalls).toBe(1);
+
+		await new Promise(resolve => setTimeout(resolve, 0));
+
+		const secondRender = renderer!(webSearchMessage(), { expanded: false }, testTheme());
+		expect(secondRender?.render(96).join("\n")).toContain("OpenAI provider completed web_search (1 call).");
+	});
+
 	it("renders web_search details from metadata while content remains agent-invisible", () => {
 		const message = webSearchMessage();
 

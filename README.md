@@ -4,11 +4,11 @@
 [![npm downloads](https://img.shields.io/npm/dw/omp-openai-provider-tools.svg)](https://www.npmjs.com/package/omp-openai-provider-tools)
 [![License: MPL-2.0](https://img.shields.io/badge/License-MPL--2.0-blue.svg)](./LICENSE)
 
-> **Latest in v0.1.6 | v0.1.6 最近更新**
+> **Latest in v0.1.7 | v0.1.7 最近更新**
 >
-> - Fixes provider-native `web_search` live overlay so one shared panel is reused, events append to it, and final card / q / session cleanup closes it | 修复 provider-native `web_search` live overlay，复用单一 panel、追加新事件，并由 final card / q / 会话清理关闭
-> - Removes Escape-based closing and keeps the overlay UI-only | 去掉 Escape 关闭语义，overlay 仍然只属于 UI
-> - Updates the release notes and install commands to `v0.1.6` | 更新发布说明与安装命令至 `v0.1.6`
+> - Fixes OMP 15.13.x startup stack overflows caused by eager provider tool result renderer TUI preloading | 修复 OMP 15.13.x 中 provider tool result renderer 注册阶段预加载 TUI 触发的启动栈溢出
+> - Uses the runtime-provided TUI override first and lazily loads a fallback TUI only after first render | 优先使用运行时传入的 TUI override，并仅在首次渲染后惰性加载兜底 TUI
+> - Updates the release notes and install commands to `v0.1.7` | 更新发布说明与安装命令至 `v0.1.7`
 
 [中文](#中文) | [English](#english)
 
@@ -128,7 +128,7 @@ OpenAI provider-executed tools 通常不会把原始工具输出暴露给宿主�
 当前版本：
 
 ```bash
-omp plugin install npm:omp-openai-provider-tools@0.1.6
+omp plugin install npm:omp-openai-provider-tools@0.1.7
 ```
 
 本地开发时可以链接 checkout：
@@ -155,7 +155,7 @@ omp plugin link <path-to-this-repo>
 2. 提取其中带明确版本号的安装命令。当前版本示例：
 
    ```bash
-   omp plugin install npm:omp-openai-provider-tools@0.1.6
+   omp plugin install npm:omp-openai-provider-tools@0.1.7
    ```
 
 3. 安装后不要停在插件安装本身。继续帮助用户配置 OpenAI 官方 provider 或用户自己的 OpenAI-compatible 中转站：确认当前模型使用 `openai-responses`，把能力声明写入模型或 provider 元数据的 `compat.openaiProviderTools`，不要新建插件专用配置文件。
@@ -411,7 +411,7 @@ Provider-executed `web_search` lets the main Agent use provider-side search resu
 For OMP:
 
 ```bash
-omp plugin install npm:omp-openai-provider-tools@0.1.6
+omp plugin install npm:omp-openai-provider-tools@0.1.7
 ```
 
 For local development:
@@ -423,8 +423,8 @@ omp plugin link <path-to-this-repo>
 For Pi-family runtimes:
 
 ```bash
-pi install npm:omp-openai-provider-tools@0.1.6
-pi -e npm:omp-openai-provider-tools@0.1.6
+pi install npm:omp-openai-provider-tools@0.1.7
+pi -e npm:omp-openai-provider-tools@0.1.7
 ```
 
 Verify:
