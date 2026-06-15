@@ -65,21 +65,29 @@ interface ProviderImageDetail {
 let tuiModule: TuiLike | undefined;
 let tuiLoadStarted = false;
 
-export function registerProviderImageRenderer(api: RendererApiLike, tuiOverride?: TuiLike): void {
+export function registerProviderImageRenderer(api: RendererApiLike, tuiOverride?: TuiLike, loadTui: () => Promise<TuiLike | undefined> = () => loadProviderImageTui(api)): void {
 	if (!api.registerMessageRenderer) return;
-	if (!tuiOverride) void ensureTuiLoaded(api);
-	api.registerMessageRenderer(PROVIDER_IMAGE_MESSAGE_TYPE, (message, options, theme) =>
-		renderProviderImageMessage(message, options, theme, tuiOverride ?? tuiModule, api.pi));
+	api.registerMessageRenderer(PROVIDER_IMAGE_MESSAGE_TYPE, (message, options, theme) => {
+		const Tui = tuiOverride ?? tuiModule;
+		if (!Tui) void ensureTuiLoaded(loadTui);
+		return renderProviderImageMessage(message, options, theme, Tui, api.pi);
+	});
 }
 
-async function ensureTuiLoaded(api: RendererApiLike): Promise<void> {
-	if (tuiLoadStarted) return;
-	tuiLoadStarted = true;
+async function loadProviderImageTui(api: RendererApiLike): Promise<TuiLike | undefined> {
 	try {
-		tuiModule = await loadTuiModule(api.pi?.VERSION);
+		return await loadTuiModule(api.pi?.VERSION);
 	} catch (error) {
 		api.logger?.warn?.("OpenAI provider image preview renderer is unavailable", error);
+		return undefined;
 	}
+}
+
+async function ensureTuiLoaded(loadTui: () => Promise<TuiLike | undefined>): Promise<void> {
+	if (tuiLoadStarted) return;
+	tuiLoadStarted = true;
+	const loaded = await loadTui();
+	if (loaded) tuiModule = loaded;
 }
 
 async function loadTuiModule(runtimeVersion?: string): Promise<TuiLike> {

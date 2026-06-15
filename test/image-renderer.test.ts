@@ -235,6 +235,38 @@ function renderMessage(expanded: boolean, message: unknown, apiOverrides: Record
 }
 
 describe("provider image renderer", () => {
+	it("loads TUI lazily after the first image render without an override", async () => {
+		const message = await makeImageMessage();
+		const renderers = new Map<string, Function>();
+		let loadCalls = 0;
+		registerProviderImageRenderer(
+			{
+				registerMessageRenderer(customType: string, renderer: Function) {
+					renderers.set(customType, renderer);
+				},
+				logger: { warn() {} },
+			},
+			undefined,
+			async () => {
+				loadCalls++;
+				return fakeTui;
+			},
+		);
+
+		const renderer = renderers.get(PROVIDER_IMAGE_MESSAGE_TYPE);
+		expect(renderer).toBeDefined();
+		expect(loadCalls).toBe(0);
+
+		const firstRender = renderer!(message, { expanded: false }, testTheme());
+		expect(firstRender).toBeUndefined();
+		expect(loadCalls).toBe(1);
+
+		await new Promise(resolve => setTimeout(resolve, 0));
+
+		const secondRender = renderer!(message, { expanded: false }, testTheme());
+		expect(secondRender?.render(96).join("\n")).toContain("[Image: provider-result.png [image/png]");
+	});
+
 	it("wraps provider image messages in the native custom-message background", async () => {
 		const message = await makeImageMessage();
 
