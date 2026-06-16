@@ -999,6 +999,36 @@ it("replays current-branch ui-only custom entries once after idle without append
 	expect(appended).toContainEqual({ customType: "openai-provider-tool-result-ui", data: expect.objectContaining({ resultKey: "session-1:web_search:ws-1" }) });
 });
 
+it("does not replay a persisted provider result again after its display message enters the branch", async () => {
+	const cwd = await makeTempDir();
+	const homeDir = await makeTempDir();
+	const persisted = currentBranchEntry(persistedProviderToolResult("stable-replay"));
+	let branch = [persisted];
+	const sessionManager = { getSessionId: () => "session-1", getBranch: () => branch };
+	const extension = registerExtension();
+	const ctx = context(cwd, homeDir, { isIdle: () => true, sessionManager });
+
+	await runSessionStart(extension, ctx);
+	await Promise.resolve();
+	const first = extension.sentMessages[0]?.message as any;
+	expect(first?.details?.resultKey).toBe("stable-replay");
+
+	branch = [
+		persisted,
+		{
+			type: "custom_message",
+			customType: first.customType,
+			content: first.content,
+			display: first.display,
+			details: first.details,
+		},
+	];
+	await runSessionLifecycle(extension, "session_tree", ctx);
+	await Promise.resolve();
+
+	expect(extension.sentMessages.filter(sent => (sent.message as any)?.details?.resultKey === "stable-replay")).toHaveLength(1);
+});
+
 it("replays same resultKey again when the current branch entries change", async () => {
 	const cwd = await makeTempDir();
 	const homeDir = await makeTempDir();

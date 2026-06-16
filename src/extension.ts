@@ -823,6 +823,23 @@ function isProviderToolResultUiOnlyMessage(message: unknown): boolean {
 	return isRecord(message.details) && message.details.uiOnly === true;
 }
 
+function providerToolResultUiOnlyMessageResultKey(entry: unknown): string | undefined {
+	if (!isRecord(entry)) return undefined;
+	if (entry.type !== "custom_message" || entry.customType !== PROVIDER_TOOL_RESULT_MESSAGE_TYPE) return undefined;
+	if (entry.display !== true || !isRecord(entry.details)) return undefined;
+	if (entry.details.uiOnly !== true || entry.details.source !== PROVIDER_TOOL_RESULT_SOURCE) return undefined;
+	const resultKey = entry.details.resultKey;
+	return typeof resultKey === "string" && resultKey.length > 0 ? resultKey : undefined;
+}
+
+function markDisplayedProviderToolResultKeys(entries: unknown[], state: ProviderToolResultState): void {
+	for (const entry of entries) {
+		const resultKey = providerToolResultUiOnlyMessageResultKey(entry);
+		if (resultKey) state.replayedKeys.add(resultKey);
+	}
+}
+
+
 function filterProviderToolResultContextMessages(event: unknown): unknown {
 	if (!isRecord(event) || !Array.isArray(event.messages)) return event;
 	return {
@@ -877,6 +894,7 @@ function replayProviderToolResultEntries(
 		state.replayedKeys.clear();
 		state.insertedKeys.clear();
 		state.replayScopeKey = scopeKey;
+		markDisplayedProviderToolResultKeys(entries, state);
 	}
 	for (const entry of entries) {
 		if (!isRecord(entry)) continue;
